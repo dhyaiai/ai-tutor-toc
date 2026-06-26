@@ -1,0 +1,42 @@
+# Web Framework
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+python-multipart==0.0.19
+
+# Database
+sqlalchemy[asyncio]==2.0.36
+aiomysql==0.3.2
+alembic==1.14.0
+
+# Auth
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+bcrypt>=4.0,<5.0  # bcrypt 5.x 与 passlib 1.7.x 不兼容
+
+# Redis & Cache
+redis==5.2.1
+
+# Task Queue
+celery[redis]==5.4.0
+
+# MinIO / S3
+minio==7.2.10
+
+# Vector DB
+qdrant-client==1.12.1
+
+# AI / LLM
+openai==1.58.1
+
+# Image processing
+opencv-python-headless==4.10.0.84
+Pillow==11.0.0
+
+# HTTP
+httpx==0.28.1
+aiohttp==3.11.10
+
+# Utils
+pydantic[email]==2.10.3
+pydantic-settings==2.7.0
+python-dotenv==1.0.1
