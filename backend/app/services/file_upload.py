@@ -121,6 +121,7 @@ class StorageService:
             return rel_path
 
         object_name = f"questions/{user_id}/{assignment_id}/{uuid.uuid4()}{suffix}.png"
+        self._ensure_bucket()
         await self._run_on_client(
             "put_object",
             bucket_name=self.bucket,
@@ -141,15 +142,16 @@ class StorageService:
                 "presigned_get_object", self.bucket, object_name, expires=expires
             )
             if not url:
-                return ""
+                logger.error("MinIO returned empty presigned URL for %s", object_name)
+                raise RuntimeError(f"MinIO returned empty presigned URL for: {object_name}")
             internal = self.settings.MINIO_ENDPOINT
             public = self.settings.MINIO_PUBLIC_ENDPOINT
             if internal != public:
                 url = url.replace(internal, public)
             return url
         except Exception:
-            logger.warning("Failed to generate presigned URL for %s", object_name, exc_info=True)
-            return ""
+            logger.error("Failed to generate presigned URL for %s", object_name, exc_info=True)
+            raise RuntimeError(f"Storage temporarily unavailable: cannot access {object_name}")
 
     async def get_file_bytes(self, object_name: str) -> bytes | None:
         """Download file bytes from storage (used by analysis pipeline)."""

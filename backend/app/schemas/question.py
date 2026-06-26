@@ -17,6 +17,8 @@ class QuestionResponse(BaseModel):
     knowledge_points: dict | None
     common_mistakes: list | None
     confidence_score: float | None
+    answer_image_url: str | None = None
+    manual_review_note: str | None = None
     page_index: int | None = None
     bbox_x: float | None = None
     bbox_y: float | None = None
@@ -24,6 +26,10 @@ class QuestionResponse(BaseModel):
     bbox_h: float | None = None
     status: QuestionStatus
     created_at: datetime
+    # 大题套小题：父子层级
+    parent_id: int | None = None
+    sub_question_index: int | None = None
+    children: list["QuestionResponse"] = []  # 子题列表，仅父题有值
 
     model_config = {"from_attributes": True}
 

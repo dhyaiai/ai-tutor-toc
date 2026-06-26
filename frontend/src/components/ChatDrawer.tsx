@@ -22,6 +22,8 @@ export default function ChatDrawer({ open, onClose }: Props) {
   const [currentReasoning, setCurrentReasoning] = useState("");
   const [currentToolCalls, setCurrentToolCalls] = useState<string[]>([]);
   const abortRef = useRef<AbortController | null>(null);
+  const reasoningRef = useRef("");
+  const toolCallsRef = useRef<string[]>([]);
 
   const handleSend = useCallback(async () => {
     const text = input.trim();
@@ -30,6 +32,8 @@ export default function ChatDrawer({ open, onClose }: Props) {
     setInput("");
     setCurrentReasoning("");
     setCurrentToolCalls([]);
+    reasoningRef.current = "";
+    toolCallsRef.current = [];
 
     const history = messages.map((m) => ({ role: m.role, content: m.content }));
     const newMessages: Message[] = [...messages, { role: "user", content: text }];
@@ -48,9 +52,14 @@ export default function ChatDrawer({ open, onClose }: Props) {
         text,
         history,
         {
-          onReasoning: (content) => setCurrentReasoning((prev) => prev + content),
-          onToolCall: (name) =>
-            setCurrentToolCalls((prev) => [...prev, name]),
+          onReasoning: (content) => {
+            reasoningRef.current += content;
+            setCurrentReasoning((prev) => prev + content);
+          },
+          onToolCall: (name) => {
+            toolCallsRef.current = [...toolCallsRef.current, name];
+            setCurrentToolCalls((prev) => [...prev, name]);
+          },
           onToken: (content) => {
             setMessages((prev) => {
               const updated = [...prev];
@@ -63,8 +72,8 @@ export default function ChatDrawer({ open, onClose }: Props) {
             setMessages((prev) => {
               const updated = [...prev];
               const last = updated[updated.length - 1];
-              last.reasoning = currentReasoning || undefined;
-              last.toolCalls = currentToolCalls.length > 0 ? currentToolCalls : undefined;
+              last.reasoning = reasoningRef.current || undefined;
+              last.toolCalls = toolCallsRef.current.length > 0 ? [...toolCallsRef.current] : undefined;
               return [...updated];
             });
           },
@@ -85,7 +94,7 @@ export default function ChatDrawer({ open, onClose }: Props) {
       setLoading(false);
       abortRef.current = null;
     }
-  }, [input, loading, messages, currentReasoning, currentToolCalls]);
+  }, [input, loading, messages]);
 
   return (
     <Drawer

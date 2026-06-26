@@ -18,6 +18,7 @@ class AdjustRegionRequest(BaseModel):
     y: float
     w: float
     h: float
+    rotation: int = 0  # 图片旋转角度：0/90/180/270
 
 
 class ReanalyzeRequest(BaseModel):
@@ -419,13 +420,10 @@ async def adjust_question_region(
     if page_img is None:
         raise HTTPException(status_code=400, detail="无法加载源页面图片")
 
-    ph, pw = page_img.shape[:2]
-    x = max(0, int(data.x))
-    y = max(0, int(data.y))
-    w = min(pw - x, int(data.w))
-    h = min(ph - y, int(data.h))
-
-    if w <= 0 or h <= 0:
+    # 使用旋转后裁切（共享函数）
+    from app.api.v1.assignments import _rotate_and_cut
+    q_img = _rotate_and_cut(page_img, data.rotation, data.x, data.y, data.w, data.h)
+    if q_img is None:
         raise HTTPException(status_code=400, detail="无效的切割区域")
 
     # 删除旧图片
@@ -434,8 +432,7 @@ async def adjust_question_region(
     except Exception:
         pass
 
-    # 切割并保存新图片
-    q_img = page_img[y:y + h, x:x + w]
+    # 切割并保存新图片（旋转后的裁切已在 _rotate_and_cut 中完成）
     _, img_bytes = cv2.imencode(".png", q_img)
 
     question.image_url = await storage.save_question_image(

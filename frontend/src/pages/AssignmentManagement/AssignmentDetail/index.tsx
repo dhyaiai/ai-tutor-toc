@@ -1,14 +1,14 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Card, Typography, Descriptions, Tag, Space, Button, Spin, Alert, message } from "antd";
-import { ArrowLeftOutlined, PlayCircleOutlined, ScissorOutlined, EyeOutlined } from "@ant-design/icons";
+import { ArrowLeftOutlined, PlayCircleOutlined, ScissorOutlined, EyeOutlined, UploadOutlined } from "@ant-design/icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { assignmentService } from "../../../services/assignmentService";
 import { ASSIGNMENT_STATUS_MAP } from "../../../utils/constants";
 import { formatDate } from "../../../utils/helpers";
 import QuestionCard from "../../../components/QuestionCard";
 import ManualSplitModal from "../../../components/ManualSplitModal";
-import AnalysisProgressPanel from "../../../components/AnalysisProgressPanel";
+import AnswerSplitModal from "../../../components/AnswerSplitModal";
 
 /** 需要前端持续轮询的活动状态 */
 const ACTIVE_STATES = new Set(["splitting", "splitted", "grading", "processing"]);
@@ -18,14 +18,13 @@ export default function AssignmentDetail() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [analyzing, setAnalyzing] = useState(false);
-  const [showProgress, setShowProgress] = useState(false);
-  const [userClosed, setUserClosed] = useState(false);
   const [manualSplitVisible, setManualSplitVisible] = useState(false);
+  const [answerSplitVisible, setAnswerSplitVisible] = useState(false);
 
   const { data, isLoading, error } = useQuery({
     queryKey: ["assignment", id],
     queryFn: () => assignmentService.getDetail(Number(id)),
-    // 页面慢速轮询（仅做后台兜底，弹窗有自己的高速轮询）
+    // 分析进行中时定期轮询刷新状态
     refetchInterval: (query) => {
       const status = query.state.data?.status;
       return status && ACTIVE_STATES.has(status) ? 10000 : false;
@@ -40,8 +39,6 @@ export default function AssignmentDetail() {
       await assignmentService.analyze(Number(id));
       message.success("分析已开始，请稍候...");
       queryClient.invalidateQueries({ queryKey: ["assignment", id] });
-      setShowProgress(true);
-      setUserClosed(false);
     } catch (err) {
       console.error("启动分析失败:", err);
       message.error("启动分析失败");
@@ -50,25 +47,15 @@ export default function AssignmentDetail() {
     }
   };
 
-  // 页面加载时如果分析正在运行，自动弹出监控弹窗（用户主动关闭后不再自动弹出）
-  useEffect(() => {
-    if (data && ACTIVE_STATES.has(data.status) && !showProgress && !userClosed) {
-      setShowProgress(true);
-    }
-    if (data && !ACTIVE_STATES.has(data.status)) {
-      setUserClosed(false);
-    }
-  }, [data, showProgress, userClosed]);
-
   if (isLoading) return <Spin size="large" style={{ display: "block", margin: "100px auto" }} />;
   if (error || !data) return <Alert type="error" message="加载失败" />;
 
   const statusCfg = ASSIGNMENT_STATUS_MAP[data.status] || { color: "default", label: data.status };
   // 手动切割：pending/failed 状态可操作，其他状态仅显示（禁用）
   const canManualSplit = data.status === "pending" || data.status === "failed";
-  // 开始分析：只要不是 pending（还没切割题目）就能点，支持重新分析
-  const canStartAnalysis = data.status !== "pending";
-  // 正在分析中时不显示手动切割
+  // 开始分析：必须先完成手动切割（splitted/completed/failed），未切割（pending）不能分析
+  const canStartAnalysis = data.status === "splitted" || data.status === "completed" || data.status === "failed";
+  // 正在分析中时不显示手动切割和答案切割
   const showManualSplit = !["grading", "processing"].includes(data.status);
 
   return (
@@ -86,14 +73,23 @@ export default function AssignmentDetail() {
           <Typography.Title level={4} style={{ margin: 0 }}>{data.name}</Typography.Title>
           <Space>
             {showManualSplit && (
-              <Button
-                type={canManualSplit ? "primary" : "default"}
-                icon={<ScissorOutlined />}
-                disabled={!canManualSplit}
-                onClick={() => setManualSplitVisible(true)}
-              >
-                手动切割
-              </Button>
+              <>
+                <Button
+                  type={canManualSplit ? "primary" : "default"}
+                  icon={<ScissorOutlined />}
+                  disabled={!canManualSplit}
+                  onClick={() => setManualSplitVisible(true)}
+                >
+                  手动切割
+                </Button>
+                <Button
+                  icon={<UploadOutlined />}
+                  disabled={!data.questions || data.questions.length === 0}
+                  onClick={() => setAnswerSplitVisible(true)}
+                >
+                  答案切割
+                </Button>
+              </>
             )}
             {canStartAnalysis && (
               <Button
@@ -147,7 +143,7 @@ export default function AssignmentDetail() {
           />
         )}
 
-        {/* 分析失败简要提示（详细错误见弹窗） */}
+        {/* 分析失败提示 */}
         {data.status === "failed" && (
           <Alert
             type="error"
@@ -181,17 +177,6 @@ export default function AssignmentDetail() {
         </>
       )}
 
-      {/* 悬浮进度面板 */}
-      <AnalysisProgressPanel
-        assignmentId={Number(id)}
-        visible={showProgress}
-        onClose={() => {
-          setShowProgress(false);
-          setUserClosed(true);
-          queryClient.invalidateQueries({ queryKey: ["assignment", id] });
-        }}
-      />
-
       {/* 手动切割弹窗 */}
       <ManualSplitModal
         assignmentId={Number(id)}
@@ -199,10 +184,24 @@ export default function AssignmentDetail() {
         prefillRegion={null}
         onSuccess={() => {
           setManualSplitVisible(false);
-          setUserClosed(true);  // 阻止进度面板自动弹出（手动切割无后台任务）
           queryClient.invalidateQueries({ queryKey: ["assignment", id] });
         }}
         onCancel={() => setManualSplitVisible(false)}
+      />
+
+      {/* 答案切割弹窗 */}
+      <AnswerSplitModal
+        assignmentId={Number(id)}
+        questions={(data.questions || []).filter((q) => !q.parent_id).map((q) => ({
+          id: q.id,
+          question_number: q.question_number,
+        }))}
+        visible={answerSplitVisible}
+        onSuccess={() => {
+          setAnswerSplitVisible(false);
+          queryClient.invalidateQueries({ queryKey: ["assignment", id] });
+        }}
+        onCancel={() => setAnswerSplitVisible(false)}
       />
 
     </div>

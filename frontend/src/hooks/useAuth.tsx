@@ -20,9 +20,14 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   useEffect(() => {
     const accessToken = localStorage.getItem("access_token");
     if (accessToken) {
-      // Try to restore session - just trust the token for now
-      // A failed request will trigger the 401 interceptor to clear state
-      setUser({ id: 0, username: "" });
+      const storedUserId = localStorage.getItem("user_id");
+      const storedUsername = localStorage.getItem("username");
+      if (storedUserId && storedUsername) {
+        setUser({ id: Number(storedUserId), username: storedUsername });
+      } else {
+        // Legacy: tokens exist but user info missing — will be corrected on first API response
+        setUser({ id: 0, username: "" });
+      }
     }
     setIsLoading(false);
   }, []);
@@ -31,6 +36,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const result: TokenResponse = await authService.login({ username, password });
     localStorage.setItem("access_token", result.access_token);
     localStorage.setItem("refresh_token", result.refresh_token);
+    localStorage.setItem("user_id", String(result.user_id));
+    localStorage.setItem("username", result.username);
     setUser({ id: result.user_id, username: result.username });
   }, []);
 
@@ -40,6 +47,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(() => {
     authService.logout();
+    localStorage.removeItem("user_id");
+    localStorage.removeItem("username");
     setUser(null);
   }, []);
 

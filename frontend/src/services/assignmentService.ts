@@ -52,6 +52,16 @@ export interface QuestionItem {
   bbox_y?: number;
   bbox_w?: number;
   bbox_h?: number;
+  /** 大题套小题：父题ID（子题关联父题） */
+  parent_id?: number | null;
+  /** 大题套小题：子题在大题中的序号（0开始） */
+  sub_question_index?: number | null;
+  /** 大题套小题：子题列表（仅父题有此字段） */
+  children?: QuestionItem[];
+  /** 学生答案切割图片URL（上传答案并切割后生成） */
+  answer_image_url?: string | null;
+  /** 人工审核备注（重新生成时输入，持久化存储） */
+  manual_review_note?: string | null;
 }
 
 export interface PageInfo {
@@ -74,6 +84,7 @@ export interface ManualRegion {
   w: number;
   h: number;
   draw_order: number;
+  rotation?: number;  // 图片旋转角度：0/90/180/270
 }
 
 export interface PaginatedResponse<T> {
@@ -180,6 +191,40 @@ export const assignmentService = {
     message: string;
   }> {
     const { data } = await api.post(`/assignments/${id}/manual-split`, { regions });
+    return data;
+  },
+
+  /** 上传答案文件，获取页面图片供答案切割使用 */
+  async uploadAnswerFile(
+    id: number,
+    file: File,
+  ): Promise<{ pages: PageInfo[]; total_pages: number; answer_file_url: string }> {
+    const formData = new FormData();
+    formData.append("file", file);
+    const { data } = await api.post(`/assignments/${id}/answer-pages`, formData, {
+      timeout: 120000,
+    });
+    return data;
+  },
+
+  /** 提交答案切割区域，保存到各题目的 answer_image_url */
+  async saveAnswerSplit(
+    id: number,
+    regions: Array<{
+      question_number: number;
+      page_index: number;
+      x: number;
+      y: number;
+      w: number;
+      h: number;
+      rotation?: number;
+    }>,
+    answerFileUrl: string,
+  ): Promise<{ assignment_id: number; updated_count: number; message: string }> {
+    const { data } = await api.post(`/assignments/${id}/answer-split`, {
+      regions,
+      answer_file_url: answerFileUrl,
+    });
     return data;
   },
 };

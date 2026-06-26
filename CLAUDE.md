@@ -4,7 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 # AI 助教系统
 
+本系统为C端产品,旨在为用户提供一个个性化的学习空间
+
+# 项目要求
+
 Claude Code 输出内容需用中文显示，不要在执行过程显示英文。
+代码要有详细的中文注释,方便后续的维护
 
 ## 项目概述
 

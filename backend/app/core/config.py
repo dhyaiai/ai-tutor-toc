@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     LOCAL_STORAGE_DIR: str = "./uploads"
 
     # JWT
-    SECRET_KEY: str = "dev-secret-key-change-in-production"
+    SECRET_KEY: str = ""
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     REFRESH_TOKEN_EXPIRE_DAYS: int = 7
     ALGORITHM: str = "HS256"

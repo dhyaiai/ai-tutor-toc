@@ -134,14 +134,19 @@ class AgentExecutor:
                         })
 
                 else:
-                    # Final answer - stream tokens
-                    # For simplicity, send full content as tokens
-                    full_content = msg.content or ""
-                    for i in range(0, len(full_content), 5):
-                        yield {
-                            "type": "token",
-                            "content": full_content[i: i + 5],
-                        }
+                    # Final answer — request a real streaming completion for this turn
+                    yield {"type": "reasoning", "content": "正在生成回答..."}
+                    stream = await self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        temperature=0.3,
+                        stream=True,
+                        timeout=120,
+                    )
+                    async for chunk in stream:
+                        delta = chunk.choices[0].delta if chunk.choices else None
+                        if delta and delta.content:
+                            yield {"type": "token", "content": delta.content}
                     yield {"type": "done"}
                     return
 

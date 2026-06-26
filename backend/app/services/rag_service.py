@@ -40,18 +40,39 @@ class RAGService:
     def __init__(self):
         self._client = None
         self._embedding_client = None
+        from app.core.config import get_settings
+        self._settings = get_settings()
+        self._qdrant_available: bool | None = None  # tri-state: None=unchecked, True/False
+
+    def _is_qdrant_available(self) -> bool:
+        """Check if Qdrant is reachable. Cache result to avoid repeated timeouts."""
+        if self._qdrant_available is not None:
+            return self._qdrant_available
+        try:
+            from qdrant_client import QdrantClient
+            client = QdrantClient(
+                host=self._settings.QDRANT_HOST,
+                port=self._settings.QDRANT_PORT,
+                timeout=3,
+            )
+            client.get_collections()  # Quick health check
+            self._qdrant_available = True
+        except Exception:
+            logger.warning("Qdrant is not available — vector search will return empty results")
+            self._qdrant_available = False
+        return self._qdrant_available
 
     @property
     def client(self):
         if self._client is None:
+            if not self._is_qdrant_available():
+                raise RuntimeError("Qdrant is not available")
             from qdrant_client import QdrantClient
             from qdrant_client.models import Distance, VectorParams
-            from app.core.config import get_settings
 
-            settings = get_settings()
             self._client = QdrantClient(
-                host=settings.QDRANT_HOST,
-                port=settings.QDRANT_PORT,
+                host=self._settings.QDRANT_HOST,
+                port=self._settings.QDRANT_PORT,
             )
 
             # Ensure collection exists
@@ -105,6 +126,9 @@ class RAGService:
             metadata: 附加元数据 {assignment_id, grade, subject, ...}
             chunk_id: 可选，自定义主键
         """
+        if not self._is_qdrant_available():
+            logger.info("RAG index skipped: Qdrant not available")
+            return
         if chunk_id is None:
             chunk_id = str(uuid.uuid4())
 
@@ -139,6 +163,9 @@ class RAGService:
             chunks: [{"text": "...", "metadata": {...}}, ...]
         """
         if not chunks:
+            return
+        if not self._is_qdrant_available():
+            logger.info("RAG batch_index skipped: Qdrant not available")
             return
 
         # Enrich all
@@ -181,8 +208,12 @@ class RAGService:
             score_threshold: 最低相似度阈值
 
         Returns:
-            按相似度降序排列的搜索结果
+            按相似度降序排列的搜索结果。Qdrant 不可用时返回空列表。
         """
+        if not self._is_qdrant_available():
+            logger.info("RAG search skipped: Qdrant not available (dev mode fallback)")
+            return []
+
         query_vec = await self._embed([query])
 
         from qdrant_client.models import Filter, FieldCondition, MatchValue

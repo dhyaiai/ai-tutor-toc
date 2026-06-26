@@ -41,6 +41,12 @@ api.interceptors.response.use(
   async (error) => {
     const originalRequest = error.config;
 
+    // 登录接口的 401 是正常的认证失败（账号或密码错误），
+    // 不应触发 token 刷新或页面跳转，直接透传错误给登录页显示
+    if (originalRequest.url?.includes('/auth/login')) {
+      return Promise.reject(error);
+    }
+
     if (error.response?.status === 401 && !originalRequest._retry) {
       if (isRefreshing) {
         return new Promise((resolve, reject) => {
@@ -59,6 +65,8 @@ api.interceptors.response.use(
         isRefreshing = false;
         localStorage.removeItem("access_token");
         localStorage.removeItem("refresh_token");
+        localStorage.removeItem("user_id");
+        localStorage.removeItem("username");
         window.location.href = "/login";
         return Promise.reject(error);
       }

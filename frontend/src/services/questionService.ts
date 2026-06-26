@@ -46,7 +46,7 @@ export const questionService = {
     return data;
   },
 
-  async adjustRegion(id: number, region: { page_index: number; x: number; y: number; w: number; h: number }): Promise<{
+  async adjustRegion(id: number, region: { page_index: number; x: number; y: number; w: number; h: number; rotation?: number }): Promise<{
     question_id: number;
     image_url: string;
     bbox: { x: number; y: number; w: number; h: number };

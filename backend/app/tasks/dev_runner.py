@@ -23,20 +23,8 @@ def run_async_in_background(coro):
         threading.Thread(target=_run, daemon=True).start()
 
 
-async def _safe_analyze(assignment_id: int):
-    """Wrap _do_analyze with error handling to mark assignment as FAILED on crash."""
-    from app.tasks.analysis_tasks import _do_analyze, _mark_failed
-    try:
-        await _do_analyze(assignment_id)
-    except Exception as exc:
-        logger.error("[dev] Analysis failed for assignment %d: %s", assignment_id, exc, exc_info=True)
-        try:
-            await _mark_failed(assignment_id, str(exc))
-        except Exception as mark_exc:
-            logger.error("[dev] Failed to mark assignment %d as FAILED: %s", assignment_id, mark_exc)
-
-
 def analyze_assignment_dev(assignment_id: int):
     """Dev-mode equivalent of analyze_assignment.delay()."""
+    from app.tasks.analysis_tasks import _do_analyze
     logger.info("[dev] Starting analysis for assignment %d", assignment_id)
-    run_async_in_background(_safe_analyze(assignment_id))
+    run_async_in_background(_do_analyze(assignment_id))
