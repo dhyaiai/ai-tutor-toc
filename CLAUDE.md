@@ -1,10 +1,8 @@
 # CLAUDE.md
 
-This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-
 # AI 助教系统
 
-本系统为C端产品,旨在为用户提供一个个性化的学习空间
+本系统为C端产品,旨在为用户提供个性化的学习空间
 
 # 项目要求
 

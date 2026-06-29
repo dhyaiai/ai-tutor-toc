@@ -1,36 +1,50 @@
+"""学情分析 Schema 定义"""
+
 from pydantic import BaseModel
+from datetime import datetime
 
 
-class SubjectAverage(BaseModel):
+# ==================== 子板块1：作业统计 ====================
+
+class SubjectStat(BaseModel):
+    """各科目作业数量统计"""
     subject: str
-    average: float
     count: int
 
 
-class AnalyticsOverview(BaseModel):
-    total_assignments: int
-    average_score: float
-    total_questions: int
-    error_rate: float
-    subject_averages: list[SubjectAverage]
+class HomeworkStatsResponse(BaseModel):
+    """作业统计响应"""
+    total: int
+    subject_stats: list[SubjectStat]
 
 
-class ScoreTrendPoint(BaseModel):
-    month: str
-    average_score: float
-    count: int
+# ==================== 子板块2：学生学期看板 ====================
+
+class DashboardItem(BaseModel):
+    """学生学期看板单条数据"""
+    id: int
+    name: str
+    grade: str
+    subject: str
+    semester: str
+    created_at: datetime
+    score_rate: float  # 得分率，范围 0~1
 
 
-class ScoreTrendResponse(BaseModel):
-    trends: list[ScoreTrendPoint]
+class DashboardResponse(BaseModel):
+    """学生学期看板响应"""
+    items: list[DashboardItem]
 
 
-class WeakPoint(BaseModel):
+# ==================== 子板块3：知识点热力图 ====================
+
+class KnowledgeHeatmapItem(BaseModel):
+    """知识点热力图单条数据"""
     knowledge_point: str
-    error_count: int
-    total_count: int
-    error_rate: float
+    frequency: int       # 考察频次
+    score_rate: float    # 得分率，范围 0~1
 
 
-class WeaknessResponse(BaseModel):
-    weak_points: list[WeakPoint]
+class KnowledgeHeatmapResponse(BaseModel):
+    """知识点热力图响应"""
+    items: list[KnowledgeHeatmapItem]

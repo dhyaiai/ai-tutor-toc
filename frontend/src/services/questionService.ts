@@ -16,11 +16,6 @@ export const questionService = {
     return data;
   },
 
-  async confirm(id: number, params: { score?: number; analysis_detail?: string }) {
-    const { data } = await api.post(`/questions/${id}/confirm`, params);
-    return data;
-  },
-
   async generateSimilar(id: number): Promise<{ task_id: number; status: string }> {
     const { data } = await api.post(`/questions/${id}/similar`, {});
     return data;

@@ -10,7 +10,7 @@ class QuestionStatus(str, enum.Enum):
     PENDING = "pending"
     COMPLETED = "completed"
     FAILED = "failed"
-    CONFIRMED = "confirmed"
+    CONFIRMED = "confirmed"  # 保留以兼容历史数据，新流程不再使用
 
 
 class AnalysisTaskType(str, enum.Enum):

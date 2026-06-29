@@ -7,7 +7,7 @@ from app.models.user import User
 from app.models.assignment import Assignment
 from app.models.question import Question, QuestionStatus, AnalysisTask, AnalysisTaskType, AnalysisTaskStatus
 from pydantic import BaseModel
-from app.schemas.question import QuestionConfirm, SimilarQuestionsResponse
+from app.schemas.question import SimilarQuestionsResponse
 
 router = APIRouter(prefix="/questions", tags=["questions"])
 
@@ -59,46 +59,6 @@ async def reanalyze_question(
         asyncio.create_task(_do_reanalyze(question_id, data.remark))
 
     return {"task_id": None, "status": "pending", "message": "重新分析任务已创建"}
-
-
-@router.post("/{question_id}/confirm")
-async def confirm_question(
-    question_id: int,
-    data: QuestionConfirm,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    result = await db.execute(select(Question).where(Question.id == question_id))
-    question = result.scalar_one_or_none()
-    if not question:
-        raise HTTPException(status_code=404, detail="Question not found")
-
-    # Verify ownership
-    a_result = await db.execute(
-        select(Assignment).where(
-            Assignment.id == question.assignment_id,
-            Assignment.creator_id == current_user.id,
-        )
-    )
-    if not a_result.scalar_one_or_none():
-        raise HTTPException(status_code=403, detail="Access denied")
-
-    if data.score is not None:
-        question.score = data.score
-    if data.analysis_detail is not None:
-        question.analysis_detail = data.analysis_detail
-    question.status = QuestionStatus.CONFIRMED
-    await db.flush()
-
-    # 同步更新作业总分
-    from app.tasks.analysis_tasks import recalc_assignment_total
-    await recalc_assignment_total(question.assignment_id, db, user_id=current_user.id)
-
-    return {
-        "question_id": question.id,
-        "status": question.status.value,
-        "message": "Question confirmed.",
-    }
 
 
 # 同类题生成内存缓存: question_id -> {"status": "pending|processing|completed|failed", "result": [...]}

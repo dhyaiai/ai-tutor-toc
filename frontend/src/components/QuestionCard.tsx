@@ -1,5 +1,5 @@
 import { Card, Tag, Button, Space, Typography, Popconfirm, Popover, Image, Descriptions, Input, message, Spin, Collapse, Alert } from "antd";
-import { ReloadOutlined, CheckOutlined, DeleteOutlined, ExpandOutlined } from "@ant-design/icons";
+import { ReloadOutlined, DeleteOutlined, ExpandOutlined } from "@ant-design/icons";
 import { useState } from "react";
 import { useReanalysis } from "../hooks/useReanalysis";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -21,12 +21,8 @@ interface Props {
  */
 function SubQuestionCard({
   question,
-  onConfirm,
-  confirming,
 }: {
   question: QuestionItem;
-  onConfirm: () => void;
-  confirming: boolean;
 }) {
   const statusCfg = QUESTION_STATUS_MAP[question.status] || { color: "default", label: question.status };
   const subIndex = question.sub_question_index != null ? question.sub_question_index + 1 : "?";
@@ -48,17 +44,6 @@ function SubQuestionCard({
             <Tag color="orange" style={{ fontSize: 11 }}>低置信度</Tag>
           )}
         </Space>
-      }
-      extra={
-        <Button
-          size="small"
-          icon={<CheckOutlined />}
-          loading={confirming}
-          onClick={onConfirm}
-          type="link"
-        >
-          确认
-        </Button>
       }
     >
       <Descriptions column={2} size="small">
@@ -138,20 +123,6 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
   const [remarkOpen, setRemarkOpen] = useState(false);
   const [remark, setRemark] = useState("");
 
-  const confirmMutation = useMutation({
-    mutationFn: (params: { score?: number; analysis_detail?: string }) =>
-      questionService.confirm(question.id, params),
-    onSuccess: () => {
-      message.success("题目已确认");
-      queryClient.invalidateQueries({ queryKey: ["assignment"] });
-      queryClient.invalidateQueries({ queryKey: ["assignments"] });
-      queryClient.invalidateQueries({ queryKey: ["analytics"] });
-    },
-    onError: (err: any) => {
-      message.error("确认失败: " + (err?.response?.data?.detail || err?.message || "未知错误"));
-    },
-  });
-
   const deleteMutation = useMutation({
     mutationFn: () => questionService.delete(question.id),
     onSuccess: () => {
@@ -162,24 +133,6 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
     },
     onError: (err: any) => {
       message.error("删除失败: " + (err?.response?.data?.detail || err?.message || "未知错误"));
-    },
-  });
-
-  // 子题确认 hook
-  const childConfirmMutation = useMutation({
-    mutationFn: (params: { questionId: number; score?: number; analysis_detail?: string }) =>
-      questionService.confirm(params.questionId, {
-        score: params.score,
-        analysis_detail: params.analysis_detail,
-      }),
-    onSuccess: () => {
-      message.success("小题已确认");
-      queryClient.invalidateQueries({ queryKey: ["assignment"] });
-      queryClient.invalidateQueries({ queryKey: ["assignments"] });
-      queryClient.invalidateQueries({ queryKey: ["analytics"] });
-    },
-    onError: (err: any) => {
-      message.error("确认失败: " + (err?.response?.data?.detail || err?.message || "未知错误"));
     },
   });
 
@@ -195,18 +148,7 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
 
   // ── 模式3：子题（正常不应独立出现，兜底显示紧凑版）──
   if (isChild && !hasChildren) {
-    return (
-      <SubQuestionCard
-        question={question}
-        onConfirm={() =>
-          confirmMutation.mutate({
-            score: question.score ?? undefined,
-            analysis_detail: question.analysis_detail ?? undefined,
-          })
-        }
-        confirming={confirmMutation.isPending}
-      />
-    );
+    return <SubQuestionCard question={question} />;
   }
 
   // ── 模式1：父题（有子题）──
@@ -357,18 +299,7 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
               各小题详情：
             </Typography.Text>
             {sortedChildren.map((child) => (
-              <SubQuestionCard
-                key={child.id}
-                question={child}
-                onConfirm={() =>
-                  childConfirmMutation.mutate({
-                    questionId: child.id,
-                    score: child.score ?? undefined,
-                    analysis_detail: child.analysis_detail ?? undefined,
-                  })
-                }
-                confirming={childConfirmMutation.isPending}
-              />
+              <SubQuestionCard key={child.id} question={child} />
             ))}
           </div>
         </Card>
@@ -442,19 +373,6 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
                 </Popconfirm>
               </>
             )}
-            <Popconfirm
-              title="确认此题分析结果？"
-              onConfirm={() =>
-                confirmMutation.mutate({
-                  score: question.score ?? undefined,
-                  analysis_detail: question.analysis_detail ?? undefined,
-                })
-              }
-            >
-              <Button size="small" icon={<CheckOutlined />} loading={confirmMutation.isPending}>
-                确认
-              </Button>
-            </Popconfirm>
             <Popover
               open={remarkOpen}
               onOpenChange={(open) => {

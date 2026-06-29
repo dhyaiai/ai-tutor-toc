@@ -501,7 +501,7 @@ async def _do_reanalyze(question_id: int, remark: str | None = None):
                 question = result.scalar_one_or_none()
                 # 只要不是已完成的正常状态，都标记 FAILED
                 # （PENDING 可能因 flush 未 commit 被回滚，所以不判断具体状态）
-                if question and question.status not in (QuestionStatus.COMPLETED, QuestionStatus.CONFIRMED):
+                if question and question.status != QuestionStatus.COMPLETED:
                     question.status = QuestionStatus.FAILED
                     question.analysis_detail = f"重分析异常: {str(e)}"
                     await db.commit()

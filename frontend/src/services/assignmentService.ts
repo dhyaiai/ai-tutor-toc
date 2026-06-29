@@ -207,6 +207,12 @@ export const assignmentService = {
     return data;
   },
 
+  /** 重新汇总整卷分数和AI评语（不重新评分，仅重新计算总分和生成评语） */
+  async reSummarize(id: number): Promise<{ message: string }> {
+    const { data } = await api.post(`/assignments/${id}/re-summarize`);
+    return data;
+  },
+
   /** 提交答案切割区域，保存到各题目的 answer_image_url */
   async saveAnswerSplit(
     id: number,

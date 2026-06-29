@@ -164,39 +164,37 @@ class AgentTools:
             return {"count": 0, "results": [], "note": "向量检索暂不可用"}
 
     async def _get_scores(self, args: dict) -> dict:
-        """学情概览"""
+        """学情概览（作业统计）"""
         from app.services.analytics_aggregator import AnalyticsAggregator
 
         aggregator = AnalyticsAggregator(self.db)
-        return await aggregator.get_overview(
+        return await aggregator.get_homework_stats(
             user_id=self.user_id,
             grade=args.get("grade"),
-            subject=args.get("subject"),
+            semester=args.get("semester"),
         )
 
     async def _get_error_kp(self, args: dict) -> dict:
-        """错题知识点"""
+        """错题知识点（热力图数据）"""
         from app.services.analytics_aggregator import AnalyticsAggregator
 
         aggregator = AnalyticsAggregator(self.db)
-        weak_points = await aggregator.get_weakness(
+        items = await aggregator.get_knowledge_heatmap(
             user_id=self.user_id,
             grade=args.get("grade"),
             subject=args.get("subject"),
-            semester=args.get("semester"),
-            limit=args.get("limit", 10),
         )
-        return {"weak_points": weak_points}
+        return {"items": items}
 
     async def _get_trend(self, args: dict) -> dict:
-        """分数趋势"""
+        """分数趋势（得分率看板）"""
         from app.services.analytics_aggregator import AnalyticsAggregator
 
         aggregator = AnalyticsAggregator(self.db)
-        trends = await aggregator.get_score_trend(
+        items = await aggregator.get_student_dashboard(
             user_id=self.user_id,
             grade=args.get("grade"),
             subject=args.get("subject"),
             semester=args.get("semester"),
         )
-        return {"trends": trends}
+        return {"items": items}

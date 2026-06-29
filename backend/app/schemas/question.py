@@ -34,11 +34,6 @@ class QuestionResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-class QuestionConfirm(BaseModel):
-    score: float | None = None
-    analysis_detail: str | None = None
-
-
 class SimilarQuestion(BaseModel):
     id: int
     question_text: str

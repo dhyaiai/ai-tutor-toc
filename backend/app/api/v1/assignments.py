@@ -220,7 +220,7 @@ async def pre_upload_file(
 @router.get("", response_model=PaginatedResponse)
 async def list_assignments(
     page: int = Query(1, ge=1),
-    page_size: int = Query(10, ge=1, le=100),
+    page_size: int = Query(10, ge=1, le=500),
     grade: str | None = Query(None),
     subject: str | None = Query(None),
     semester: str | None = Query(None),
@@ -568,6 +568,90 @@ async def cancel_analysis(
     await db.commit()
 
     return {"assignment_id": assignment_id, "status": "failed", "message": "Analysis cancelled."}
+
+
+@router.post("/{assignment_id}/re-summarize", status_code=status.HTTP_200_OK)
+async def re_summarize(
+    assignment_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    重新汇总整卷分数和AI评语。
+
+    不重新逐题评分，仅基于现有题目分数重新计算总分，并重新生成整体分析评语。
+    用于用户在确认/修正各题分数后刷新整卷分析结果。
+    """
+    # 1. 校验所有权
+    result = await db.execute(
+        select(Assignment).where(
+            Assignment.id == assignment_id,
+            Assignment.creator_id == current_user.id,
+        )
+    )
+    assignment = result.scalar_one_or_none()
+    if not assignment:
+        raise HTTPException(status_code=404, detail="作业不存在")
+
+    if assignment.status != AssignmentStatus.COMPLETED:
+        raise HTTPException(status_code=400, detail="仅已完成分析的作业可以重新汇总")
+
+    # 2. 重新计算总分
+    from app.tasks.analysis_tasks import recalc_assignment_total
+    await recalc_assignment_total(assignment_id, db, user_id=current_user.id)
+
+    # 3. 刷新 assignment 数据（recalc 内部已 commit，需要重新加载）
+    await db.refresh(assignment)
+
+    # 4. 获取叶子题目，重新生成AI评语
+    from app.tasks.analysis_tasks import _generate_assignment_summary
+    from app.models.question import Question
+
+    q_result = await db.execute(
+        select(Question)
+        .where(Question.assignment_id == assignment_id)
+        .order_by(Question.question_number, Question.sub_question_index)
+    )
+    all_qs = q_result.scalars().all()
+    parent_ids = {q.parent_id for q in all_qs if q.parent_id is not None}
+    leaf_records = [(q, None) for q in all_qs if q.id not in parent_ids]
+
+    error_count = sum(
+        1 for q, _ in leaf_records
+        if q.score is not None and q.full_score is not None and q.score < q.full_score
+    )
+
+    try:
+        ai_summary = await _generate_assignment_summary(
+            question_records=leaf_records,
+            total_score=assignment.total_score or 0,
+            q_count=len(leaf_records),
+            error_count=error_count,
+        )
+        assignment.ai_summary = ai_summary
+    except Exception as e:
+        logger.warning("重新汇总: LLM评语生成失败，使用基础评语: %s", e)
+        from app.tasks.analysis_tasks import _generate_assignment_summary
+        kp_set: set[str] = set()
+        for q, _ in leaf_records:
+            if q.knowledge_points:
+                for kp in (q.knowledge_points if isinstance(q.knowledge_points, list) else []):
+                    name = kp if isinstance(kp, str) else kp.get("name", str(kp)) if isinstance(kp, dict) else str(kp)
+                    kp_set.add(name)
+        kp_list = ", ".join(kp_set) if kp_set else "暂无"
+        assignment.ai_summary = (
+            f"本作业共 {len(leaf_records)} 题，总分 {assignment.total_score or 0} 分。"
+            f"错题 {error_count} 题。"
+            f"涉及知识点：{kp_list}。"
+        )
+
+    await db.commit()
+
+    return {
+        "assignment_id": assignment_id,
+        "total_score": assignment.total_score,
+        "message": "整卷分析已更新",
+    }
 
 
 @router.get("/{assignment_id}/source-pages")

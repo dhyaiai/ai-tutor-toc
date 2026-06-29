@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { Card, Typography, Descriptions, Tag, Space, Button, Spin, Alert, message } from "antd";
-import { ArrowLeftOutlined, PlayCircleOutlined, ScissorOutlined, EyeOutlined, UploadOutlined } from "@ant-design/icons";
+import { ArrowLeftOutlined, PlayCircleOutlined, ScissorOutlined, EyeOutlined, UploadOutlined, ReloadOutlined } from "@ant-design/icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { assignmentService } from "../../../services/assignmentService";
 import { ASSIGNMENT_STATUS_MAP } from "../../../utils/constants";
@@ -18,6 +18,7 @@ export default function AssignmentDetail() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [analyzing, setAnalyzing] = useState(false);
+  const [reSummarizing, setReSummarizing] = useState(false);
   const [manualSplitVisible, setManualSplitVisible] = useState(false);
   const [answerSplitVisible, setAnswerSplitVisible] = useState(false);
 
@@ -44,6 +45,22 @@ export default function AssignmentDetail() {
       message.error("启动分析失败");
     } finally {
       setAnalyzing(false);
+    }
+  };
+
+  /** 重新汇总整卷分数和AI评语 */
+  const handleReSummarize = async () => {
+    if (!id) return;
+    setReSummarizing(true);
+    try {
+      await assignmentService.reSummarize(Number(id));
+      message.success("整卷分析已更新");
+      queryClient.invalidateQueries({ queryKey: ["assignment", id] });
+    } catch (err) {
+      console.error("重新汇总失败:", err);
+      message.error("重新汇总失败");
+    } finally {
+      setReSummarizing(false);
     }
   };
 
@@ -112,7 +129,20 @@ export default function AssignmentDetail() {
             {data.total_score != null ? `${data.total_score} / ${data.full_total ?? "-"}` : "-"}
           </Descriptions.Item>
           <Descriptions.Item label="状态">
-            <Tag color={statusCfg.color}>{statusCfg.label}</Tag>
+            <Space>
+              <Tag color={statusCfg.color}>{statusCfg.label}</Tag>
+              {data.status === "completed" && (
+                <Button
+                  size="small"
+                  type="link"
+                  icon={<ReloadOutlined />}
+                  loading={reSummarizing}
+                  onClick={handleReSummarize}
+                >
+                  重新分析
+                </Button>
+              )}
+            </Space>
           </Descriptions.Item>
           <Descriptions.Item label="上传时间">{formatDate(data.created_at, true)}</Descriptions.Item>
           <Descriptions.Item label="作业预览">
@@ -137,7 +167,7 @@ export default function AssignmentDetail() {
         {data.ai_summary && data.status === "completed" && (
           <Alert
             type="info"
-            message="AI 整体分析"
+            message="助教有话说"
             description={data.ai_summary}
             style={{ marginTop: 16 }}
           />
