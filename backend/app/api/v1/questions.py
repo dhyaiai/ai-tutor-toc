@@ -12,6 +12,16 @@ from app.schemas.question import SimilarQuestionsResponse
 router = APIRouter(prefix="/questions", tags=["questions"])
 
 
+class AdjustRegionItem(BaseModel):
+    """单个裁切区域（额外区域使用，如 A4 双栏左右分栏）"""
+    page_index: int = 0
+    x: float
+    y: float
+    w: float
+    h: float
+    rotation: int = 0  # 图片旋转角度：0/90/180/270
+
+
 class AdjustRegionRequest(BaseModel):
     page_index: int = 0
     x: float
@@ -19,6 +29,8 @@ class AdjustRegionRequest(BaseModel):
     w: float
     h: float
     rotation: int = 0  # 图片旋转角度：0/90/180/270
+    # 同题额外区域（与主区域垂直拼接，支持双栏/跨页）
+    extra_regions: list[AdjustRegionItem] = []
 
 
 class ReanalyzeRequest(BaseModel):
@@ -67,7 +79,10 @@ _similar_cache: dict[int, dict] = {}
 
 
 async def _run_similar_generation(question_id: int):
-    """后台执行同类题生成——逐题生成，每生成完1题就更新缓存"""
+    """后台执行同类题生成。
+    普通题：生成 3 道（easy/medium/hard）逐题更新缓存。
+    父题（大题）：只生成 1 道中等难度类似大题，节省 Token。
+    """
     try:
         from sqlalchemy import select as _select
         from app.db.session import async_session_factory
@@ -80,6 +95,75 @@ async def _run_similar_generation(question_id: int):
                 _similar_cache[question_id] = {"status": "failed", "error": "题目不存在"}
                 return
 
+            generator = SimilarGenerator()
+
+            # ── 检测是否为父题（大题）──
+            children_result = await _db.execute(
+                _select(Question).where(Question.parent_id == question_id)
+                .order_by(Question.sub_question_index)
+            )
+            children = children_result.scalars().all()
+
+            if children:
+                # ── 大题：生成 1 道类似大题 ──
+                _similar_cache[question_id] = {"status": "processing", "result": None, "is_big_question": True}
+
+                # 构建父题和子题信息字典
+                parent_info = {
+                    "question_number": _question.question_number,
+                    "question_type": _question.question_type,
+                    "knowledge_points": _question.knowledge_points,
+                }
+                children_info = []
+                for child in children:
+                    children_info.append({
+                        "question_type": child.question_type,
+                        "student_answer": child.student_answer,
+                        "correct_answer": child.correct_answer,
+                        "knowledge_points": child.knowledge_points,
+                        "analysis_detail": child.analysis_detail,
+                        "score": child.score,
+                        "full_score": child.full_score,
+                    })
+
+                try:
+                    big_q = await _asyncio.wait_for(
+                        generator.generate_similar_big_question(parent_info, children_info, difficulty="medium"),
+                        timeout=300,
+                    )
+                except _asyncio.TimeoutError:
+                    logger.error("Similar big question generation timeout for question %d", question_id)
+                    _similar_cache[question_id] = {"status": "failed", "error": "生成超时，请重试", "is_big_question": True}
+                    return
+                except Exception as _exc:
+                    logger.error("Similar big question generation failed for question %d: %s", question_id, _exc)
+                    _similar_cache[question_id] = {"status": "failed", "error": str(_exc), "is_big_question": True}
+                    return
+
+                if not big_q:
+                    _similar_cache[question_id] = {"status": "failed", "error": "生成失败，请重试", "is_big_question": True}
+                    return
+
+                result_data = {
+                    "question_context": big_q.question_context,
+                    "sub_questions": [
+                        {
+                            "question_text": sq.question_text,
+                            "answer": sq.answer,
+                            "analysis": sq.analysis,
+                            "knowledge_point": sq.knowledge_point,
+                            "difficulty": sq.difficulty,
+                            "question_type": sq.question_type,
+                            "options": sq.options,
+                            "full_score": sq.full_score,
+                        }
+                        for sq in big_q.sub_questions
+                    ],
+                }
+                _similar_cache[question_id] = {"status": "completed", "result": result_data, "is_big_question": True}
+                return
+
+            # ── 普通题：逐题生成 3 道（easy/medium/hard）──
             kps = _question.knowledge_points
             raw_list = kps if isinstance(kps, list) else list(kps.values()) if isinstance(kps, dict) else None
             kp_list = [
@@ -87,13 +171,12 @@ async def _run_similar_generation(question_id: int):
                 for k in raw_list
             ] if raw_list else None
 
-            generator = SimilarGenerator()
             difficulties = ["easy", "medium", "hard"]
             all_results = []
 
             # 逐题生成，每完成1题就更新缓存；单题超时 240s
             SINGLE_TIMEOUT = 240
-            _similar_cache[question_id] = {"status": "processing", "result": all_results}
+            _similar_cache[question_id] = {"status": "processing", "result": all_results, "is_big_question": False}
             for diff in difficulties:
                 try:
                     sq = await _asyncio.wait_for(
@@ -119,6 +202,7 @@ async def _run_similar_generation(question_id: int):
                         "id": len(all_results),
                         "question_text": sq.question_text,
                         "answer": sq.answer,
+                        "analysis": sq.analysis,
                         "knowledge_point": sq.knowledge_point,
                         "difficulty": sq.difficulty,
                         "question_type": sq.question_type,
@@ -131,15 +215,16 @@ async def _run_similar_generation(question_id: int):
                         "id": len(all_results),
                         "question_text": "生成失败，请点击换一题",
                         "answer": "",
+                        "analysis": "",
                         "knowledge_point": kp_list[0] if kp_list else "",
                         "difficulty": diff,
                         "question_type": _question.question_type or "",
                         "options": [],
                     })
                 # 每生成1题立即更新缓存，前端轮询即时获取
-                _similar_cache[question_id] = {"status": "processing", "result": list(all_results)}
+                _similar_cache[question_id] = {"status": "processing", "result": list(all_results), "is_big_question": False}
 
-        _similar_cache[question_id] = {"status": "completed", "result": all_results}
+        _similar_cache[question_id] = {"status": "completed", "result": all_results, "is_big_question": False}
     except Exception as _exc:
         _similar_cache[question_id] = {"status": "failed", "error": str(_exc)}
 
@@ -178,13 +263,20 @@ async def generate_similar(
     return {"status": "pending", "message": "同类题生成任务已创建"}
 
 
+class SimilarSingleRequest(BaseModel):
+    difficulty: str = "medium"  # easy | medium | hard
+
+
 @router.post("/{question_id}/similar-single")
 async def generate_similar_single(
     question_id: int,
+    data: SimilarSingleRequest = SimilarSingleRequest(),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """生成单道同类题（换一题用）"""
+    """生成单道同类题（换一题用）。
+    普通题：生成 1 道指定难度同类题。
+    父题（大题）：生成 1 道指定难度类似大题替换当前。"""
     result = await db.execute(select(Question).where(Question.id == question_id))
     question = result.scalar_one_or_none()
     if not question:
@@ -201,6 +293,58 @@ async def generate_similar_single(
 
     from app.services.similar_generator import SimilarGenerator
 
+    # ── 检测是否为父题（大题）──
+    children_result = await db.execute(
+        select(Question).where(Question.parent_id == question_id)
+        .order_by(Question.sub_question_index)
+    )
+    children = children_result.scalars().all()
+
+    generator = SimilarGenerator()
+    difficulty = data.difficulty if data.difficulty in ("easy", "medium", "hard") else "medium"
+
+    if children:
+        # ── 大题：按指定难度生成类似大题 ──
+        parent_info = {
+            "question_number": question.question_number,
+            "question_type": question.question_type,
+            "knowledge_points": question.knowledge_points,
+        }
+        children_info = []
+        for child in children:
+            children_info.append({
+                "question_type": child.question_type,
+                "student_answer": child.student_answer,
+                "correct_answer": child.correct_answer,
+                "knowledge_points": child.knowledge_points,
+                "analysis_detail": child.analysis_detail,
+                "score": child.score,
+                "full_score": child.full_score,
+            })
+
+        big_q = await generator.generate_similar_big_question(parent_info, children_info, difficulty=difficulty)
+        if not big_q:
+            raise HTTPException(status_code=500, detail="生成失败，请稍后重试")
+
+        return {
+            "is_big_question": True,
+            "question_context": big_q.question_context,
+            "sub_questions": [
+                {
+                    "question_text": sq.question_text,
+                    "answer": sq.answer,
+                    "analysis": sq.analysis,
+                    "knowledge_point": sq.knowledge_point,
+                    "difficulty": sq.difficulty,
+                    "question_type": sq.question_type,
+                    "options": sq.options,
+                    "full_score": sq.full_score,
+                }
+                for sq in big_q.sub_questions
+            ],
+        }
+
+    # ── 普通题：随机难度单题生成 ──
     kps = question.knowledge_points
     raw_list = kps if isinstance(kps, list) else list(kps.values()) if isinstance(kps, dict) else None
     kp_list = [
@@ -212,11 +356,11 @@ async def generate_similar_single(
     existing = _similar_cache.get(question_id)
     exclude = ""
     if existing and existing.get("result"):
-        exclude = " | ".join(
-            r.get("question_text", "")[:60] for r in existing["result"] if isinstance(r, dict)
-        )
+        if isinstance(existing["result"], list):
+            exclude = " | ".join(
+                r.get("question_text", "")[:60] for r in existing["result"] if isinstance(r, dict)
+            )
 
-    generator = SimilarGenerator()
     import random
     difficulty = random.choice(["easy", "medium", "hard"])
     sq = await generator.generate_one(
@@ -235,6 +379,7 @@ async def generate_similar_single(
     return {
         "question_text": sq.question_text,
         "answer": sq.answer,
+        "analysis": sq.analysis,
         "knowledge_point": sq.knowledge_point,
         "difficulty": sq.difficulty,
         "question_type": sq.question_type,
@@ -268,10 +413,22 @@ async def get_similar_result(
     if not cached:
         return {"status": "not_found"}
 
+    is_big = cached.get("is_big_question", False)
     result_data = cached.get("result", [])
-    if cached["status"] == "completed":
+    status = cached["status"]
+
+    if is_big:
+        # 大题返回单个对象而非数组
+        if status == "completed":
+            return {"status": "completed", "similar_questions": result_data, "is_big_question": True}
+        elif status == "failed":
+            return {"status": "failed", "error": cached.get("error", "生成失败"), "is_big_question": True}
+        else:
+            return {"status": status, "similar_questions": None, "is_big_question": True}
+
+    if status == "completed":
         return {"status": "completed", "similar_questions": result_data}
-    elif cached["status"] == "failed":
+    elif status == "failed":
         return {"status": "failed", "error": cached.get("error", "生成失败")}
     else:
         # pending/processing: 返回已生成的部分结果，让前端逐题展示
@@ -355,13 +512,23 @@ async def adjust_question_region(
     import numpy as np
     import cv2
 
-    # 获取指定页面
-    page_img = None
+    # 主区域 + 额外区域（双栏/跨页），按需渲染涉及的页面
+    all_regions: list = [
+        AdjustRegionItem(
+            page_index=data.page_index, x=data.x, y=data.y,
+            w=data.w, h=data.h, rotation=data.rotation,
+        )
+    ] + list(data.extra_regions)
+    needed_pages = {r.page_index for r in all_regions}
+
+    page_images: dict[int, np.ndarray] = {}
     if file_bytes.startswith(b"%PDF"):
         import fitz
         doc = fitz.open(stream=file_bytes, filetype="pdf")
-        if data.page_index < len(doc):
-            page = doc[data.page_index]
+        for page_idx in needed_pages:
+            if page_idx >= len(doc):
+                continue
+            page = doc[page_idx]
             mat = fitz.Matrix(2.0, 2.0)
             pix = page.get_pixmap(matrix=mat)
             img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
@@ -371,20 +538,29 @@ async def adjust_question_region(
                 img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             else:
                 img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            page_img = img
+            page_images[page_idx] = img
         doc.close()
     else:
         img_array = np.frombuffer(file_bytes, dtype=np.uint8)
-        page_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+        if img is not None:
+            page_images[0] = img
 
-    if page_img is None:
-        raise HTTPException(status_code=400, detail="无法加载源页面图片")
+    # 逐区域旋转后裁切（共享函数），多区域垂直拼接
+    from app.api.v1.assignments import _rotate_and_cut, _merge_images
+    cut_images: list[np.ndarray] = []
+    for region in all_regions:
+        page_img = page_images.get(region.page_index)
+        if page_img is None:
+            continue
+        cut = _rotate_and_cut(page_img, region.rotation, region.x, region.y, region.w, region.h)
+        if cut is not None:
+            cut_images.append(cut)
 
-    # 使用旋转后裁切（共享函数）
-    from app.api.v1.assignments import _rotate_and_cut
-    q_img = _rotate_and_cut(page_img, data.rotation, data.x, data.y, data.w, data.h)
-    if q_img is None:
+    if not cut_images:
         raise HTTPException(status_code=400, detail="无效的切割区域")
+
+    q_img = cut_images[0] if len(cut_images) == 1 else _merge_images(cut_images)
 
     # 删除旧图片
     try:
@@ -398,17 +574,18 @@ async def adjust_question_region(
     question.image_url = await storage.save_question_image(
         img_bytes.tobytes(), current_user.id, question.assignment_id
     )
+    # bbox 记录主区域坐标（下次调整时预填主区域）
     question.page_index = data.page_index
-    question.bbox_x = float(x)
-    question.bbox_y = float(y)
-    question.bbox_w = float(w)
-    question.bbox_h = float(h)
+    question.bbox_x = float(data.x)
+    question.bbox_y = float(data.y)
+    question.bbox_w = float(data.w)
+    question.bbox_h = float(data.h)
 
     await db.commit()
 
     return {
         "question_id": question.id,
         "image_url": await storage.get_presigned_url(question.image_url),
-        "bbox": {"x": x, "y": y, "w": w, "h": h},
+        "bbox": {"x": data.x, "y": data.y, "w": data.w, "h": data.h},
         "message": "Region adjusted.",
     }

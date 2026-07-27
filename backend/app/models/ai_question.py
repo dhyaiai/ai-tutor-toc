@@ -16,10 +16,15 @@ class AIGeneratedQuestion(Base):
     )
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
     answer: Mapped[str] = mapped_column(Text, nullable=False)
+    analysis: Mapped[str | None] = mapped_column(Text, nullable=True, comment="完整解析（解题思路、步骤、依据）")
     question_type: Mapped[str | None] = mapped_column(String(64), nullable=True)
     knowledge_point: Mapped[str | None] = mapped_column(String(255), nullable=True)
     difficulty: Mapped[str | None] = mapped_column(String(16), nullable=True)
     options: Mapped[list | None] = mapped_column(JSON, nullable=True)
+    # 大题分组字段（group_id 非空表示属于某个大题）
+    group_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True, comment="大题分组ID（UUID），同组子题共享")
+    sub_question_index: Mapped[int | None] = mapped_column(Integer, nullable=True, comment="子题序号（从0开始）")
+    question_context: Mapped[str | None] = mapped_column(Text, nullable=True, comment="大题背景材料")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.now, nullable=False)
 
     answers = relationship("AIQuestionAnswer", back_populates="question", cascade="all, delete-orphan")

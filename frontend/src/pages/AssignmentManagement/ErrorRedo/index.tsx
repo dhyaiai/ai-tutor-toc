@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { Card, Select, Input, InputNumber, Space, Typography, Pagination, Empty, Spin } from "antd";
 import { useQuery } from "@tanstack/react-query";
-import { errorQuestionService } from "../../../services/errorQuestionService";
+import { errorQuestionService, type ErrorQuestionItem } from "../../../services/errorQuestionService";
 import { GRADE_OPTIONS, SUBJECT_OPTIONS, SEMESTER_OPTIONS, QUESTION_TYPE_OPTIONS, toSelectOptions } from "../../../utils/filterConfig";
 import ErrorQuestionCard from "../../../components/ErrorQuestionCard";
 
@@ -110,7 +110,7 @@ export default function ErrorRedo() {
       ) : data?.items?.length ? (
         <>
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
-            {data.items.map((item: Record<string, unknown>) => (
+            {data.items.map((item: ErrorQuestionItem) => (
               <ErrorQuestionCard key={item.id as number} item={item} />
             ))}
           </Space>

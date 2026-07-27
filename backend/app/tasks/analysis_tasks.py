@@ -19,38 +19,38 @@ def _stitch_question_answer(q_image_bytes: bytes, a_image_bytes: bytes | None) -
 
     拼接后 AI 能同时看到题目内容和学生作答，提高识别准确率。
     如果答案图片为空，直接返回题目图片。
+    输出为 JPEG 格式（体积远小于 PNG，大幅减少 API 传输时间）。
 
     Args:
         q_image_bytes: 题目图片字节
         a_image_bytes: 答案图片字节（可为 None）
 
     Returns:
-        拼接后的图片字节（PNG格式）
+        拼接后的图片字节（JPEG格式）
     """
     import cv2
     import numpy as np
 
     if a_image_bytes is None:
-        return q_image_bytes
+        return _compress_for_api(q_image_bytes)
 
     q_img = cv2.imdecode(np.frombuffer(q_image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
     a_img = cv2.imdecode(np.frombuffer(a_image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
 
     if q_img is None:
-        return a_image_bytes if isinstance(a_image_bytes, bytes) else q_image_bytes
+        return _compress_for_api(a_image_bytes) if isinstance(a_image_bytes, bytes) else q_image_bytes
     if a_img is None:
-        return q_image_bytes
+        return _compress_for_api(q_image_bytes)
 
-    # 缩放到相同宽度
+    # 缩放到相同宽度，限制最大宽度为 800px（减小图片体积，加快 API 传输）
     max_w = max(q_img.shape[1], a_img.shape[1])
-    # 限制最大宽度为 1024px，避免图片过大导致 API 超时
-    if max_w > 1024:
-        scale = 1024 / max_w
+    if max_w > 800:
+        scale = 800 / max_w
         q_h = int(q_img.shape[0] * scale)
         a_h = int(a_img.shape[0] * scale)
-        q_img = cv2.resize(q_img, (1024, q_h))
-        a_img = cv2.resize(a_img, (1024, a_h))
-        target_w = 1024
+        q_img = cv2.resize(q_img, (800, q_h))
+        a_img = cv2.resize(a_img, (800, a_h))
+        target_w = 800
     else:
         q_h = int(q_img.shape[0] * max_w / q_img.shape[1])
         a_h = int(a_img.shape[0] * max_w / a_img.shape[1])
@@ -68,8 +68,111 @@ def _stitch_question_answer(q_image_bytes: bytes, a_image_bytes: bytes | None) -
     # 垂直拼接
     stitched = np.vstack([q_img, sep, a_img])
 
-    _, result_bytes = cv2.imencode(".png", stitched)
+    # 使用 JPEG 压缩（quality=85 在识别质量和文件体积间取得平衡）
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
+    _, result_bytes = cv2.imencode(".jpg", stitched, encode_params)
     return result_bytes.tobytes()
+
+
+def _compress_for_api(image_bytes: bytes, max_width: int = 800, quality: int = 85) -> bytes:
+    """
+    将单张图片压缩为 JPEG 格式，减小体积以加快 API 传输速度。
+
+    Args:
+        image_bytes: 原始图片字节
+        max_width: 最大宽度（像素）
+        quality: JPEG 压缩质量（1-100）
+
+    Returns:
+        压缩后的 JPEG 图片字节
+    """
+    import cv2
+    import numpy as np
+
+    img = cv2.imdecode(np.frombuffer(image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        return image_bytes
+
+    # 缩放过大的图片
+    if img.shape[1] > max_width:
+        scale = max_width / img.shape[1]
+        new_h = int(img.shape[0] * scale)
+        img = cv2.resize(img, (max_width, new_h))
+
+    encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality]
+    _, result_bytes = cv2.imencode(".jpg", img, encode_params)
+    return result_bytes.tobytes()
+
+
+# ── 父题题型后处理：修正 AI 误判（如将文言文阅读大题误标为单选题）──
+_PARENT_TYPE_KEYWORD_MAP = [
+    # (关键词列表, 修正后的题型)
+    (["文言文", "文言", "古文", "古文中"], "文言文阅读"),
+    (["现代文", "散文", "小说", "议论文", "记叙文"], "现代文阅读"),
+    (["完形填空", "完形"], "完形填空"),
+    (["阅读", "篇章", "passage"], "阅读理解"),
+]
+
+
+def _infer_parent_question_type(
+    ai_parent_type: str | None,
+    sub_list: list,
+) -> str | None:
+    """
+    根据子题信息修正父题题型。
+
+    规则：
+    - 若 AI 已将父题标为"单选题"/"多选题"，但子题中存在多种不同题型，
+      说明这是一个包含混合小题的大题，此时根据子题分析内容推断正确的大题题型。
+    - 若所有子题题型一致且与父题相同，不做修正。
+    """
+    if not sub_list:
+        return ai_parent_type
+
+    # 收集子题的题型集合
+    child_types = {sq.question_type for sq in sub_list if sq.question_type}
+
+    # 如果子题题型全部一致且父题不是选择题，无需修正
+    # 如果父题不是单选题/多选题，信任 AI 的判断
+    if ai_parent_type not in ("单选题", "多选题"):
+        return ai_parent_type
+
+    # 父题被标为选择题，但子题有多种类型 → 明显是 AI 误判
+    # 或者子题中有非选择题类型（如简答题、填空题），说明这不是纯选择题大题
+    has_non_choice_child = any(
+        t and "选" not in t for t in child_types
+    )
+    if len(child_types) <= 1 and not has_non_choice_child:
+        # 子题全是选择题，父题标为单选题可能是正确的
+        return ai_parent_type
+
+    # 扫描子题的 analysis_detail 和 knowledge_points 寻找关键词
+    all_text = ""
+    for sq in sub_list:
+        if sq.analysis_detail:
+            all_text += sq.analysis_detail + " "
+        if sq.knowledge_points:
+            for kp in sq.knowledge_points:
+                if isinstance(kp, str):
+                    all_text += kp + " "
+                elif isinstance(kp, dict):
+                    all_text += kp.get("name", "") + " "
+
+    for keywords, corrected_type in _PARENT_TYPE_KEYWORD_MAP:
+        if any(kw in all_text for kw in keywords):
+            logger.info(
+                "Corrected parent question_type from '%s' to '%s' based on sub-question analysis",
+                ai_parent_type, corrected_type
+            )
+            return corrected_type
+
+    # 无法推断具体类型，但确认不是纯选择题大题
+    logger.warning(
+        "Parent question_type '%s' appears incorrect (mixed sub-types: %s), "
+        "but could not infer correct type from analysis text",
+        ai_parent_type, child_types
+    )
+    return ai_parent_type  # 无法确定时保持原样
 
 
 # Celery is optional (not available in dev mode)
@@ -156,11 +259,29 @@ async def _do_analyze_inner(assignment_id: int):
         if existing_count == 0:
             raise ValueError("请先手动切割题目后再开始分析")
 
+        # ── 清理旧的子题记录（重新分析时避免产生孤儿数据）──
+        old_children_result = await db.execute(
+            select(Question).where(
+                Question.assignment_id == assignment_id,
+                Question.parent_id.isnot(None),
+            )
+        )
+        old_children = old_children_result.scalars().all()
+        if old_children:
+            logger.info("[analyze] Deleting %d old sub-questions for assignment %d", len(old_children), assignment_id)
+            for child in old_children:
+                await db.delete(child)
+            await db.flush()
+
         # ── 题目已存在（手动切割），直接进入评分 ──
-        logger.info("[analyze] %d existing questions found, starting grading", existing_count)
+        # 只加载顶层题目（parent_id IS NULL），子题已清理
+        logger.info("[analyze] Loading top-level questions for assignment %d", assignment_id)
         question_result = await db.execute(
             select(Question)
-            .where(Question.assignment_id == assignment_id)
+            .where(
+                Question.assignment_id == assignment_id,
+                Question.parent_id.is_(None),
+            )
             .order_by(Question.question_number)
         )
         existing_questions = question_result.scalars().all()
@@ -180,9 +301,14 @@ async def _do_analyze_inner(assignment_id: int):
                         logger.info("[analyze] 题目 #%d 已拼接答案图片", q.question_number)
                     else:
                         logger.warning("[analyze] 题目 #%d 答案图片下载失败", q.question_number)
+                        q_bytes = _compress_for_api(q_bytes)  # 无答案图时也压缩
                 except Exception as stitch_err:
                     logger.error("[analyze] 题目 #%d 答案拼接异常: %s，回退到仅使用题目图片",
                                  q.question_number, stitch_err)
+                    q_bytes = _compress_for_api(q_bytes)
+            else:
+                # 无答案图片，直接压缩题目图片
+                q_bytes = _compress_for_api(q_bytes)
             question_records.append((q, q_bytes))
         if not question_records:
             raise ValueError("无法加载任何题目图片进行评分")
@@ -196,8 +322,12 @@ async def _do_analyze_inner(assignment_id: int):
 
         from app.services.ai_grader import AIGrader
         from app.services.knowledge_extractor import KnowledgeExtractor
+        from app.services.personality_service import load_grading_directive
         grader = AIGrader()
         extractor = KnowledgeExtractor()
+
+        # 加载作业创建者的助教个性化配置（性格/说话风格/评分严格度），对所有批改生效
+        personality_directive = await load_grading_directive(db, assignment.creator_id)
 
         total_score = 0
         all_knowledge_points: set[str] = set()
@@ -215,14 +345,14 @@ async def _do_analyze_inner(assignment_id: int):
 
             try:
                 batch_results = await asyncio.wait_for(
-                    grader.grade_batch(batch_images),
-                    timeout=120,  # 每批 2 分钟超时
+                    grader.grade_batch(batch_images, subject=assignment.subject, personality_directive=personality_directive),
+                    timeout=240,  # 每批 4 分钟超时（LLM API 自身超时 120s，需留余量）
                 )
             except asyncio.TimeoutError:
                 logger.warning("Batch grading timed out for questions starting at idx %d", batch_start)
                 for question, _ in batch:
                     question.status = QuestionStatus.FAILED
-                    question.analysis_detail = "评分超时"
+                    question.analysis_detail = "评分超时，请重新分析该题"
                 await db.commit()
                 batch_start += BATCH_SIZE
                 continue
@@ -246,7 +376,9 @@ async def _do_analyze_inner(assignment_id: int):
                     question.full_score = None
                     question.student_answer = None
                     question.correct_answer = None
-                    question.question_type = grade_result.question_type
+                    question.question_type = _infer_parent_question_type(
+                        grade_result.question_type, sub_list
+                    )
                     question.analysis_detail = f"本大题共 {len(sub_list)} 小题"
                     question.confidence_score = grade_result.confidence
                     question.status = QuestionStatus.COMPLETED
@@ -296,8 +428,13 @@ async def _do_analyze_inner(assignment_id: int):
                             all_knowledge_points.add(name)
                             parent_kps.add(name)
 
-                    # 父题知识点 = 所有子题知识点的并集
-                    question.knowledge_points = list(parent_kps) if parent_kps else grade_result.knowledge_points
+                    # 父题知识点 = 所有子题知识点的并集，再精简到约5个
+                    raw_kps = list(parent_kps) if parent_kps else (grade_result.knowledge_points or [])
+                    question.knowledge_points = await extractor.trim(
+                        raw_kps,
+                        context=question.analysis_detail,
+                        max_count=5,
+                    )
 
                 else:
                     # ── 普通单题（保持原有逻辑）──
@@ -311,17 +448,28 @@ async def _do_analyze_inner(assignment_id: int):
                     question.confidence_score = grade_result.confidence
                     question.status = QuestionStatus.COMPLETED if grade_result.confidence >= 0.3 else QuestionStatus.FAILED
 
-                    # 提取知识点
+                    # 提取知识点，并精简到约5个
                     if grade_result.analysis_detail:
                         try:
                             kps = await extractor.extract(grade_result.analysis_detail)
-                            question.knowledge_points = extractor.merge(
-                                grade_result.knowledge_points, kps
+                            merged = extractor.merge(grade_result.knowledge_points, kps)
+                            question.knowledge_points = await extractor.trim(
+                                merged,
+                                context=grade_result.analysis_detail,
+                                max_count=5,
                             )
                         except Exception:
-                            question.knowledge_points = grade_result.knowledge_points or []
+                            question.knowledge_points = await extractor.trim(
+                                grade_result.knowledge_points or [],
+                                context=grade_result.analysis_detail,
+                                max_count=5,
+                            )
                     else:
-                        question.knowledge_points = grade_result.knowledge_points or []
+                        question.knowledge_points = await extractor.trim(
+                            grade_result.knowledge_points or [],
+                            context=None,
+                            max_count=5,
+                        )
 
                     if question.score is not None:
                         total_score += question.score
@@ -514,6 +662,7 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
     from sqlalchemy import select
     from app.db.session import async_session_factory
     from app.models.question import Question
+    from app.models.assignment import Assignment
     from app.services.file_upload import StorageService
 
     async with async_session_factory() as db:
@@ -522,16 +671,37 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
         if not question:
             raise ValueError(f"题目 {question_id} 不存在")
 
-        # 如果是父题，先删除所有子题
+        # 获取作业的学科信息
+        assign_result = await db.execute(select(Assignment).where(Assignment.id == question.assignment_id))
+        assignment = assign_result.scalar_one_or_none()
+        subject = assignment.subject if assignment else None
+
+        # 加载作业创建者的助教个性化配置，重分析时同样生效
+        from app.services.personality_service import load_grading_directive
+        personality_directive = (
+            await load_grading_directive(db, assignment.creator_id) if assignment else None
+        )
+
+        # 如果是父题，递归删除所有子题（包括孙子题等多级嵌套）
         if question.parent_id is None:
-            children_result = await db.execute(
-                select(Question).where(Question.parent_id == question_id)
-            )
-            children = children_result.scalars().all()
-            for child in children:
-                await db.delete(child)
-            if children:
-                logger.info("[reanalyze_question] Deleted %d children of question %d", len(children), question_id)
+            # 收集所有后代ID（BFS遍历）
+            to_delete_ids = [question_id]
+            all_descendants = []
+            while to_delete_ids:
+                parent_ids_batch = to_delete_ids
+                to_delete_ids = []
+                children_result = await db.execute(
+                    select(Question).where(Question.parent_id.in_(parent_ids_batch))
+                )
+                children = children_result.scalars().all()
+                for child in children:
+                    all_descendants.append(child)
+                    to_delete_ids.append(child.id)
+            # 从叶子节点向上删除
+            for desc in reversed(all_descendants):
+                await db.delete(desc)
+            if all_descendants:
+                logger.info("[reanalyze_question] Deleted %d descendants of question %d", len(all_descendants), question_id)
                 await db.flush()
 
         question.status = QuestionStatus.PENDING
@@ -552,9 +722,14 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
                     logger.info("[reanalyze] 题目 #%d 已拼接答案图片", question.question_number)
                 else:
                     logger.warning("[reanalyze] 题目 #%d 答案图片下载失败", question.question_number)
+                    image_bytes = _compress_for_api(image_bytes)
             except Exception as stitch_err:
                 logger.error("[reanalyze] 题目 #%d 答案拼接异常: %s，回退到仅使用题目图片",
                              question.question_number, stitch_err)
+                image_bytes = _compress_for_api(image_bytes)
+        else:
+            # 无答案图片，直接压缩题目图片
+            image_bytes = _compress_for_api(image_bytes)
 
         # Re-grade with remark (with timeout protection)
         import asyncio
@@ -562,12 +737,15 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
         grader = AIGrader()
         try:
             results = await asyncio.wait_for(
-                grader.grade_batch([image_bytes], remark=remark),
-                timeout=180,  # 单题重分析 3 分钟超时
+                grader.grade_batch([image_bytes], remark=remark, subject=subject, personality_directive=personality_directive),
+                # 单题重分析预算需容纳一次完整调用 + 一次重试：
+                # _grade_chunk 最坏情况 = 180s(首试) + 1s(退避) + 180s(重试) = 361s，
+                # 因此设为 6 分钟，避免复杂大题（如文言文/现代文阅读）在重试尚未完成时被外层取消。
+                timeout=360,
             )
         except asyncio.TimeoutError:
             question.status = QuestionStatus.FAILED
-            question.analysis_detail = "重分析超时（3分钟），请重试"
+            question.analysis_detail = "重分析超时（6分钟），请重试"
             await db.commit()
             await recalc_assignment_total(question.assignment_id, db)
             logger.warning("[reanalyze_question] Timed out for question %d", question_id)
@@ -590,20 +768,70 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
 
         gr = results[0]
 
-        # ── 教师备注强制覆盖：解析备注中的明确纠正，覆盖AI识别结果 ──
+        # ── 备注持久化（提前保存，确保异常路径也能看到备注内容）──
         if remark:
-            from app.services.remark_parser import parse_remark_overrides, apply_remark_overrides
-            overrides = parse_remark_overrides(remark)
-            if overrides:
-                logger.info("[reanalyze_question] 备注覆盖 question %d: %s", question_id, overrides)
-                # 覆盖父题结果
-                apply_remark_overrides(gr, overrides)
-                # 如果有子题，同样覆盖子题结果
-                if gr.sub_questions:
-                    for sq in gr.sub_questions:
-                        apply_remark_overrides(sq, overrides)
-            # 持久化备注到数据库
             question.manual_review_note = remark
+
+        # ── 教师备注强制覆盖：解析备注中的明确纠正，覆盖AI识别结果 ──
+        # 注意：即使 AI 评分返回空壳结果（API 全部重试失败），备注覆盖仍然生效，
+        # 因为教师已经人工确认过，备注中的内容就是权威依据。
+        from app.services.remark_parser import parse_remark_overrides, apply_remark_overrides
+        remark_overrides = parse_remark_overrides(remark) if remark else {}
+        if remark_overrides:
+            logger.info("[reanalyze_question] 备注覆盖 question %d: %s", question_id, remark_overrides)
+            apply_remark_overrides(gr, remark_overrides)
+            if gr.sub_questions:
+                for sq in gr.sub_questions:
+                    apply_remark_overrides(sq, remark_overrides)
+
+        # ── 检测 AI 评分是否返回了有效结果 ──
+        # 当 _grade_chunk 的 API 调用全部重试失败时，会返回 _empty_grade_result()
+        # （confidence=0.0 且所有字段为 None），此时不能当作正常结果写入数据库。
+        grading_failed = (
+            gr.confidence is not None and gr.confidence <= 0.01
+            and gr.analysis_detail is None
+            and gr.student_answer is None
+            and not gr.sub_questions
+        )
+
+        # ── 评分失败时的兜底策略 ──
+        if grading_failed:
+            if remark_overrides:
+                # 有教师备注覆盖：用覆盖值填充，标记为已完成
+                logger.info(
+                    "[reanalyze_question] AI 评分返回空结果，但备注覆盖提供 %d 个字段，"
+                    "以备注为准完成 question %d",
+                    len(remark_overrides), question_id,
+                )
+                # 用备注覆盖后的 gr 值写入（apply_remark_overrides 已设置 confidence=1.0）
+                question.student_answer = gr.student_answer
+                question.correct_answer = gr.correct_answer
+                question.score = gr.score
+                question.full_score = gr.full_score
+                question.analysis_detail = gr.analysis_detail or f"（人工备注修正：{remark}）"
+                question.question_type = gr.question_type
+                question.confidence_score = gr.confidence
+                question.common_mistakes = gr.common_mistakes
+                question.status = QuestionStatus.COMPLETED
+            else:
+                # 无有效备注覆盖：标记失败，保留旧数据不被空结果覆盖
+                logger.warning(
+                    "[reanalyze_question] AI 评分返回空结果且无有效备注覆盖，"
+                    "question %d 标记为失败，旧数据不覆盖",
+                    question_id,
+                )
+                question.status = QuestionStatus.FAILED
+                question.analysis_detail = (
+                    f"重分析失败：AI 未返回有效评分结果。"
+                    f"请尝试在备注中写明「学生答案：X；正确答案：Y；得分：Z」等关键信息，"
+                    f"系统将自动识别并以备注为准完成分析。"
+                )
+                await db.commit()
+                await recalc_assignment_total(question.assignment_id, db)
+                return
+
+        from app.services.knowledge_extractor import KnowledgeExtractor
+        extractor = KnowledgeExtractor()
 
         if gr.sub_questions and len(gr.sub_questions) > 0:
             # ── 大题套小题重分析：父题为容器，重建子题 ──
@@ -611,7 +839,9 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
             question.full_score = None
             question.student_answer = None
             question.correct_answer = None
-            question.question_type = gr.question_type
+            question.question_type = _infer_parent_question_type(
+                gr.question_type, gr.sub_questions
+            )
             question.analysis_detail = f"本大题共 {len(gr.sub_questions)} 小题"
             question.confidence_score = gr.confidence
             question.status = QuestionStatus.COMPLETED
@@ -619,6 +849,8 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
 
             parent_kps: set[str] = set()
             for idx, sq in enumerate(gr.sub_questions):
+                # 有教师备注覆盖时，子题也不再因低置信度标为 FAILED
+                # （备注覆盖已把 confidence 设为 1.0，阈值判断自然通过）
                 child = Question(
                     assignment_id=question.assignment_id,
                     question_number=question.question_number,
@@ -644,8 +876,6 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
 
                 child_kps = sq.knowledge_points or []
                 if sq.analysis_detail:
-                    from app.services.knowledge_extractor import KnowledgeExtractor
-                    extractor = KnowledgeExtractor()
                     try:
                         kps = await extractor.extract(sq.analysis_detail)
                         child.knowledge_points = extractor.merge(child_kps, kps)
@@ -658,7 +888,13 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
                     name = kp if isinstance(kp, str) else kp.get("name", str(kp))
                     parent_kps.add(name)
 
-            question.knowledge_points = list(parent_kps) if parent_kps else gr.knowledge_points
+            # 父题知识点精简到约5个
+            raw_kps = list(parent_kps) if parent_kps else (gr.knowledge_points or [])
+            question.knowledge_points = await extractor.trim(
+                raw_kps,
+                context=question.analysis_detail,
+                max_count=5,
+            )
         else:
             # ── 普通单题重分析 ──
             question.student_answer = gr.student_answer
@@ -669,18 +905,29 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
             question.question_type = gr.question_type
             question.confidence_score = gr.confidence
             question.common_mistakes = gr.common_mistakes
-            question.status = QuestionStatus.COMPLETED
+            # 备注覆盖后置信度已被设为 1.0，正常评分结果置信度也已被 remark boost
+            # 提升到 ≥0.85，此处统一按阈值判断，只有真正低置信度（<0.3）才标失败
+            question.status = (
+                QuestionStatus.COMPLETED
+                if (gr.confidence is None or gr.confidence >= 0.3)
+                else QuestionStatus.FAILED
+            )
 
-            # Re-extract knowledge points
+            # Re-extract knowledge points 并精简到约5个
             if gr.analysis_detail:
-                from app.services.knowledge_extractor import KnowledgeExtractor
-                extractor = KnowledgeExtractor()
                 kps = await extractor.extract(gr.analysis_detail)
-                question.knowledge_points = extractor.merge(
-                    gr.knowledge_points, kps
+                merged = extractor.merge(gr.knowledge_points, kps)
+                question.knowledge_points = await extractor.trim(
+                    merged,
+                    context=gr.analysis_detail,
+                    max_count=5,
                 )
             else:
-                question.knowledge_points = gr.knowledge_points or []
+                question.knowledge_points = await extractor.trim(
+                    gr.knowledge_points or [],
+                    context=None,
+                    max_count=5,
+                )
 
         await db.commit()
 
@@ -757,6 +1004,7 @@ async def _do_generate_similar(question_id: int) -> dict:
                     "id": i,
                     "question_text": sq.question_text,
                     "answer": sq.answer,
+                    "analysis": sq.analysis,
                     "knowledge_point": sq.knowledge_point,
                     "difficulty": sq.difficulty,
                     "question_type": sq.question_type,

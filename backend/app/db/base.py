@@ -5,3 +5,8 @@ from app.models.user import User
 from app.models.assignment import Assignment
 from app.models.question import Question, AnalysisTask
 from app.models.ai_question import AIGeneratedQuestion, AIQuestionAnswer
+from app.models.conversation import Conversation, ConversationMessage
+from app.models.knowledge_state import UserKnowledgeState
+from app.models.personality import AgentPersonality
+from app.models.composition import CompositionCorrection
+from app.models.oral_assessment import ListeningTest, DictationTask, MandarinTestRecord, OralRecord

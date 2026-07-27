@@ -6,7 +6,7 @@ export interface AssignmentListItem {
   grade: string;
   subject: string;
   semester: string;
-  month: string;
+  usage_month: string;
   layout_type: string;
   status: string;
   total_score: number | null;
@@ -21,7 +21,7 @@ export interface AssignmentDetail {
   grade: string;
   subject: string;
   semester: string;
-  month: string;
+  usage_month: string;
   layout_type: string;
   file_url: string;
   status: string;
@@ -113,25 +113,31 @@ export const assignmentService = {
     return data;
   },
 
-  /** Create assignment with metadata + pre-uploaded file_path */
+  /** Create assignment with metadata + pre-uploaded file_path(s) */
   async upload(
     params: {
-      file_path: string;
+      file_path?: string;       // 单文件预上传（旧版兼容）
+      file_paths?: string[];    // 多文件预上传（按顺序合并）
       name: string;
       grade: string;
       subject: string;
       semester: string;
-      month: string;
+      usage_month: string;
       layout_type?: string;
     },
   ): Promise<{ assignment_id: number; status: string }> {
     const formData = new FormData();
-    formData.append("file_path", params.file_path);
+    // 多文件路径以 JSON 数组发送，单文件保持兼容
+    if (params.file_paths && params.file_paths.length > 0) {
+      formData.append("file_paths", JSON.stringify(params.file_paths));
+    } else if (params.file_path) {
+      formData.append("file_path", params.file_path);
+    }
     formData.append("name", params.name);
     formData.append("grade", params.grade);
     formData.append("subject", params.subject);
     formData.append("semester", params.semester);
-    formData.append("month", params.month);
+    formData.append("usage_month", params.usage_month);
     formData.append("layout_type", params.layout_type || "a4_single");
     const { data } = await api.post("/assignments", formData, {
       timeout: 30000,
@@ -160,7 +166,7 @@ export const assignmentService = {
     grade?: string;
     subject?: string;
     semester?: string;
-    month?: string;
+    usage_month?: string;
   }): Promise<void> {
     await api.put(`/assignments/${id}`, params);
   },

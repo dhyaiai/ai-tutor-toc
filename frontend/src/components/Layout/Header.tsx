@@ -1,5 +1,5 @@
-import { Layout, Button, Space, Typography } from "antd";
-import { LogoutOutlined, UserOutlined } from "@ant-design/icons";
+import { Layout, Button, Space, Typography, Dropdown } from "antd";
+import { LogoutOutlined, UserOutlined, SettingOutlined, SmileOutlined } from "@ant-design/icons";
 import { useNavigate, useLocation } from "react-router-dom";
 import { useAuth } from "../../hooks/useAuth";
 
@@ -10,7 +10,30 @@ export default function Header() {
   const navigate = useNavigate();
   const location = useLocation();
 
-  const currentTab = location.pathname.startsWith("/analytics") ? "analytics" : "assignments";
+  const currentTab = location.pathname.startsWith("/analytics")
+    ? "analytics"
+    : location.pathname.startsWith("/oral")
+    ? "oral"
+    : location.pathname.startsWith("/composition")
+    ? "composition"
+    : "assignments";
+
+  /** 用户下拉菜单项 */
+  const userMenuItems = [
+    {
+      key: "personality",
+      icon: <SmileOutlined />,
+      label: "助教设置",
+      onClick: () => navigate("/settings/personality"),
+    },
+    { type: "divider" as const },
+    {
+      key: "logout",
+      icon: <LogoutOutlined />,
+      label: "退出登录",
+      onClick: logout,
+    },
+  ];
 
   return (
     <AntHeader
@@ -41,16 +64,30 @@ export default function Header() {
           >
             学情分析
           </Button>
+          <Button
+            type={currentTab === "oral" ? "primary" : "text"}
+            style={currentTab === "oral" ? {} : { color: "#fff" }}
+            onClick={() => navigate("/oral")}
+          >
+            听力与口语
+          </Button>
+          <Button
+            type={currentTab === "composition" ? "primary" : "text"}
+            style={currentTab === "composition" ? {} : { color: "#fff" }}
+            onClick={() => navigate("/composition")}
+          >
+            作文批改
+          </Button>
         </Space>
       </div>
-      <Space>
-        <Typography.Text style={{ color: "#fff" }}>
-          <UserOutlined /> {user?.username}
-        </Typography.Text>
-        <Button type="text" icon={<LogoutOutlined />} style={{ color: "#fff" }} onClick={logout}>
-          退出
-        </Button>
-      </Space>
+      <Dropdown menu={{ items: userMenuItems }} placement="bottomRight">
+        <Space style={{ cursor: "pointer" }}>
+          <Typography.Text style={{ color: "#fff" }}>
+            <UserOutlined /> {user?.username}
+          </Typography.Text>
+          <SettingOutlined style={{ color: "#fff", fontSize: 12 }} />
+        </Space>
+      </Dropdown>
     </AntHeader>
   );
 }

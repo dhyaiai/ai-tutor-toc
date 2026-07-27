@@ -1,0 +1,13 @@
+schema_version: 1
+module_path: ""
+title: AI助教系统 · 根目录与项目规范
+scope:
+    - .gitignore
+    - AI助教agent.md
+    - ai助教.md
+    - start_dev.bat
+    - .env.example
+    - CLAUDE.md
+source_files: []
+depends_on: []
+related_to: []

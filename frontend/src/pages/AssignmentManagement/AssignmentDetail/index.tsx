@@ -124,7 +124,7 @@ export default function AssignmentDetail() {
           <Descriptions.Item label="年级">{data.grade}</Descriptions.Item>
           <Descriptions.Item label="科目">{data.subject}</Descriptions.Item>
           <Descriptions.Item label="学期">{data.semester}</Descriptions.Item>
-          <Descriptions.Item label="月份">{data.month}</Descriptions.Item>
+          <Descriptions.Item label="使用月份">{data.usage_month}</Descriptions.Item>
           <Descriptions.Item label="得分/总分">
             {data.total_score != null ? `${data.total_score} / ${data.full_total ?? "-"}` : "-"}
           </Descriptions.Item>

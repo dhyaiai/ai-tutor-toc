@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { Card, Table, Select, Tag, Space, Typography, Button, message, Dropdown, Modal, Form, Input } from "antd";
 import { EyeOutlined, MoreOutlined } from "@ant-design/icons";
@@ -8,6 +8,80 @@ import { ASSIGNMENT_STATUS_MAP } from "../../../utils/constants";
 import { GRADE_OPTIONS, SUBJECT_OPTIONS, SEMESTER_OPTIONS, toSelectOptions } from "../../../utils/filterConfig";
 import { formatDate } from "../../../utils/helpers";
 
+/** 初始列宽配置（px），key 对应列的 key */
+const INITIAL_COLUMN_WIDTHS: Record<string, number> = {
+  name: 0,
+  grade: 80,
+  subject: 80,
+  semester: 100,
+  usage_month: 100,
+  question_count: 80,
+  status: 100,
+  created_at: 120,
+  action: 120,
+};
+
+/** 列最小宽度 */
+const MIN_COL_WIDTH = 50;
+
+/**
+ * 可拖动调整列宽的表格标题组件。
+ * 在标题右侧渲染一个 6px 宽的拖拽手柄，拖动时实时调整列宽。
+ */
+function ResizableTitle(props: any) {
+  const { onResize, width, children, ...restProps } = props;
+  /* 用 ref 保存回调避免闭包陷阱 */
+  const onResizeRef = useRef(onResize);
+  onResizeRef.current = onResize;
+  const dragState = useRef({ startX: 0, startWidth: 0 });
+
+  if (!width) {
+    return <th {...restProps}>{children}</th>;
+  }
+
+  const handleMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    dragState.current = { startX: e.clientX, startWidth: width };
+
+    const handleMouseMove = (ev: MouseEvent) => {
+      const delta = ev.clientX - dragState.current.startX;
+      onResizeRef.current(Math.max(MIN_COL_WIDTH, dragState.current.startWidth + delta));
+    };
+
+    const handleMouseUp = () => {
+      document.removeEventListener("mousemove", handleMouseMove);
+      document.removeEventListener("mouseup", handleMouseUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+
+    document.addEventListener("mousemove", handleMouseMove);
+    document.addEventListener("mouseup", handleMouseUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
+
+  return (
+    <th {...restProps} style={{ position: "relative" }}>
+      {children}
+      {/* 拖拽手柄：位于标题右侧边缘 */}
+      <div
+        onMouseDown={handleMouseDown}
+        style={{
+          position: "absolute",
+          right: 0,
+          top: 0,
+          bottom: 0,
+          width: 6,
+          cursor: "col-resize",
+          zIndex: 1,
+        }}
+      />
+    </th>
+  );
+}
+
 export default function AssignmentRecords() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -16,6 +90,16 @@ export default function AssignmentRecords() {
   const [editModalOpen, setEditModalOpen] = useState(false);
   const [editingRecord, setEditingRecord] = useState<AssignmentListItem | null>(null);
   const [editForm] = Form.useForm();
+
+  /* 列宽状态 */
+  const [columnWidths, setColumnWidths] = useState<Record<string, number>>(INITIAL_COLUMN_WIDTHS);
+
+  /* 列宽拖动回调（用 useCallback 保持引用稳定） */
+  const handleColumnResize = useCallback((key: string) => {
+    return (width: number) => {
+      setColumnWidths((prev) => ({ ...prev, [key]: width }));
+    };
+  }, []);
 
   const { data, isLoading } = useQuery({
     queryKey: ["assignments", page, filters],
@@ -47,14 +131,13 @@ export default function AssignmentRecords() {
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, ...params }: { id: number; name?: string; grade?: string; subject?: string; semester?: string; month?: string }) =>
+    mutationFn: ({ id, ...params }: { id: number; name?: string; grade?: string; subject?: string; semester?: string; usage_month?: string }) =>
       assignmentService.update(id, params),
     onSuccess: (_, variables) => {
       message.success("作业信息已更新");
       setEditModalOpen(false);
       setEditingRecord(null);
       queryClient.invalidateQueries({ queryKey: ["assignments"] });
-      // 同步更新作业详情（如果正在查看）和学情分析数据
       queryClient.invalidateQueries({ queryKey: ["assignment", variables.id] });
       queryClient.invalidateQueries({ queryKey: ["analytics"] });
     },
@@ -70,31 +153,23 @@ export default function AssignmentRecords() {
       grade: record.grade,
       subject: record.subject,
       semester: record.semester,
-      month: record.month,
+      usage_month: record.usage_month,
     });
     setEditModalOpen(true);
   };
 
+  /* 基础列定义 */
   const columns = [
     { title: "作业名称", dataIndex: "name", key: "name", ellipsis: true },
-    { title: "年级", dataIndex: "grade", key: "grade", width: 80 },
-    { title: "科目", dataIndex: "subject", key: "subject", width: 80 },
-    { title: "学期", dataIndex: "semester", key: "semester", width: 100 },
-    { title: "月份", dataIndex: "month", key: "month", width: 80 },
-    { title: "题目数", dataIndex: "question_count", key: "question_count", width: 80 },
-    { title: "错题数", dataIndex: "error_count", key: "error_count", width: 80 },
-    {
-      title: "总分",
-      dataIndex: "total_score",
-      key: "total_score",
-      width: 80,
-      render: (v: number | null) => (v != null ? v : "-"),
-    },
+    { title: "年级", dataIndex: "grade", key: "grade" },
+    { title: "科目", dataIndex: "subject", key: "subject" },
+    { title: "学期", dataIndex: "semester", key: "semester" },
+    { title: "使用月份", dataIndex: "usage_month", key: "usage_month" },
+    { title: "题目数", dataIndex: "question_count", key: "question_count" },
     {
       title: "状态",
       dataIndex: "status",
       key: "status",
-      width: 100,
       render: (v: string) => {
         const cfg = ASSIGNMENT_STATUS_MAP[v] || { color: "default", label: v };
         return <Tag color={cfg.color}>{cfg.label}</Tag>;
@@ -104,13 +179,11 @@ export default function AssignmentRecords() {
       title: "上传时间",
       dataIndex: "created_at",
       key: "created_at",
-      width: 120,
       render: (v: string) => formatDate(v, true),
     },
     {
       title: "操作",
       key: "action",
-      width: 120,
       render: (_: unknown, record: AssignmentListItem) => (
         <Space>
           <Button
@@ -156,6 +229,16 @@ export default function AssignmentRecords() {
     },
   ];
 
+  /* 注入当前列宽 + onHeaderCell，生成可拖动列 */
+  const resizableColumns = columns.map((col) => ({
+    ...col,
+    width: columnWidths[col.key] || 0,
+    onHeaderCell: () => ({
+      width: columnWidths[col.key] || 0,
+      onResize: handleColumnResize(col.key),
+    }),
+  }));
+
   return (
     <Card>
       <Typography.Title level={4}>作业记录</Typography.Title>
@@ -183,10 +266,15 @@ export default function AssignmentRecords() {
         />
       </Space>
       <Table
-        columns={columns}
+        columns={resizableColumns}
         dataSource={data?.items || []}
         rowKey="id"
         loading={isLoading}
+        components={{
+          header: {
+            cell: ResizableTitle,
+          },
+        }}
         pagination={{
           current: page,
           pageSize: 10,
@@ -228,8 +316,8 @@ export default function AssignmentRecords() {
             <Form.Item name="semester" label="学期" rules={[{ required: true }]}>
               <Select style={{ width: 140 }} options={toSelectOptions(SEMESTER_OPTIONS)} />
             </Form.Item>
-            <Form.Item name="month" label="月份" rules={[{ required: true }]}>
-              <Input style={{ width: 140 }} />
+            <Form.Item name="usage_month" label="使用月份" rules={[{ required: true }]}>
+              <Input style={{ width: 140 }} placeholder="例如：2026-03" />
             </Form.Item>
           </Space>
         </Form>

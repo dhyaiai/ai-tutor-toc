@@ -1,10 +1,11 @@
 """
 学情分析 API 路由（v1）
 
-三个子板块：
+四个子板块：
 1. GET /analytics/homework-stats      — 作业统计（按科目统计作业数量）
 2. GET /analytics/student-dashboard  — 学生学期看板（得分率趋势 + 作业情况表）
 3. GET /analytics/knowledge-heatmap  — 知识点热力图（考察频次 + 得分率）
+4. GET /analytics/knowledge-state    — 知识状态追踪（跨会话知识点掌握度）
 """
 
 from fastapi import APIRouter, Depends, Query
@@ -20,7 +21,12 @@ from app.schemas.analytics import (
     KnowledgeHeatmapResponse,
     KnowledgeHeatmapItem,
 )
+from app.schemas.knowledge_state import (
+    KnowledgeStateResponse,
+    KnowledgeStateItem,
+)
 from app.services.analytics_aggregator import AnalyticsAggregator
+from app.services.knowledge_tracker import KnowledgeTracker
 
 router = APIRouter(prefix="/analytics", tags=["analytics"])
 
@@ -104,3 +110,38 @@ async def get_knowledge_heatmap(
         assignment_ids=assignment_ids,
     )
     return {"items": items}
+
+
+# ==================== 子板块4：知识状态追踪 ====================
+
+@router.get("/knowledge-state", response_model=KnowledgeStateResponse)
+async def get_knowledge_state(
+    subject: str | None = Query(None, description="学科筛选"),
+    query_type: str = Query("掌握度汇总", description="查询类型：薄弱点查询/掌握度汇总/进步点分析/学习建议"),
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    获取用户的知识点掌握状态追踪数据。
+
+    跨会话持久化的知识点掌握画像：
+    - 每个知识点的掌握分数（0-100）和等级
+    - 薄弱知识点列表和强项列表
+    - 教学策略建议
+    - 支持按学科和查询类型筛选
+
+    数据来源：作业分析、题目讲解反馈、错题订正、练习测试等全场景学习行为。
+    """
+    tracker = KnowledgeTracker(db)
+    result = await tracker.query(
+        user_id=current_user.id,
+        subject=subject,
+        query_type=query_type,
+    )
+    return KnowledgeStateResponse(
+        items=[KnowledgeStateItem(**item) for item in result["items"]],
+        total=result["total"],
+        summary=result["summary"],
+        weak_points=result["weak_points"],
+        strong_points=result["strong_points"],
+    )

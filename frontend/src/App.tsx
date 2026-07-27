@@ -16,6 +16,9 @@ import AssignmentDetail from "./pages/AssignmentManagement/AssignmentDetail";
 import ErrorRedo from "./pages/AssignmentManagement/ErrorRedo";
 import AIChallenge from "./pages/AssignmentManagement/AIChallenge";
 import LearningAnalytics from "./pages/LearningAnalytics";
+import OralAssessment from "./pages/OralAssessment";
+import Composition from "./pages/Composition";
+import PersonalityConfigPage from "./pages/Settings/PersonalityConfig";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -56,6 +59,15 @@ export default function App() {
 
                 {/* Learning Analytics */}
                 <Route path="/analytics" element={<LearningAnalytics />} />
+
+                {/* Oral Assessment */}
+                <Route path="/oral" element={<OralAssessment />} />
+
+                {/* Composition */}
+                <Route path="/composition" element={<Composition />} />
+
+                {/* Settings */}
+                <Route path="/settings/personality" element={<PersonalityConfigPage />} />
 
                 {/* Default redirect */}
                 <Route path="/" element={<Navigate to="/assignments" replace />} />

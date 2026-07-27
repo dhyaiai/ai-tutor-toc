@@ -486,11 +486,13 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
     // Minimum size: 20px in each direction
     if (w >= 20 && h >= 20) {
       // If pendingQuestionNum is set, use it (user clicked + to add extra region);
-      // otherwise auto-increment
+      // otherwise auto-increment (adjust mode always belongs to the same question)
       let questionNum: number;
       if (pendingQuestionNum !== null) {
         questionNum = pendingQuestionNum;
         setPendingQuestionNum(null);
+      } else if (prefillRegion) {
+        questionNum = prefillRegion.question_id;
       } else {
         questionNum =
           regions.length > 0
@@ -592,8 +594,21 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
     setSubmitting(true);
     try {
       if (prefillRegion) {
-        // Adjust single question (include rotation)
-        const adjPayload = { ...payload[0], rotation: payload[0].rotation || 0 };
+        // Adjust single question: first region is primary, the rest are extra regions
+        // (dual-column / cross-page), merged vertically on the backend
+        const [primary, ...extras] = payload;
+        const adjPayload = {
+          ...primary,
+          rotation: primary.rotation || 0,
+          extra_regions: extras.map((r) => ({
+            page_index: r.page_index,
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+            rotation: r.rotation || 0,
+          })),
+        };
         await (
           await import('../services/questionService')
         ).questionService.adjustRegion(prefillRegion.question_id, adjPayload);
@@ -836,7 +851,7 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
                         )}
                         <strong>题</strong>
                       </Space>
-                      {!prefillRegion && (
+                      {!prefillRegion ? (
                         <Space size={2}>
                           {/* + button for adding extra region (same-page dual-column or cross-page) */}
                           <Tooltip title="添加同题区域（双栏/跨页）">
@@ -860,6 +875,34 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
                               onClick={(e) => e.stopPropagation()}
                             />
                           </Popconfirm>
+                        </Space>
+                      ) : (
+                        <Space size={2}>
+                          {/* 调整模式：+ 添加同题额外区域（A4双栏/跨页） */}
+                          <Tooltip title="添加同题区域（双栏/跨页）">
+                            <Button
+                              size="small"
+                              type="text"
+                              icon={<PlusOutlined />}
+                              onClick={(e) => { e.stopPropagation(); startExtraRegion(r); }}
+                            />
+                          </Tooltip>
+                          {/* 至少保留一个区域 */}
+                          {allRegionsSorted.length > 1 && (
+                            <Popconfirm
+                              title="确认删除此区域？"
+                              onConfirm={(e) => { e?.stopPropagation(); deleteRegion(r.id); }}
+                              onCancel={(e) => e?.stopPropagation()}
+                            >
+                              <Button
+                                size="small"
+                                danger
+                                type="text"
+                                icon={<DeleteOutlined />}
+                                onClick={(e) => e.stopPropagation()}
+                              />
+                            </Popconfirm>
+                          )}
                         </Space>
                       )}
                     </div>

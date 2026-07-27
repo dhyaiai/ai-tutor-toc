@@ -36,8 +36,21 @@ export interface CellStyle {
   };
 }
 
-/** rgb() 颜色字符串转 6 位十六进制，如 "rgb(255,128,128)" → "FF8080" */
+/**
+ * 颜色字符串转 6 位大写十六进制 RGB（不含 alpha 前缀）。
+ *
+ * 支持两种输入格式：
+ * - rgb(r, g, b) 格式：如 "rgb(255,128,128)" → "FF8080"
+ * - 6 位十六进制：如 "FF8080" → "FF8080"（直接返回大写形式）
+ *
+ * exceljs 需要 ARGB 格式（8 位），调用方会在返回值前补 "FF" alpha 前缀。
+ */
 function rgbToHex(rgb: string): string {
+  // 已经是 6 位十六进制 RGB 格式，直接返回大写
+  if (/^[0-9A-Fa-f]{6}$/.test(rgb)) {
+    return rgb.toUpperCase();
+  }
+  // rgb(r, g, b) 格式：提取数字分量转十六进制
   const match = rgb.match(/[\d.]+/g);
   if (!match || match.length < 3) return rgb;
   return match

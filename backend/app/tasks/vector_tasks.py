@@ -70,7 +70,7 @@ async def _do_vectorize(assignment_id: int):
                     "grade": assignment.grade,
                     "subject": assignment.subject,
                     "semester": assignment.semester,
-                    "month": assignment.month,
+                    "month": assignment.usage_month,
                     "type": "summary",
                 },
             })
@@ -107,7 +107,7 @@ async def _do_vectorize(assignment_id: int):
                     "grade": assignment.grade,
                     "subject": assignment.subject,
                     "semester": assignment.semester,
-                    "month": assignment.month,
+                    "month": assignment.usage_month,
                     "knowledge_points": kp_str,
                     "score_rate": round(q.score / q.full_score, 4) if q.score is not None and q.full_score else 0,
                     "type": "question_analysis",

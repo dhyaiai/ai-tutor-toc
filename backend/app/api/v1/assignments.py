@@ -16,7 +16,9 @@ from app.schemas.question import QuestionResponse
 from app.services.file_upload import StorageService
 from app.core.config import get_settings
 import asyncio
+import json
 import logging
+from io import BytesIO
 
 logger = logging.getLogger(__name__)
 
@@ -139,25 +141,123 @@ async def _validate_and_read_file(file: UploadFile) -> bytes:
     return file_data
 
 
+async def _merge_files_to_pdf(
+    file_paths: list[str],
+    storage: StorageService,
+    user_id: int,
+) -> str:
+    """
+    将多个文件（图片/PDF）按数组顺序合并为一个 PDF，保存到 storage，返回合并后的 file_url。
+
+    合并策略：
+    - PDF 文件：逐页插入到目标文档
+    - 图片文件（png/jpg/jpeg/webp）：先用 Pillow 转为 PDF 再插入
+    - 文件顺序由 file_paths 数组顺序决定（前端保证 = 用户排列的顺序）
+    """
+    import fitz
+    from PIL import Image
+
+    merged_doc = fitz.open()  # 新建空白 PDF 文档
+
+    for fp in file_paths:
+        # 从 storage 读取文件内容（支持 MinIO 和本地存储）
+        file_data = await storage.get_file_bytes(fp)
+        if not file_data:
+            raise HTTPException(
+                status_code=400,
+                detail=f"文件读取失败：{fp}，请重新上传",
+            )
+
+        ext = fp.rsplit(".", 1)[-1].lower() if "." in fp else ""
+
+        if ext == "pdf":
+            # PDF → 打开并插入所有页面
+            src_doc = fitz.open(stream=file_data, filetype="pdf")
+            merged_doc.insert_pdf(src_doc)
+            src_doc.close()
+
+        elif ext in ("png", "jpg", "jpeg", "webp"):
+            # 图片 → Pillow 打开 → 转为 PDF → 插入
+            img = Image.open(BytesIO(file_data))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img_pdf_bytes = BytesIO()
+            img.save(img_pdf_bytes, format="PDF")
+            img_pdf_bytes.seek(0)
+            src_doc = fitz.open(stream=img_pdf_bytes.read(), filetype="pdf")
+            merged_doc.insert_pdf(src_doc)
+            src_doc.close()
+
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持合并的文件类型：.{ext}",
+            )
+
+    if len(merged_doc) == 0:
+        raise HTTPException(status_code=400, detail="合并后PDF为空，请检查上传的文件")
+
+    # 保存合并后的 PDF 到 storage
+    merged_bytes = merged_doc.tobytes()
+    merged_doc.close()
+
+    # 合并后的文件名：基于第一个文件名，确保以 .pdf 结尾
+    base_name = file_paths[0].rsplit("/", 1)[-1] if "/" in file_paths[0] else file_paths[0]
+    merged_name = f"merged_{base_name}"
+    if not merged_name.lower().endswith(".pdf"):
+        merged_name = merged_name.rsplit(".", 1)[0] + ".pdf"
+
+    file_url = await storage.save_original(merged_bytes, merged_name, user_id)
+    logger.info(f"Merged {len(file_paths)} files into {file_url}")
+    return file_url
+
+
 @router.post("", status_code=status.HTTP_202_ACCEPTED)
 async def upload_assignment(
     file: UploadFile | None = File(None),
     file_path: str | None = Form(None),
+    file_paths: str | None = Form(
+        None,
+        description="多文件合并上传，JSON 数组字符串如 '[\"path/1.png\",\"path/2.png\"]'，顺序=合并后页面顺序",
+    ),
     name: str = Form(..., max_length=255),
     grade: str = Form(..., max_length=32),
     subject: str = Form(..., max_length=64),
     semester: str = Form(..., max_length=32),
-    month: str = Form(..., max_length=16),
+    usage_month: str = Form(..., max_length=16),
     layout_type: LayoutType = Form(LayoutType.A4_SINGLE),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    """上传作业文件。
+    支持三种模式：
+    - file_path：单个预上传文件（旧版兼容）
+    - file_paths：多个预上传文件，将按顺序合并为一个 PDF（多页合并）
+    - file：直接上传单个文件
+    """
     storage = StorageService()
 
-    if file_path:
-        # Use pre-uploaded file path
+    # 解析多文件路径
+    parsed_paths: list[str] = []
+    if file_paths:
+        try:
+            parsed_paths = json.loads(file_paths)
+            if not isinstance(parsed_paths, list) or len(parsed_paths) == 0:
+                raise HTTPException(status_code=400, detail="file_paths 需要是非空 JSON 数组")
+        except json.JSONDecodeError:
+            raise HTTPException(status_code=400, detail="file_paths 格式错误，需要 JSON 数组字符串")
+
+    if len(parsed_paths) > 1:
+        # 多文件合并模式：按前端排列的顺序合并为单个 PDF
+        file_url = await _merge_files_to_pdf(parsed_paths, storage, current_user.id)
+    elif len(parsed_paths) == 1:
+        # 单文件路径，直接用
+        file_url = parsed_paths[0]
+    elif file_path:
+        # 旧版单文件预上传模式
         file_url = file_path
     elif file:
+        # 直接上传单文件模式
         file_data = await _validate_and_read_file(file)
         file_url = await storage.save_original(file_data, file.filename, current_user.id)
     else:
@@ -169,7 +269,7 @@ async def upload_assignment(
         grade=grade,
         subject=subject,
         semester=semester,
-        month=month,
+        usage_month=usage_month,
         layout_type=layout_type,
         file_url=file_url,
         status=AssignmentStatus.PENDING,
@@ -275,7 +375,7 @@ async def list_assignments(
                 "grade": a.grade,
                 "subject": a.subject,
                 "semester": a.semester,
-                "month": a.month,
+                "usage_month": a.usage_month,
                 "layout_type": a.layout_type,
                 "status": a.status,
                 "total_score": float(total_score),
@@ -361,11 +461,13 @@ async def get_assignment(
             "children": [],  # 占位，后续填充
         }
 
-    # 构建嵌套结构：父题 + 子题
+    # 构建嵌套结构：父题 + 子题（支持多级嵌套）
     children_by_parent: dict[int, list[dict]] = {}
     top_level: list[dict] = []
+    all_dicts: list[dict] = []
     for q in all_questions:
         qd = await _question_to_dict(q)
+        all_dicts.append(qd)
         if q.parent_id is not None:
             # 子题 → 归入对应父题
             children_by_parent.setdefault(q.parent_id, []).append(qd)
@@ -373,9 +475,14 @@ async def get_assignment(
             # 顶层题（可能是独立题或父题容器）
             top_level.append(qd)
 
-    # 挂载子题到父题
-    for pqd in top_level:
-        pqd["children"] = children_by_parent.get(pqd["id"], [])
+    # 递归挂载子题到父题（支持多级嵌套）
+    def _attach_children(qd_list: list[dict]):
+        for qd in qd_list:
+            qd["children"] = children_by_parent.get(qd["id"], [])
+            if qd["children"]:
+                _attach_children(qd["children"])
+
+    _attach_children(top_level)
 
     # 计算总分：只汇总叶子题（子题 + 无子题的独立题）
     parent_ids = set(children_by_parent.keys())
@@ -387,7 +494,7 @@ async def get_assignment(
         "grade": assignment.grade,
         "subject": assignment.subject,
         "semester": assignment.semester,
-        "month": assignment.month,
+        "usage_month": assignment.usage_month,
         "layout_type": assignment.layout_type,
         "file_url": file_url,
         "status": assignment.status,
@@ -404,7 +511,7 @@ class UpdateAssignmentRequest(BaseModel):
     grade: str | None = None
     subject: str | None = None
     semester: str | None = None
-    month: str | None = None
+    usage_month: str | None = None
 
 
 @router.put("/{assignment_id}")
@@ -432,8 +539,8 @@ async def update_assignment(
         assignment.subject = data.subject
     if data.semester is not None:
         assignment.semester = data.semester
-    if data.month is not None:
-        assignment.month = data.month
+    if data.usage_month is not None:
+        assignment.usage_month = data.usage_month
 
     await db.commit()
     await db.refresh(assignment)
@@ -631,7 +738,6 @@ async def re_summarize(
         assignment.ai_summary = ai_summary
     except Exception as e:
         logger.warning("重新汇总: LLM评语生成失败，使用基础评语: %s", e)
-        from app.tasks.analysis_tasks import _generate_assignment_summary
         kp_set: set[str] = set()
         for q, _ in leaf_records:
             if q.knowledge_points:

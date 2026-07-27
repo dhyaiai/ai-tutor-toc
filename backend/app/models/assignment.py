@@ -31,7 +31,7 @@ class Assignment(Base):
     grade: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     subject: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     semester: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
-    month: Mapped[str] = mapped_column(String(16), nullable=False)
+    usage_month: Mapped[str] = mapped_column(String(16), nullable=False)
     layout_type: Mapped[LayoutType] = mapped_column(
         SAEnum(LayoutType), default=LayoutType.A4_SINGLE, nullable=False
     )

@@ -1,0 +1,21 @@
+# 知识卡导出索引文件
+schema_version: 1
+locale: zh-CN
+branch: master
+nodes_managed: true
+exported_at: "2026-07-20T03:27:45Z"
+modules:
+    "":
+        dir_name: AI助教系统 · 根目录与项目规范
+        title: AI助教系统 · 根目录与项目规范
+        scope:
+            - .gitignore
+            - AI助教agent.md
+            - ai助教.md
+            - start_dev.bat
+            - .env.example
+            - CLAUDE.md
+        source_files: []
+        children: []
+        depends_on: []
+        related_to: []

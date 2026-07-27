@@ -55,9 +55,9 @@ function getTextColor(rate: number): string {
 }
 
 export default function KnowledgeHeatmapPanel() {
-  /** 筛选条件 */
+  /** 筛选条件（科目默认选中数学） */
   const [grade, setGrade] = useState<string>("");
-  const [subject, setSubject] = useState<string>("");
+  const [subject, setSubject] = useState<string>("数学");
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
 
   /**
@@ -181,10 +181,9 @@ export default function KnowledgeHeatmapPanel() {
       {
         /** 得分率列：使用与网页一致的红→白渐变背景色 */
         cellStyles: {
-          score_rate: (_val, row) => {
-            const originalItem = items.find(
-              (it) => it.knowledge_point === row.knowledge_point,
-            );
+          score_rate: (_val, _row, _colIdx, rowIdx) => {
+            // exportData 与 items 顺序一致，直接索引取原始得分率（O(1) 替代 find O(n)）
+            const originalItem = items[rowIdx];
             if (!originalItem) return {};
             const rate = originalItem.score_rate;
             // 计算热力图背景色：得分率越低越红，越高越白

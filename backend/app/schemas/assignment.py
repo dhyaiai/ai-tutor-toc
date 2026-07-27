@@ -9,7 +9,7 @@ class AssignmentUpload(BaseModel):
     grade: str = Field(..., max_length=32)
     subject: str = Field(..., max_length=64)
     semester: str = Field(..., max_length=32)
-    month: str = Field(..., max_length=16)
+    usage_month: str = Field(..., max_length=16)
     layout_type: LayoutType
 
 
@@ -19,7 +19,7 @@ class AssignmentListResponse(BaseModel):
     grade: str
     subject: str
     semester: str
-    month: str
+    usage_month: str
     layout_type: LayoutType
     status: AssignmentStatus
     total_score: float | None
@@ -36,7 +36,7 @@ class AssignmentDetailResponse(BaseModel):
     grade: str
     subject: str
     semester: str
-    month: str
+    usage_month: str
     layout_type: LayoutType
     file_url: str
     status: AssignmentStatus

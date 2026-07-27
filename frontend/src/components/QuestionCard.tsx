@@ -1,4 +1,4 @@
-import { Card, Tag, Button, Space, Typography, Popconfirm, Popover, Image, Descriptions, Input, message, Spin, Collapse, Alert } from "antd";
+import { Card, Tag, Button, Space, Typography, Popconfirm, Popover, Image, Descriptions, Input, message, Spin, Collapse } from "antd";
 import { ReloadOutlined, DeleteOutlined, ExpandOutlined } from "@ant-design/icons";
 import { useState } from "react";
 import { useReanalysis } from "../hooks/useReanalysis";
@@ -55,9 +55,6 @@ function SubQuestionCard({
         </Descriptions.Item>
         <Descriptions.Item label="学生答案">
           {question.student_answer || "-"}
-          {question.manual_review_note && (
-            <Tag color="orange" style={{ fontSize: 10, marginLeft: 4 }}>已修正</Tag>
-          )}
         </Descriptions.Item>
         <Descriptions.Item label="正确答案">
           {question.correct_answer || "-"}
@@ -95,15 +92,6 @@ function SubQuestionCard({
         >
           {question.analysis_detail}
         </Typography.Paragraph>
-      )}
-      {question.manual_review_note && (
-        <Alert
-          type="warning"
-          message="人工备注"
-          description={question.manual_review_note}
-          style={{ marginTop: 8, fontSize: 12 }}
-          showIcon
-        />
       )}
     </Card>
   );
@@ -156,6 +144,16 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
     const sortedChildren = [...question.children!].sort(
       (a, b) => (a.sub_question_index ?? 0) - (b.sub_question_index ?? 0)
     );
+    // 大题分值 = 所有小题满分之和（大题本身不存分值）
+    const totalFullScore = sortedChildren.reduce(
+      (sum, c) => sum + (c.full_score ?? 0),
+      0
+    );
+    // 大题得分 = 所有小题得分之和
+    const totalScore = sortedChildren.reduce(
+      (sum, c) => sum + (c.score ?? 0),
+      0
+    );
 
     return (
       <>
@@ -168,6 +166,9 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
               </Typography.Text>
               {question.question_type && (
                 <Tag color="purple">{question.question_type}</Tag>
+              )}
+              {totalFullScore > 0 && (
+                <Tag color="gold">得分：{totalScore} / {totalFullScore} 分</Tag>
               )}
               <Tag color={statusCfg.color}>{statusCfg.label}</Tag>
             </Space>
@@ -262,15 +263,6 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
                 width={300}
                 style={{ borderRadius: 4 }}
                 fallback="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
-              />
-            )}
-            {question.manual_review_note && (
-              <Alert
-                type="warning"
-                message="人工备注"
-                description={question.manual_review_note}
-                style={{ marginTop: 8, fontSize: 12 }}
-                showIcon
               />
             )}
             {question.knowledge_points && (
@@ -445,9 +437,6 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
               </Descriptions.Item>
               <Descriptions.Item label="学生答案">
                 {question.student_answer || "-"}
-                {question.manual_review_note && (
-                  <Tag color="orange" style={{ fontSize: 10, marginLeft: 4 }}>已修正</Tag>
-                )}
               </Descriptions.Item>
               <Descriptions.Item label="正确答案">
                 {question.correct_answer || "-"}
@@ -491,15 +480,6 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
               >
                 {question.analysis_detail}
               </Typography.Paragraph>
-            )}
-            {question.manual_review_note && (
-              <Alert
-                type="warning"
-                message="人工备注"
-                description={question.manual_review_note}
-                style={{ marginTop: 8, fontSize: 12 }}
-                showIcon
-              />
             )}
           </div>
         </div>

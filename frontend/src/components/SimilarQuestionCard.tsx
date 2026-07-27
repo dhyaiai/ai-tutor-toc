@@ -46,7 +46,7 @@ export default function SimilarQuestionCard({
     );
   }
 
-  // "单选题"/"多选题"/"选择题" 都包含"选"字；或用 options 列表兜底
+  // "单选题"/"多选题" 都包含"选"字；或用 options 列表兜底
   const isChoice = question.question_type?.includes("选") || (question.options && question.options.length > 0);
   const isMulti = question.question_type?.includes("多选");
   const options = question.options || [];
@@ -77,6 +77,7 @@ export default function SimilarQuestionCard({
         source_question_id: questionId,
         question_text: question.question_text,
         answer: question.answer,
+        analysis: question.analysis,
         question_type: question.question_type,
         knowledge_point: question.knowledge_point,
         difficulty: question.difficulty,
@@ -160,7 +161,7 @@ export default function SimilarQuestionCard({
             {question.question_text}
           </Typography.Paragraph>
 
-          {/* 选择题选项 */}
+          {/* 单选题/多选题选项 */}
           {isChoice && options.length > 0 && (
         <div style={{ marginBottom: 12 }}>
           {isMulti && (
@@ -287,6 +288,16 @@ export default function SimilarQuestionCard({
             <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #d9d9d9" }}>
               <Typography.Text strong style={{ fontSize: 13 }}>正确答案：</Typography.Text>
               <Typography.Text style={{ fontSize: 13 }}>{question.answer}</Typography.Text>
+            </div>
+          )}
+
+          {/* 显示完整解析 */}
+          {showAnswer && question.analysis && (
+            <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #d9d9d9" }}>
+              <Typography.Text strong style={{ fontSize: 13, color: "#722ed1" }}>解析：</Typography.Text>
+              <Typography.Paragraph style={{ fontSize: 13, marginBottom: 0, marginTop: 4, whiteSpace: "pre-wrap" }}>
+                {question.analysis}
+              </Typography.Paragraph>
             </div>
           )}
         </div>

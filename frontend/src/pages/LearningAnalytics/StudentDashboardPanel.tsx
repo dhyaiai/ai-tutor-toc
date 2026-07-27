@@ -44,9 +44,9 @@ const EXPORT_COLUMNS: ExportColumn[] = [
 ];
 
 export default function StudentDashboardPanel() {
-  /** 筛选条件 */
+  /** 筛选条件（科目默认选中数学） */
   const [grade, setGrade] = useState<string>("");
-  const [subject, setSubject] = useState<string>("");
+  const [subject, setSubject] = useState<string>("数学");
   const [semester, setSemester] = useState<string>("");
 
   /** 获取看板数据 */

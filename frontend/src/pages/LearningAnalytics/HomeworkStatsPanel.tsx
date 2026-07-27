@@ -28,15 +28,15 @@ import {
 
 /** 饼状图配色方案（按科目固定颜色，区分度大） */
 const SUBJECT_COLORS: Record<string, string> = {
-  语文: "#f56a00",
+  语文: "#10c2f9",
   数学: "#7265e6",
   英语: "#ffbf00",
   物理: "#00a2ae",
-  化学: "#0e9e56",
+  化学: "#0c100e",
   生物: "#e8590c",
   政治: "#c41a1a",
   历史: "#6e71c4",
-  地理: "#1d953f",
+  地理: "#086322",
 };
 
 /** 表格列定义 */
@@ -94,9 +94,10 @@ export default function HomeworkStatsPanel() {
     });
   }, [data]);
 
-  /** G2 v5 饼状图配置（@ant-design/charts v2.6） */
+  /** G2 v5 饼状图配置（@ant-design/charts v2.6）。
+   *  无数据时返回 undefined，渲染层通过 hasPieData 控制显隐。 */
   const pieConfig = useMemo(() => {
-    if (pieData.length === 0) return null;
+    if (pieData.length === 0) return undefined;
 
     // 根据数据动态构建颜色映射，保证每科颜色固定
     const colorDomain = pieData.map((d) => d.type);
@@ -157,6 +158,9 @@ export default function HomeworkStatsPanel() {
     count: item.count,
   }));
 
+  /** 是否有饼图数据（显式布尔值，避免 null/undefined 混淆） */
+  const hasPieData = pieData.length > 0;
+
   return (
     <div>
       {/* ===== 筛选器 ===== */}
@@ -215,7 +219,7 @@ export default function HomeworkStatsPanel() {
           {/* 右侧：饼状图（环形图 + CSS 居中统计文字） */}
           <Col xs={24} lg={12}>
             <Card title="各科目作业占比" size="small">
-              {pieConfig ? (
+              {hasPieData && pieConfig ? (
                 <div style={{ position: "relative" }}>
                   <Pie {...pieConfig} />
                   {/* 环形图中心统计文字：G2 v5 不再内置 statistic，用 CSS 绝对定位覆盖 */}
@@ -223,7 +227,7 @@ export default function HomeworkStatsPanel() {
                     style={{
                       position: "absolute",
                       top: "50%",
-                      left: "50%",
+                      left: "45%",
                       transform: "translate(-50%, -55%)",
                       textAlign: "center",
                       pointerEvents: "none",

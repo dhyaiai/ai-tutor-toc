@@ -20,6 +20,77 @@ from app.core.config import get_settings
 logger = logging.getLogger(__name__)
 
 
+def _loads_questions_tolerant(raw: str) -> list[dict]:
+    """容错解析 LLM 返回的 JSON，提取 questions 数组。
+
+    正常情况下直接 json.loads；当响应因 max_tokens 截断导致 JSON 不完整时，
+    退化为逐个括号匹配提取 questions 数组中「完整」的题目对象，
+    尽量挣救已生成的结果，避免因最后一个对象不完整而整体丢失。
+    """
+    # 1) 正常解析
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            return data.get("questions", []) or []
+    except Exception:
+        pass
+
+    # 2) 截断挣救：定位 "questions" 数组，逐个括号匹配提取完整对象
+    objs: list[dict] = []
+    key_idx = raw.find('"questions"')
+    if key_idx == -1:
+        return objs
+    arr_start = raw.find("[", key_idx)
+    if arr_start == -1:
+        return objs
+
+    i = arr_start + 1
+    n = len(raw)
+    while i < n:
+        # 定位下一个对象起点
+        while i < n and raw[i] != "{":
+            if raw[i] == "]":  # 数组正常结束
+                return objs
+            i += 1
+        if i >= n:
+            break
+        # 括号匹配（考虑字符串内的括号与转义）
+        depth = 0
+        in_str = False
+        esc = False
+        start = i
+        closed = False
+        while i < n:
+            ch = raw[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+            else:
+                if ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            objs.append(json.loads(raw[start:i + 1]))
+                        except Exception:
+                            pass
+                        i += 1
+                        closed = True
+                        break
+            i += 1
+        if not closed:
+            # 末尾对象被截断，无法闭合 → 丢弃
+            break
+    return objs
+
+
 @dataclass
 class SubGradeResult:
     """大题下的子题评分结果（如阅读理解的第1小题、第2小题等）"""
@@ -57,7 +128,7 @@ GRADING_SYSTEM_PROMPT = """你是一位经验丰富、富有洞察力的中小�
     {
       "image_index": 整数（对应第几张输入图片，从0开始）,
       "question_number": 整数,
-      "question_type": "题型，如：选择题、填空题、计算题、应用题、证明题、简答题、判断题、阅读理解、完形填空、写作题、作图题、文言文阅读、现代文阅读等现在中高考所涉及的所有题型，一道包含多个小题的大题，不要只识别第1小题就判断题型，要参考中高考的题型以及学科网的题型划分对题目进行综合判断",
+      "question_type": "题型（重要：大题题型判断规则见下方说明）。选择题必须区分为\"单选题\"或\"多选题\"，不要使用笼统的\"选择题\"；其他如：填空题、计算题、应用题、证明题、简答题、判断题、阅读理解、完形填空、写作题、作图题、文言文阅读、现代文阅读等现在中高考所涉及的所有题型",
       "student_answer": "学生写的内容（null 如果未作答）",
       "correct_answer": "正确答案",
       "score": 数字（学生得分）,
@@ -72,6 +143,15 @@ GRADING_SYSTEM_PROMPT = """你是一位经验丰富、富有洞察力的中小�
 
 注意：一张图片可能包含多个小题（如阅读理解通常有3-5个小题）。如果图片上有多个小题，请为每个小题分别输出一个 question 对象，所有小题的 image_index 设为该图片的序号。此时 questions 数组的长度会大于图片数量，这是正确的。
 
+大题题型判断规则（极其重要，必须严格遵守）：
+- 语文试卷中，包含文言文原文（古文段落）并下设多道小题的大题，必须标为"文言文阅读"，绝不能因为其中第1小题是选择题就标为"单选题"
+- 包含现代文段落（散文、小说、议论文等）并下设多道小题的大题，必须标为"现代文阅读"
+- 包含英语阅读篇章并下设多道小题的大题，必须标为"阅读理解"
+- 包含完形填空篇章的大题，必须标为"完形填空"
+- 判断大题题型时，必须根据题目整体的内容载体（文言文原文、现代文篇章、英语文章等）来判断，而不能根据某一道小题的答题形式（选择、填空、简答）来判断
+- 小题的答题形式（选择题、填空题、简答题）只用于该小题自身的 question_type，不能上升为大题的 question_type
+- 示例：文言文阅读大题下有“1.加点词解释（单选）2.句子翻译（简答）3.内容理解（单选）”，大题 question_type 应为"文言文阅读"，而不是"单选题"
+
 评分原则：
 - 计算错误但思路正确，可酌情给部分分
 - 完全未作答，score = 0
@@ -79,7 +159,7 @@ GRADING_SYSTEM_PROMPT = """你是一位经验丰富、富有洞察力的中小�
 - 红色笔迹为老师批改，非学生作答，直接忽略掉，老师的红笔批改痕迹会划过学生作答，要仔细识别学生作答，不要被红色的笔迹影响，不要识别错误。
 
 analysis_detail 编写原则（重要）：
-- 选择题、填空题、判断题等客观题，学生只写了答案没有解题过程，如果得0分（全错或未答），不要在"做得好"部分编造表扬内容，直接说明"本题未得分"并聚焦于"存在问题"和"改进建议"
+- 单选题、多选题、填空题、判断题等客观题，学生只写了答案没有解题过程，如果得0分（全错或未答），不要在"做得好"部分编造表扬内容，直接说明"本题未得分"并聚焦于"存在问题"和"改进建议"
 - 同理，客观题如果全对但没有过程，正常肯定即可，不要过度表扬
 - 只有计算题、应用题、证明题等有解题过程的题目，且学生确实展现了正确的思路或规范的步骤时，才具体写出"做得好"的内容
 - 总之：有什么就写什么，不要无中生有
@@ -177,11 +257,15 @@ class AIGrader:
             base_url=settings.LLM_API_BASE,
         )
         self.model = settings.LLM_MODEL
-        self.max_retries = 3
+        self.max_retries = 2  # 减少重试次数，避免总超时过长
+        # 输出 token 上限：大题（如文言文/现代文阅读）含多个小题，
+        # 每题都要输出三段式详细评语 + 知识点 + 常见错误，3000 tokens 易被截断。
+        # 设为 8000（gpt-4o 等支持更大输出）；max_tokens 仅为上限，短响应不受影响。
+        self.max_output_tokens = 8000
 
-    async def grade_single(self, image_bytes: bytes, remark: str | None = None) -> GradeResult:
+    async def grade_single(self, image_bytes: bytes, remark: str | None = None, subject: str | None = None, personality_directive: str | None = None) -> GradeResult:
         """单题评分"""
-        results = await self.grade_batch([image_bytes], remark=remark)
+        results = await self.grade_batch([image_bytes], remark=remark, subject=subject, personality_directive=personality_directive)
         return results[0] if results else GradeResult(
             student_answer=None, correct_answer=None,
             score=None, full_score=None, analysis_detail=None,
@@ -190,7 +274,7 @@ class AIGrader:
         )
 
     # 每批最多几张图片（避免单次 API 请求过大导致超时）
-    MAX_IMAGES_PER_REQUEST = 3
+    MAX_IMAGES_PER_REQUEST = 2
 
     # ── 辅助方法：解析单个评分结果 ──
 
@@ -282,13 +366,15 @@ class AIGrader:
 
     # ── 批量评分 ──
 
-    async def grade_batch(self, images: list[bytes], remark: str | None = None) -> list[GradeResult]:
+    async def grade_batch(self, images: list[bytes], remark: str | None = None, subject: str | None = None, personality_directive: str | None = None) -> list[GradeResult]:
         """
         批量评分：将多题拆为小批并发调用，避免单次请求过大。
 
         Args:
             images: 题目图片字节列表
             remark: 用户备注，告诉AI识别时需要注意的问题
+            subject: 学科名称（如"语文"、"数学"），用于辅助题型识别
+            personality_directive: 助教个性化批改指令（性格/说话风格/评分严格度）
 
         Returns:
             按输入顺序返回的评分结果列表
@@ -310,7 +396,7 @@ class AIGrader:
 
         # 并发给所有小批发请求
         chunk_results: list[list[GradeResult]] = await asyncio.gather(
-            *[self._grade_chunk(chunk, idx, remark) for idx, chunk in enumerate(chunks)]
+            *[self._grade_chunk(chunk, idx, remark, subject, personality_directive) for idx, chunk in enumerate(chunks)]
         )
 
         # 按原始顺序展平
@@ -320,13 +406,19 @@ class AIGrader:
         return results
 
     async def _grade_chunk(
-        self, images: list[bytes], chunk_idx: int, remark: str | None = None
+        self, images: list[bytes], chunk_idx: int, remark: str | None = None, subject: str | None = None,
+        personality_directive: str | None = None,
     ) -> list[GradeResult]:
         """对一小批图片（≤MAX_IMAGES_PER_REQUEST）进行一次 API 调用"""
         import base64
 
         # Build prompt text
         prompt_text = GRADING_SYSTEM_PROMPT
+        if subject:
+            prompt_text += f"\n\n当前学科：{subject}。请根据该学科的常见题型和考试内容来识别题型和评分。"
+        if personality_directive:
+            # 用户自定义微调：性格/说话风格/评分严格度对所有批改生效
+            prompt_text += f"\n\n{personality_directive}"
         if remark:
             prompt_text += (
                 f"\n\n【教师批注——权威纠正】老师（批改者）已经人工检查了这道题，给出了以下纠正：\n"
@@ -346,9 +438,11 @@ class AIGrader:
         ]
         for img_bytes in images:
             b64 = base64.b64encode(img_bytes).decode("utf-8")
+            # 自动检测图片格式，使用对应的 MIME type
+            mime = "image/jpeg" if img_bytes[:3] == b'\xff\xd8\xff' else "image/png"
             content.append({
                 "type": "image_url",
-                "image_url": {"url": f"data:image/png;base64,{b64}"},
+                "image_url": {"url": f"data:{mime};base64,{b64}"},
             })
 
         for attempt in range(self.max_retries):
@@ -356,15 +450,24 @@ class AIGrader:
                 response = await self.client.chat.completions.create(
                     model=self.model,
                     messages=[{"role": "user", "content": content}],
-                    max_tokens=4000,
+                    max_tokens=self.max_output_tokens,
                     temperature=0.1,
                     response_format={"type": "json_object"},
-                    timeout=120,
+                    timeout=180,
                 )
 
                 raw = response.choices[0].message.content or "{}"
-                data = json.loads(raw)
-                questions = data.get("questions", [])
+                finish_reason = getattr(response.choices[0], "finish_reason", None)
+                if finish_reason == "length":
+                    logger.warning(
+                        "Chunk %d attempt %d: 响应被 max_tokens(%d) 截断，尝试容错解析已生成部分",
+                        chunk_idx, attempt + 1, self.max_output_tokens,
+                    )
+                questions = _loads_questions_tolerant(raw)
+                if not questions:
+                    raise ValueError(
+                        f"无法从响应中解析出题目（finish_reason={finish_reason}, raw_len={len(raw)}）"
+                    )
 
                 # ── 结果映射：按 image_index 分组（支持一图多题）──
                 # 检查 LLM 是否返回了 image_index（新格式），否则走旧的 1:1 兼容模式

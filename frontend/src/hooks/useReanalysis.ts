@@ -5,8 +5,8 @@ import type { QuestionItem } from "../services/assignmentService";
 
 /** 轮询间隔（毫秒） */
 const POLL_INTERVAL = 3000;
-/** 最大轮询时间（毫秒），与后端 3 分钟超时匹配 */
-const MAX_POLL_TIME = 180_000;
+/** 最大轮询时间（毫秒），与后端 6 分钟重分析超时匹配 */
+const MAX_POLL_TIME = 360_000;
 
 /**
  * 重新分析 hook。

@@ -40,6 +40,39 @@ class AgentExecutor:
         self.model = settings.LLM_MODEL
         self.tools = AgentTools(db, user_id)
         self.max_iterations = 5  # Max ReAct loops
+        self.db = db
+        self.user_id = user_id
+
+    async def _load_knowledge_state(self) -> str:
+        """
+        从数据库加载当前用户的知识状态摘要，
+        注入到系统提示词的 {{user_knowledge_state}} 占位符中。
+        返回简化的知识状态文本描述。
+        """
+        try:
+            from app.services.knowledge_tracker import KnowledgeTracker
+            tracker = KnowledgeTracker(self.db)
+            result = await tracker.query(user_id=self.user_id, query_type="掌握度汇总")
+            if result["items"]:
+                return result["summary"]
+            return "暂无知识状态记录。完成作业分析后将自动建立学习画像。"
+        except Exception:
+            return "知识状态加载失败，本次对话中将不包含个性化学习画像。"
+
+    async def _load_personality(self) -> str:
+        """
+        从数据库加载当前用户的助教性格配置，
+        生成性格指令文本，追加到系统提示词末尾。
+
+        配置缺失时返回默认的严谨专业型配置。
+        """
+        try:
+            from app.services.personality_service import load_grading_directive
+
+            # 与全系统 AI 批改共用同一套个性化指令（性格/说话风格/评分严格度）
+            return await load_grading_directive(self.db, self.user_id)
+        except Exception:
+            return ""
 
     async def run(
         self,
@@ -58,8 +91,18 @@ class AgentExecutor:
             {"type": "error", "content": "..."}
             {"type": "done"}
         """
+        # 加载用户知识状态和性格配置并注入到系统提示词
+        knowledge_state_text = await self._load_knowledge_state()
+        personality_text = await self._load_personality()
+
+        system_prompt = SYSTEM_PROMPT.format(
+            user_knowledge_state=knowledge_state_text,
+        )
+        # 在系统提示词后追加性格配置指令
+        system_prompt += "\n\n" + personality_text
+
         # Build messages
-        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        messages = [{"role": "system", "content": system_prompt}]
 
         # Add history
         if history:
@@ -84,7 +127,9 @@ class AgentExecutor:
                     messages=messages,
                     tools=TOOL_DEFINITIONS,
                     tool_choice="auto",
-                    temperature=0.3,
+                    temperature=0.7,
+                    frequency_penalty=0.3,
+                    presence_penalty=0.2,
                     timeout=120,
                 )
 
@@ -139,7 +184,9 @@ class AgentExecutor:
                     stream = await self.client.chat.completions.create(
                         model=self.model,
                         messages=messages,
-                        temperature=0.3,
+                        temperature=0.7,
+                        frequency_penalty=0.3,
+                        presence_penalty=0.2,
                         stream=True,
                         timeout=120,
                     )

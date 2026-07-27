@@ -19,7 +19,8 @@ export function formatDate(dateStr: string, dateOnly?: boolean): string {
   });
 }
 
-export function getScoreRate(score: number | null, fullScore: number | null): string {
+export function getScoreRate(score: number | null, fullScore: number | null, preCalculated?: number): string {
+  if (preCalculated != null) return `${(preCalculated * 100).toFixed(1)}%`;
   if (score == null || fullScore == null || fullScore === 0) return "-";
   return `${((score / fullScore) * 100).toFixed(1)}%`;
 }
