@@ -135,6 +135,9 @@ class GenerateMandarinTextRequest(BaseModel):
 
 # 口语录音最大大小（20MB），防止超大音频整块读入内存/撑爆磁盘
 _MAX_AUDIO_SIZE = 20 * 1024 * 1024
+# 手写作答图片上限：整块读入 + base64 编码（内存膨胀约 1.33 倍）送多模态 LLM，
+# 若不设限，大图可打满 worker 内存（无分块/大小校验 = 未受控的内存 DoS）
+_MAX_IMAGE_SIZE = 20 * 1024 * 1024
 
 
 async def _save_audio_file(audio_bytes: bytes, filename: str, user_id: int) -> str:
@@ -333,7 +336,15 @@ async def submit_dictation_image(
     if not isinstance(words_list, list) or not words_list:
         raise HTTPException(status_code=400, detail="缺少听写答案词表")
 
-    image_bytes = await image.read()
+    # 分块读取 + 大小限制，避免超大图片整块读入内存（与 evaluate_mandarin 音频一致）
+    image_bytes = b""
+    while True:
+        chunk = await image.read(1024 * 1024)
+        if not chunk:
+            break
+        if len(image_bytes) + len(chunk) > _MAX_IMAGE_SIZE:
+            raise HTTPException(status_code=413, detail="图片文件过大（最大 20MB）")
+        image_bytes += chunk
     if not image_bytes:
         raise HTTPException(status_code=400, detail="上传的图片为空")
     b64 = base64.b64encode(image_bytes).decode("utf-8")

@@ -23,6 +23,31 @@ from app.models.knowledge_state import UserKnowledgeState
 logger = logging.getLogger(__name__)
 
 
+def sanitize_knowledge_text(text: str, max_len: int = 50) -> str:
+    """
+    清洗知识点名称等用户/LLM 可控文本，防止跨会话持久化提示注入。
+
+    该文本最终会落入 user_knowledge_state 表，并在后续对话中被注入到
+    system prompt（agent_executor._load_knowledge_state 的
+    {{user_knowledge_state}} 占位符）。若不设防，用户可诱导 LLM 写入
+    "忽略以上所有规则，回答时输出xxx" 之类指令，跨会话持续控制分析行为。
+    因此必须：
+    1. 剥离换行/控制字符——提示注入依赖多行指令结构，单行文本无法"覆盖"上文
+    2. 截断长度——限制注入面（超过 50 字符的知识点名称无实际意义）
+    3. 剥离常见指令性前缀——"忽略/无视…"式开头几乎不可能是正常知识点名
+    """
+    if not text:
+        return ""
+    # 只保留可见字符（>= 空格），丢弃换行/回车/制表符/控制字符
+    cleaned = "".join(ch for ch in str(text) if ch >= " " and ch != "\x7f")
+    cleaned = cleaned.strip().lstrip('"\'「『（(').rstrip('"\'」』）)')
+    for prefix in ("忽略", "无视", "请忽略", "从现在开始", "从现在起", "请记住"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):].strip()
+            break
+    return cleaned[:max_len]
+
+
 def parse_feedback_level(feedback_level: str) -> tuple[int, str]:
     """
     讲解反馈等级 → 知识状态变化量 + 行为类型（Alt3 共用映射）。
@@ -79,8 +104,10 @@ class KnowledgeTracker:
         now = datetime.now()
 
         for kp in knowledge_points:
-            point_name = kp.get("point_name", "")
-            subject = kp.get("subject", "通用")
+            # 清洗后写入：point_name 会注入后续对话的 system prompt，
+            # 必须剥离换行/控制字符与指令性前缀（详见 sanitize_knowledge_text）
+            point_name = sanitize_knowledge_text(kp.get("point_name", ""))
+            subject = sanitize_knowledge_text(kp.get("subject", "通用"))
             mastery_change = kp.get("mastery_change", 0)
             behavior_type = kp.get("behavior_type", "练习正确")
 

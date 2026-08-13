@@ -149,27 +149,22 @@ function preprocessFileLinks(markdown: string): string {
  * 用于用户消息的纯文本渲染，AI 消息使用 ReactMarkdown 渲染。
  */
 function renderUserMessage(text: string): React.ReactNode {
+  // 带捕获组的正则 split：结果数组中偶数位是普通文本，奇数位是正则捕获的 URL
   const parts = text.split(FILE_URL_REGEX);
-  const matches = text.match(FILE_URL_REGEX) || [];
-
-  if (matches.length === 0) return text;
+  if (parts.length <= 1) return text;
 
   const result: React.ReactNode[] = [];
-  let matchIndex = 0;
-
   parts.forEach((part, i) => {
-    if (part) {
-      result.push(<span key={`t-${i}`}>{part}</span>);
-    }
-    if (matchIndex < matches.length) {
-      const fileUrl = matches[matchIndex];
+    if (!part) return;
+    if (i % 2 === 1) {
+      // 奇数位是 URL：只渲染一次链接（不能同时渲染成 span，否则 URL 文本重复出现）
       result.push(
         <a
-          key={`link-${matchIndex}`}
-          href={fileUrl}
+          key={`link-${i}`}
+          href={part}
           onClick={(e) => {
             e.preventDefault();
-            void openFileLink(fileUrl);
+            void openFileLink(part);
           }}
           target="_blank"
           rel="noopener noreferrer"
@@ -178,7 +173,8 @@ function renderUserMessage(text: string): React.ReactNode {
           📥 点击查看
         </a>
       );
-      matchIndex++;
+    } else {
+      result.push(<span key={`t-${i}`}>{part}</span>);
     }
   });
 
@@ -203,6 +199,12 @@ interface Message {
   toolCalls?: string[];
   /** 本次流式的工具步骤展示（可选字段，历史消息无此数据时不影响渲染） */
   toolSteps?: ToolStep[];
+  /**
+   * 流式过程中的错误提示（仅 UI 展示，不参与 content，故不会进入 LLM 上下文与持久化）。
+   * 后端"分析超时，正在直接回答..."类信息性 error 事件后流还会继续输出，
+   * 覆盖 content 会把真实回答污染成 "[错误]...真实回答"。
+   */
+  errorText?: string;
 }
 
 let _msgIdCounter = 0;
@@ -536,10 +538,14 @@ export default function ChatDrawer({ open, onClose }: Props) {
               const updated = [...prev];
               const last = updated[updated.length - 1];
               if (last && last.role === "assistant") {
+                // 不覆盖消息正文：后端"分析超时，正在直接回答..."类信息性 error 事件
+                // 之后流还会继续输出真实回答，覆盖会把最终消息污染成
+                // "[错误] ...真实回答"，且错误文本会进入下轮对话上下文。
+                // 错误提示单独存 errorText，仅 UI 展示，不参与 content/历史构建。
                 updated[updated.length - 1] = {
                   ...last,
                   toolSteps: steps.length > 0 ? [...steps] : undefined,
-                  content: `[错误] ${error}`,
+                  errorText: error,
                 };
               }
               return updated;
@@ -1064,6 +1070,12 @@ export default function ChatDrawer({ open, onClose }: Props) {
                     : "思考中..."
                 ) : (
                   ""
+                )}
+                {/* 流式错误提示（信息性提示或终局错误），不进入消息正文，避免污染对话历史 */}
+                {msg.errorText && (
+                  <div style={{ marginTop: 6, color: "#ff4d4f", fontSize: 12 }}>
+                    {msg.errorText}
+                  </div>
                 )}
               </div>
             </div>

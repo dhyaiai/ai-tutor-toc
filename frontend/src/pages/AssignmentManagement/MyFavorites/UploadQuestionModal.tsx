@@ -235,8 +235,8 @@ export default function UploadQuestionModal({ open, onClose, onSuccess }: Props)
       confirmLoading={submitting}
       okButtonProps={{ disabled: fileList.length === 0 || submitting }}
     >
-      <Typography.Paragraph type="secondary" style={{ fontSize: 13, marginTop: 8 }}>
-        上传 Word / PDF / 图片试卷，系统将自动转录题目、标注知识点，完成后可在编辑弹窗中检查修改。
+      <Typography.Paragraph style={{ fontSize: 13, marginTop: 8, padding: 12, borderRadius: 8, background: '#f6ffed', border: '1px solid #b7eb8f', color: '#389e0d' }}>
+        上传 Word / PDF / 图片试卷，系统将自动转录题目、标注知识点，完成后可在编辑弹窗中检查修改。如果你发现题目有误或缺失，可以询问豆包相关的知识，如可以将题目截图发送给豆包，让豆包进行转录。
       </Typography.Paragraph>
 
       <Form form={form} layout="vertical">

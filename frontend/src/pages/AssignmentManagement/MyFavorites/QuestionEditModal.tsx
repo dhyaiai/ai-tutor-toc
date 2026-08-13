@@ -732,6 +732,8 @@ export default function QuestionEditModal({
   /** 保存：按条目类型分派到对应更新接口（全量覆盖发送） */
   const handleSave = async () => {
     if (!entry) return;
+    // 防重复提交：保存中双击会重复写库
+    if (saving) return;
     setSaving(true);
     try {
       if (entry.item_type === "error") {

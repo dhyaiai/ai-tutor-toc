@@ -463,6 +463,11 @@ const AnswerSplitModal: React.FC<AnswerSplitModalProps> = ({
   // ── Keyboard shortcuts ──
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      // 在输入框/文本域内按 Backspace/Delete 是编辑操作，不应触发删除切割区域
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+        return;
+      }
       if (e.key === 'Escape') {
         if (pendingQuestionNum !== null) {
           setPendingQuestionNum(null);

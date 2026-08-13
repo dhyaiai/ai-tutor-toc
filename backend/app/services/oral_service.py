@@ -683,7 +683,11 @@ class OralService:
                     response_format={"type": "json_object"},
                     timeout=120,
                 )
-                content = response.choices[0].message.content or "{}"
+                content = response.choices[0].message.content
+                if not content or not content.strip():
+                    # 空正文（思考型模型 token 预算耗尽）：按失败处理走重试，
+                    # 不能静默返回空 dict 让调用方产出"空题/空文本"假成功结果
+                    raise ValueError("LLM 返回空正文，按失败处理")
                 data = json.loads(content)
                 if isinstance(data, dict):
                     return data

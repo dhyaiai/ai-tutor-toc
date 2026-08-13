@@ -119,7 +119,9 @@ export default function AIChallenge() {
         <>
           <Space direction="vertical" size="middle" style={{ width: "100%" }}>
             {data.items.map((item: AIQuestionItem) => (
-              <AIQuestionHistoryCard key={item.id} item={item} />
+              // 大题后端返回 id 为 null（见 ai_questions.py 聚合逻辑），key 必须兜底，
+              // 否则多道大题 key 全为 null，React 状态复用串扰
+              <AIQuestionHistoryCard key={item.id ?? `big-${item.group_id}`} item={item} />
             ))}
           </Space>
           <Pagination

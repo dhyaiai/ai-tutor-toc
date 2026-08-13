@@ -14,6 +14,14 @@
 export const AUTH_KEYS = {
   ACCESS_TOKEN: "access_token",
   REFRESH_TOKEN: "refresh_token",
+  /**
+   * 跨标签页共享的 refresh_token 镜像（存 localStorage，供其他标签页通过
+   * storage 事件同步；本标签页实际使用的仍是 sessionStorage 里的 REFRESH_TOKEN）。
+   * 见 tokenRefresher.setupCrossTabSync：storage 事件只在 localStorage 上触发，
+   * 若 refresh_token 只存 sessionStorage（每标签页隔离），跨标签页同步机制
+   * 将完全失效，多标签页使用约 30 分钟后后到者会用已作废的旧 token 刷新被踢下线。
+   */
+  SHARED_REFRESH_TOKEN: "shared_refresh_token",
   USER_ID: "user_id",
   PHONE: "phone",
   USERNAME: "username",
@@ -56,6 +64,8 @@ export function setSession(session: {
   if (session.refresh_token !== undefined) {
     // refresh_token 存 sessionStorage，关闭标签页即失效（降低 XSS 持久化风险）
     sessionStorage.setItem(AUTH_KEYS.REFRESH_TOKEN, session.refresh_token);
+    // 同时写入 localStorage 共享镜像，供其他标签页同步新 token（见 AUTH_KEYS.SHARED_REFRESH_TOKEN 注释）
+    localStorage.setItem(AUTH_KEYS.SHARED_REFRESH_TOKEN, session.refresh_token);
   }
   if (session.role !== undefined) {
     localStorage.setItem(AUTH_KEYS.ROLE, session.role ?? getStoredRole() ?? "user");
@@ -89,7 +99,7 @@ export function setStoredUserId(id: string | number): void {
 
 /** 清除全部登录态（登出 / 会话失效时调用） */
 export function clearSession(): void {
-  // 清理 localStorage 中的会话数据
+  // 清理 localStorage 中的会话数据（含跨标签页共享的 refresh_token 镜像）
   Object.values(AUTH_KEYS).forEach((key) => localStorage.removeItem(key));
   // 清理 sessionStorage 中的 refresh_token
   sessionStorage.removeItem(AUTH_KEYS.REFRESH_TOKEN);

@@ -12,7 +12,9 @@ class AIGeneratedQuestion(Base):
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id"), nullable=False)
     source_question_id: Mapped[int | None] = mapped_column(
-        Integer, ForeignKey("assignment_questions.id"), nullable=True
+        # ON DELETE SET NULL：删除原题（作业/题目删除）时自动置空引用，
+        # 否则 MySQL 外键 RESTRICT 会拒绝删除整张作业（接口 500）
+        Integer, ForeignKey("assignment_questions.id", ondelete="SET NULL"), nullable=True
     )
     question_text: Mapped[str] = mapped_column(Text, nullable=False)
     answer: Mapped[str] = mapped_column(Text, nullable=False)

@@ -32,7 +32,10 @@ def _extract_kp_names(kps) -> list[str]:
     if not kps:
         return []
     if isinstance(kps, list):
-        return [k["name"] if isinstance(k, dict) else str(k) for k in kps]
+        # k.get("name", ...) 兜底：knowledge_points 是 LLM 自由返回的 JSON，
+        # 部分题目存的是 {"知识点": "xxx"} 等无 name 键的变体，直接 k["name"]
+        # 会 KeyError 把整个学情接口打成 500
+        return [k.get("name", str(k)) if isinstance(k, dict) else str(k) for k in kps]
     if isinstance(kps, dict):
         return [kps.get("name", str(kps))]
     return []

@@ -40,6 +40,10 @@ const { Dragger } = Upload;
 /** 每页记录数（卡片网格） */
 const PAGE_SIZE = 12;
 
+/** 轮询分页大小（后端 page_size 上限 100）：逐页拉取全量，确保任何一页
+ * 中处于批改中的记录都能被轮询合并到状态（见轮询 effect 注释） */
+const POLL_PAGE_SIZE = 100;
+
 /** 按得分率映射语义色：≥0.7 优秀绿 / ≥0.5 中等琥珀 / 其余待提升红 */
 function rateColor(rate: number): string {
   if (rate >= 0.7) return "#52c41a";
@@ -133,6 +137,8 @@ function SubjectSection({
   const [total, setTotal] = useState(0);
   /** 卡片网格当前页 */
   const [page, setPage] = useState(1);
+  /** 列表请求代次：筛选/翻页/轮询并发时只采纳最新一次请求的结果，避免旧响应覆盖新数据 */
+  const loadEpochRef = useRef(0);
 
   /** 从文件名提取默认作文题目（去掉扩展名） */
   const getTitleFromFilename = (filename: string): string => {
@@ -214,22 +220,30 @@ function SubjectSection({
   }, []);
 
   /** 加载历史记录（仅查询本板块科目）；
-   *  silent=true 时不显示加载骨架屏（轮询/后台刷新用，避免列表每 5s 闪烁成空白卡片） */
-  const loadRecords = useCallback(async (silent = false) => {
+   *  silent=true 时不显示加载骨架屏（轮询/后台刷新用，避免列表每 5s 闪烁成空白卡片）；
+   *  pageNo 缺省时加载当前 page（后端分页，total 为真实总数） */
+  const loadRecords = useCallback(async (silent = false, pageNo?: number) => {
+    const epoch = ++loadEpochRef.current;
     if (!silent) setRecordsLoading(true);
     try {
-      const params: { subject?: string; grade?: string } = { subject };
+      const params: { subject?: string; grade?: string; page?: number; page_size?: number } = {
+        subject,
+        page: pageNo ?? page,
+        page_size: PAGE_SIZE,
+      };
       if (gradeFilter) params.grade = gradeFilter;
       const data = await compositionService.list(params);
+      if (epoch !== loadEpochRef.current) return; // 已有更新的请求，丢弃本次过期结果
       setRecords(data.items || []);
       setTotal(data.total || 0);
     } catch (err) {
+      if (epoch !== loadEpochRef.current) return;
       console.error("加载历史记录失败:", err);
       message.error("加载历史记录失败，请刷新重试");
     } finally {
-      if (!silent) setRecordsLoading(false);
+      if (epoch === loadEpochRef.current && !silent) setRecordsLoading(false);
     }
-  }, [subject, gradeFilter]);
+  }, [subject, gradeFilter, page]);
 
   // 仅在所在子板块激活时加载历史记录；首次切换到该板块时自动拉取
   useEffect(() => {
@@ -238,6 +252,8 @@ function SubjectSection({
 
   /** 提交批改（科目固定为本板块科目；批改异步执行，提交即返回） */
   const handleSubmit = useCallback(async () => {
+    // 防重复提交：antd Button 的 loading 不阻止 onClick，双击会创建两条批改记录
+    if (loading) return;
     if (filesRef.current.length === 0) {
       message.warning("请选择作文文件");
       return;
@@ -270,19 +286,58 @@ function SubjectSection({
       setLoading(false);
       setUploadProgress(0);
     }
-  }, [form, loadRecords, subject]);
+  }, [form, loadRecords, subject, loading]);
 
   /** 是否存在批改中的记录（驱动轮询） */
   const hasPendingRecords = records.some((r) => isCorrecting(r.status));
 
-  // 有批改中的记录时每 5s 静默轮询一次列表（不闪骨架屏），直到全部完成/失败后自动停止
+  // 有批改中的记录时每 5s 轮询（分页拉取全量）：
+  // - 只把返回记录的最新状态合并进本地列表（不改动当前分页位置，避免列表跳动）
+  // - 全量无批改中记录后停止轮询，并刷新当前页显示最终状态
+  // 注意必须轮询全量而非只查第 1 页：非第 1 页的记录被"重新批改"后，
+  // 若只查第 1 页，该记录状态永远合不到，且第 1 页无 pending 会提前停止
+  // 轮询 → 该记录永久停在"批改中"（死锁，只能刷新页面恢复）
   useEffect(() => {
     if (!hasPendingRecords) return;
-    const timer = setInterval(() => {
-      loadRecords(true);
-    }, 5000);
-    return () => clearInterval(timer);
-  }, [hasPendingRecords, loadRecords]);
+    let stopped = false;
+    const poll = async () => {
+      try {
+        // 分页拉取全量（后端 page_size 上限 100，逐页请求直到拉完 total）
+        const all: CompositionListItem[] = [];
+        let pageNo = 1;
+        while (true) {
+          const data = await compositionService.list({
+            subject,
+            grade: gradeFilter || undefined,
+            page: pageNo,
+            page_size: POLL_PAGE_SIZE,
+          });
+          all.push(...(data.items || []));
+          if (all.length >= (data.total || 0) || !data.items?.length) break;
+          pageNo += 1;
+        }
+        if (stopped) return;
+        // 合并最新状态：只更新返回 id 对应的记录，不替换整个列表
+        const byId = new Map(all.map((r) => [r.id, r]));
+        setRecords((prev) =>
+          prev.map((r) => (byId.has(r.id) ? { ...r, ...byId.get(r.id)! } : r)),
+        );
+        const hasPending = all.some((r) => isCorrecting(r.status));
+        if (!hasPending) {
+          // 全部完成/失败：停止轮询并刷新当前页
+          clearInterval(timer);
+          loadRecords(true);
+        }
+      } catch {
+        // 网络抖动：忽略本轮，下一轮重试
+      }
+    };
+    const timer = setInterval(poll, 5000);
+    return () => {
+      stopped = true;
+      clearInterval(timer);
+    };
+  }, [hasPendingRecords, subject, gradeFilter, loadRecords]);
 
   /** 删除记录 */
   const deleteRecord = useCallback(async (id: number) => {
@@ -318,8 +373,8 @@ function SubjectSection({
     }
   }, []);
 
-  // 当前页兜底：记录被删除后 page 可能越界，clamp 到有效范围
-  const safePage = Math.max(1, Math.min(page, Math.max(1, Math.ceil(records.length / PAGE_SIZE))));
+  // 当前页兜底：记录被删除后 page 可能越界，按真实总数 total clamp 到有效范围
+  const safePage = Math.max(1, Math.min(page, Math.max(1, Math.ceil(total / PAGE_SIZE))));
 
   return (
     <div>
@@ -647,7 +702,7 @@ function SubjectSection({
               <Pagination
                 current={safePage}
                 pageSize={PAGE_SIZE}
-                total={records.length}
+                total={total}
                 onChange={setPage}
                 showSizeChanger={false}
               />

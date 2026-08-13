@@ -40,6 +40,8 @@ export default function UploadModal({ open, onClose, onSuccess }: Props) {
   const [form] = Form.useForm();
   const [files, setFiles] = useState<File[]>([]);
   const [filesUploaded, setFilesUploaded] = useState(false);
+  /** 提交中标记：防止双击"提交作业"重复创建作业 */
+  const [submitting, setSubmitting] = useState(false);
   const { startFilesUpload, submitAssignment, uploading, progress, reset } = useUpload();
 
   // 用 ref 避免 onChange 闭包中使用到过期的 files state
@@ -131,6 +133,9 @@ export default function UploadModal({ open, onClose, onSuccess }: Props) {
   };
 
   const handleSubmit = async () => {
+    // 防重复提交：antd Button 的 loading 状态不阻止 onClick，双击会创建两份作业
+    if (submitting) return;
+    setSubmitting(true);
     try {
       const values = await form.validateFields();
       if (!filesUploaded) {
@@ -152,6 +157,8 @@ export default function UploadModal({ open, onClose, onSuccess }: Props) {
       console.error("Submit error:", err);
       const detail = extractErrorMsg(err);
       message.error(`提交失败：${detail}`);
+    } finally {
+      setSubmitting(false);
     }
   };
 
@@ -177,7 +184,7 @@ export default function UploadModal({ open, onClose, onSuccess }: Props) {
       cancelText="取消"
       width={600}
       destroyOnClose
-      okButtonProps={{ disabled: uploading || (hasFiles && !filesUploaded) }}
+      okButtonProps={{ disabled: submitting || uploading || (hasFiles && !filesUploaded) }}
     >
       <Form form={form} layout="vertical" style={{ marginTop: 16 }}>
         {/* 文件上传区域 */}
@@ -220,7 +227,8 @@ export default function UploadModal({ open, onClose, onSuccess }: Props) {
                             type="text"
                             size="small"
                             icon={<ArrowUpOutlined />}
-                            disabled={index === 0}
+                            // 上传中禁用排序：并发重启上传批次会丢文件（见 useUpload 代次守卫）
+                            disabled={index === 0 || uploading}
                             onClick={() => moveUp(index)}
                             title="上移"
                           />
@@ -228,7 +236,7 @@ export default function UploadModal({ open, onClose, onSuccess }: Props) {
                             type="text"
                             size="small"
                             icon={<ArrowDownOutlined />}
-                            disabled={index === files.length - 1}
+                            disabled={index === files.length - 1 || uploading}
                             onClick={() => moveDown(index)}
                             title="下移"
                           />
@@ -239,6 +247,7 @@ export default function UploadModal({ open, onClose, onSuccess }: Props) {
                         size="small"
                         danger
                         icon={<DeleteOutlined />}
+                        disabled={uploading}
                         onClick={() => removeFile(index)}
                         title="移除"
                       />

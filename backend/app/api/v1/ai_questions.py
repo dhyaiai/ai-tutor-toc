@@ -157,11 +157,24 @@ async def list_ai_questions(
     semester: str | None = Query(None),
     question_type: str | None = Query(None),
     difficulty: str | None = Query(None),
+    score_rate_min: float | None = Query(None, ge=0, le=1),
+    score_rate_max: float | None = Query(None, ge=0, le=1),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """列出AI生成题目（繁星驱动板块）——支持大题分组聚合"""
+    """列出AI生成题目（繁星驱动板块）——支持大题分组聚合。
+    score_rate 是聚合值（大题按最近一次作答累计计算），无法用 SQL 条件过滤，
+    必须在 Python 侧分组构建 items 之后再过滤。"""
     conditions = [AIGeneratedQuestion.user_id == current_user.id]
+    # 繁星驱动只展示 AI 生成的题（source 为 NULL 或 'ai'）。
+    # 上传转录的题（source='upload'）与 AI 题共用本表并自动收藏，
+    # 但应只出现在收藏页——不按 source 过滤会让用户上传的题混入繁星驱动
+    conditions.append(
+        or_(
+            AIGeneratedQuestion.source.is_(None),
+            AIGeneratedQuestion.source == "ai",
+        )
+    )
 
     # 当前用户已收藏的 AI 题锚点 id 集合（供收藏按钮初始状态回显）
     fav_result = await db.execute(
@@ -372,6 +385,15 @@ async def list_ai_questions(
             # 大题以组内第一子题（sub_question_index 最小）为收藏锚点
             "is_favorited": children[0].id in fav_set,
         })
+
+    # ── 得分率筛选（聚合后过滤；无 score_rate 的项不满足任何范围条件） ──
+    if score_rate_min is not None or score_rate_max is not None:
+        items = [
+            it for it in items
+            if it.get("score_rate") is not None
+            and (score_rate_min is None or it["score_rate"] >= score_rate_min)
+            and (score_rate_max is None or it["score_rate"] <= score_rate_max)
+        ]
 
     # ── 按创建时间降序 + 分页 ──
     items.sort(key=lambda x: x.get("created_at") or datetime.min, reverse=True)
@@ -756,7 +778,28 @@ import asyncio as _ai_asyncio
 
 # 同类题生成任务状态缓存：TTLCache 限容量 + 限 TTL，避免普通 dict 无界增长
 from cachetools import TTLCache
+from app.core.config import get_settings as _get_settings
 _ai_similar_cache: TTLCache = TTLCache(maxsize=200, ttl=1800)
+
+
+async def _set_ai_similar_cache(ai_question_id: int, value: dict) -> None:
+    """写 AI 题同类题任务状态：DEV 写进程内 TTLCache；生产写 Redis（跨 worker 共享）。
+
+    生产多 worker 部署时任务跑在 worker A、轮询打到 worker B，进程内缓存互相
+    不可见，必须持久化到 Redis（见 services/redis_state.py）。
+    """
+    _ai_similar_cache[ai_question_id] = value
+    if not _get_settings().DEV_MODE:
+        from app.services.redis_state import redis_state_set
+        await redis_state_set(f"ai_similar:{ai_question_id}", value)
+
+
+async def _get_ai_similar_cache(ai_question_id: int) -> dict | None:
+    """读 AI 题同类题任务状态（生产模式从 Redis 读，与 _set_ai_similar_cache 对应）。"""
+    if _get_settings().DEV_MODE:
+        return _ai_similar_cache.get(ai_question_id)
+    from app.services.redis_state import redis_state_get
+    return await redis_state_get(f"ai_similar:{ai_question_id}")
 
 
 async def _run_ai_similar_generation(ai_question_id: int):
@@ -764,6 +807,11 @@ async def _run_ai_similar_generation(ai_question_id: int):
     import logging
     _logger = logging.getLogger(__name__)
     try:
+        # 任务启动即释放并发占位锁（锁只防"投递→启动"窗口的重复触发；
+        # 运行期间由 existing 状态的 pending/processing 拦截新任务）
+        if not _get_settings().DEV_MODE:
+            from app.services.redis_state import redis_state_del
+            await redis_state_del(f"ai_similar:{ai_question_id}:lock")
         from sqlalchemy import select as _select
         from app.db.session import async_session_factory
         from app.services.similar_generator import SimilarGenerator
@@ -774,7 +822,7 @@ async def _run_ai_similar_generation(ai_question_id: int):
             )
             _ai_q = _result.scalar_one_or_none()
             if not _ai_q:
-                _ai_similar_cache[ai_question_id] = {"status": "failed", "error": "题目不存在"}
+                await _set_ai_similar_cache(ai_question_id, {"status": "failed", "error": "题目不存在"})
                 return
 
             generator = SimilarGenerator()
@@ -782,7 +830,7 @@ async def _run_ai_similar_generation(ai_question_id: int):
             all_results = []
             SINGLE_TIMEOUT = 90
 
-            _ai_similar_cache[ai_question_id] = {"status": "processing", "result": all_results}
+            await _set_ai_similar_cache(ai_question_id, {"status": "processing", "result": all_results})
             for diff in difficulties:
                 try:
                     sq = await _ai_asyncio.wait_for(
@@ -827,11 +875,11 @@ async def _run_ai_similar_generation(ai_question_id: int):
                         "question_type": _ai_q.question_type or "",
                         "options": [],
                     })
-                _ai_similar_cache[ai_question_id] = {"status": "processing", "result": list(all_results)}
+                await _set_ai_similar_cache(ai_question_id, {"status": "processing", "result": list(all_results)})
 
-        _ai_similar_cache[ai_question_id] = {"status": "completed", "result": all_results}
+        await _set_ai_similar_cache(ai_question_id, {"status": "completed", "result": all_results})
     except Exception as _exc:
-        _ai_similar_cache[ai_question_id] = {"status": "failed", "error": str(_exc)}
+        await _set_ai_similar_cache(ai_question_id, {"status": "failed", "error": str(_exc)})
 
 
 @router.post("/{question_id}/similar", status_code=status.HTTP_202_ACCEPTED)
@@ -845,15 +893,29 @@ async def generate_ai_similar(
     if not q or q.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="题目不存在")
 
-    existing = _ai_similar_cache.get(question_id)
+    existing = await _get_ai_similar_cache(question_id)
     if existing and existing["status"] in ("pending", "processing"):
         return {"status": existing["status"], "message": "已有同类题生成任务进行中"}
 
-    _ai_similar_cache[question_id] = {"status": "pending"}
-    # 用 run_async_in_background 持有任务引用，防止 create_task 的裸任务被 GC 回收
-    #（回收后缓存永久停在 pending，前端轮询永不返回）
-    from app.tasks.dev_runner import run_async_in_background
-    run_async_in_background(_run_ai_similar_generation(question_id))
+    if _get_settings().DEV_MODE:
+        await _set_ai_similar_cache(question_id, {"status": "pending"})
+        # 用 run_async_in_background 持有任务引用，防止 create_task 的裸任务被 GC 回收
+        #（回收后缓存永久停在 pending，前端轮询永不返回）
+        from app.tasks.dev_runner import run_async_in_background
+        run_async_in_background(_run_ai_similar_generation(question_id))
+    else:
+        # 生产模式：投递 Celery 由 worker 执行（状态写 Redis，见 _set_ai_similar_cache）。
+        # SET NX 原子占位：堵住并发请求同时通过上方 existing 检查的竞态窗口。
+        # 注意锁 key 与状态 key 分离（锁 = "ai_similar:{id}:lock"，状态 = "ai_similar:{id}"）：
+        # 若共用同一 key，任务完成后状态仍保留 completed（TTL 1800s），
+        # SET NX 永远失败 → 用户 30 分钟内无法再次生成。任务启动时会删锁。
+        from app.services.redis_state import redis_state_setnx
+        if not await redis_state_setnx(
+            f"ai_similar:{question_id}:lock", {"status": "pending"}, ttl=_AI_SIMILAR_LOCK_TTL
+        ):
+            return {"status": "pending", "message": "已有同类题生成任务进行中"}
+        from app.tasks.analysis_tasks import generate_ai_similar_questions
+        generate_ai_similar_questions.delay(question_id)
     return {"status": "pending", "message": "同类题生成任务已创建"}
 
 
@@ -868,7 +930,7 @@ async def get_ai_similar_result(
     if not q or q.user_id != current_user.id:
         raise HTTPException(status_code=404, detail="题目不存在")
 
-    cached = _ai_similar_cache.get(question_id)
+    cached = await _get_ai_similar_cache(question_id)
     if not cached:
         return {"status": "not_found"}
 
@@ -889,6 +951,12 @@ _ai_similar_single_timestamps: dict[int, list[float]] = defaultdict(list)
 _AI_SIMILAR_SINGLE_MAX_PER_HOUR = 30
 _AI_SIMILAR_SINGLE_RATE_WINDOW = 3600
 
+# 生产模式并发占位锁 TTL（锁 key 为 "ai_similar:{question_id}:lock"，与状态 key
+# 分离，避免任务完成后状态仍保留、SET NX 永远失败导致 30 分钟内无法再次生成）：
+# 锁在任务启动时释放（redis_state_del），TTL 只兜底覆盖"投递→启动"的窗口。
+_AI_SIMILAR_LOCK_TTL = 900   # 批量生成任务软超时 900s
+_AI_REPLACE_LOCK_TTL = 300   # 单题替换任务软超时 300s
+
 
 class AIReplaceRequest(BaseModel):
     difficulty: str = "medium"  # easy | medium | hard
@@ -903,6 +971,10 @@ async def _run_ai_single_replace(ai_question_id: int, index: int, difficulty: st
     import logging
     _logger = logging.getLogger(__name__)
     try:
+        # 任务启动即释放并发占位锁（与批量生成共用同一把锁；见 _AI_SIMILAR_LOCK_TTL 注释）
+        if not _get_settings().DEV_MODE:
+            from app.services.redis_state import redis_state_del
+            await redis_state_del(f"ai_similar:{ai_question_id}:lock")
         from sqlalchemy import select as _select
         from app.db.session import async_session_factory
         from app.services.similar_generator import SimilarGenerator
@@ -913,14 +985,16 @@ async def _run_ai_single_replace(ai_question_id: int, index: int, difficulty: st
             )
             _ai_q = _result.scalar_one_or_none()
             if not _ai_q:
-                entry = _ai_similar_cache.get(ai_question_id)
+                entry = await _get_ai_similar_cache(ai_question_id)
                 if entry:
                     entry["replace"] = {"status": "failed", "error": "题目不存在", "index": index, "difficulty": difficulty}
+                    await _set_ai_similar_cache(ai_question_id, entry)
                 return
 
-            entry = _ai_similar_cache.get(ai_question_id)
+            entry = await _get_ai_similar_cache(ai_question_id)
             if entry and entry.get("replace"):
                 entry["replace"]["status"] = "processing"
+                await _set_ai_similar_cache(ai_question_id, entry)
 
             # 从缓存获取已有题目文本以排除重复
             exclude = ""
@@ -943,6 +1017,7 @@ async def _run_ai_single_replace(ai_question_id: int, index: int, difficulty: st
             if entry:
                 if not sq:
                     entry["replace"] = {"status": "failed", "error": "生成失败，请重试", "index": index, "difficulty": difficulty}
+                    await _set_ai_similar_cache(ai_question_id, entry)
                     return
                 item = {
                     "question_text": sq.question_text,
@@ -967,11 +1042,13 @@ async def _run_ai_single_replace(ai_question_id: int, index: int, difficulty: st
                     "status": "completed", "question": item,
                     "index": index, "difficulty": difficulty, "error": None,
                 }
+                await _set_ai_similar_cache(ai_question_id, entry)
     except Exception as _exc:
         _logger.error("AI single replace failed for q %d: %s", ai_question_id, _exc)
-        entry = _ai_similar_cache.get(ai_question_id)
+        entry = await _get_ai_similar_cache(ai_question_id)
         if entry:
             entry["replace"] = {"status": "failed", "error": str(_exc), "index": index, "difficulty": difficulty}
+            await _set_ai_similar_cache(ai_question_id, entry)
 
 
 @router.post("/{question_id}/similar-single", status_code=status.HTTP_202_ACCEPTED)
@@ -1004,7 +1081,7 @@ async def generate_ai_similar_single(
 
     # 并发守卫：批量生成任务或换题任务进行中时拒绝，避免多个任务同时写缓存
     # 和并发调用 LLM（用户反复点击叠加请求会让模型更慢、更易超时）。
-    existing = _ai_similar_cache.get(question_id)
+    existing = await _get_ai_similar_cache(question_id)
     if existing:
         if existing["status"] in ("pending", "processing"):
             raise HTTPException(status_code=409, detail="同类题正在生成中，请稍候再试")
@@ -1013,18 +1090,33 @@ async def generate_ai_similar_single(
             raise HTTPException(status_code=409, detail="换题正在生成中，请稍候再试")
     else:
         # 缓存缺失（TTL 过期）：重建占位缓存，保证 replace 任务有可写位置
-        _ai_similar_cache[question_id] = {"status": "completed", "result": []}
+        await _set_ai_similar_cache(question_id, {"status": "completed", "result": []})
 
     difficulty = data.difficulty if data.difficulty in ("easy", "medium", "hard") else "medium"
     index = data.index if data.index is not None else -1
-    entry = _ai_similar_cache[question_id]
+    entry = await _get_ai_similar_cache(question_id)
     entry["replace"] = {
         "status": "pending", "index": index, "difficulty": difficulty,
         "question": None, "error": None,
     }
-    # 用 run_async_in_background 持有任务引用，防止 create_task 裸任务被 GC 回收
-    from app.tasks.dev_runner import run_async_in_background
-    run_async_in_background(_run_ai_single_replace(question_id, index, difficulty))
+    await _set_ai_similar_cache(question_id, entry)
+
+    if _get_settings().DEV_MODE:
+        # 用 run_async_in_background 持有任务引用，防止 create_task 裸任务被 GC 回收
+        from app.tasks.dev_runner import run_async_in_background
+        run_async_in_background(_run_ai_single_replace(question_id, index, difficulty))
+    else:
+        # 生产模式：投递 Celery 由 worker 执行（状态写 Redis，见 _set_ai_similar_cache）。
+        # SET NX 原子占位：堵住并发请求同时通过上方 existing 检查的竞态窗口
+        #（与批量生成共用同一把锁，任务启动时释放；锁 key 与状态 key 分离，
+        # 避免任务完成后 30 分钟内无法再次触发——见 generate_ai_similar 注释）。
+        from app.services.redis_state import redis_state_setnx
+        if not await redis_state_setnx(
+            f"ai_similar:{question_id}:lock", {"status": "pending"}, ttl=_AI_REPLACE_LOCK_TTL
+        ):
+            raise HTTPException(status_code=409, detail="换题正在生成中，请稍候再试")
+        from app.tasks.analysis_tasks import ai_similar_replace
+        ai_similar_replace.delay(question_id, index, difficulty)
 
     return {"status": "processing", "message": "换题任务已创建"}
 

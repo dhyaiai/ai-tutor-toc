@@ -84,11 +84,14 @@ class AgentExecutor:
         返回简化的知识状态文本描述。
         """
         try:
-            from app.services.knowledge_tracker import KnowledgeTracker
+            from app.services.knowledge_tracker import KnowledgeTracker, sanitize_knowledge_text
             tracker = KnowledgeTracker(self.db)
             result = await tracker.query(user_id=self.user_id, query_type="掌握度汇总")
             if result["items"]:
-                return result["summary"]
+                # 二次清洗再注入 system prompt：拦截历史脏数据/存量库中的
+                # 指令性文本，防止跨会话持久化提示注入（写入端约束见
+                # KnowledgeTracker.update 的 sanitize_knowledge_text）
+                return sanitize_knowledge_text(result["summary"], max_len=200)
             return "暂无知识状态记录。完成作业分析后将自动建立学习画像。"
         except Exception:
             return "知识状态加载失败，本次对话中将不包含个性化学习画像。"

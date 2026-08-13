@@ -433,6 +433,44 @@ async def _auto_migrate(conn):
     # 1826 重复的外键约束名（如重复建 fk_question_parent）/
     # 1138 无效使用 NULL（如 NOT NULL 列 UPDATE 置 NULL，出现在"先收紧再清数据"的幂等场景）
     _SAFE_ERR_CODES = (1050, 1054, 1060, 1061, 1091, 1092, 1146, 1826, 1138)
+
+    # ── 特殊迁移：ai_generated_questions.source_question_id 外键改为 ON DELETE SET NULL (added 2026-08)
+    # 旧库该外键为默认 RESTRICT 规则（约束名 ai_generated_questions_ibfk_N，由 MySQL 按创建顺序
+    # 自动命名，不能硬编码），删除作业时若题目被 AI 题/转录题引用，外键直接拒绝删除 → 接口 500。
+    # 必须先查 information_schema 拿到实际约束名，确认删除规则不是 SET NULL 后再 DROP + 重建。
+    # 幂等：新库（create_all 已建 SET NULL）/已迁移过的库查询 DELETE_RULE 为 SET NULL 直接跳过。
+    try:
+        _fk_row = (await conn.execute(text(
+            "SELECT CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE "
+            "WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'ai_generated_questions' "
+            "AND COLUMN_NAME = 'source_question_id' AND REFERENCED_TABLE_NAME = 'assignment_questions'"
+        ))).first()
+        if _fk_row:
+            _fk_name = _fk_row[0]
+            _rule_row = (await conn.execute(text(
+                "SELECT DELETE_RULE FROM information_schema.REFERENTIAL_CONSTRAINTS "
+                "WHERE CONSTRAINT_SCHEMA = DATABASE() AND CONSTRAINT_NAME = :fk_name"
+            ), {"fk_name": _fk_name})).first()
+            if _rule_row and _rule_row[0] != "SET NULL":
+                await conn.execute(text(
+                    f"ALTER TABLE ai_generated_questions DROP FOREIGN KEY `{_fk_name}`"
+                ))
+                await conn.execute(text(
+                    "ALTER TABLE ai_generated_questions ADD CONSTRAINT fk_ai_q_source_question "
+                    "FOREIGN KEY (source_question_id) REFERENCES assignment_questions(id) ON DELETE SET NULL"
+                ))
+                print(f"[migrate] OK: 外键 {_fk_name} → ON DELETE SET NULL", flush=True)
+    except OperationalError as e:
+        # 与上方循环一致的容错：白名单错误码跳过，非白名单按模式决定告警或启动失败
+        _err_code = 0
+        if hasattr(e, 'orig') and e.orig and hasattr(e.orig, 'args'):
+            _err_code = e.orig.args[0] if e.orig.args else 0
+        if _err_code not in _SAFE_ERR_CODES:
+            _msg = f"[migrate] WARN (errno {_err_code}): FK 迁移失败 -> {e}"
+            print(_msg, flush=True)
+            if not settings.DEV_MODE:
+                raise RuntimeError(f"数据库迁移失败，应用拒绝在未完全迁移的 schema 上启动：{_msg}")
+
     for sql in migrations:
         try:
             result = await conn.execute(text(sql))

@@ -966,7 +966,11 @@ function OralRecordsList({
   const mandarinClickable = category === "普通话测评" && showMandarinDetail;
   const dictationClickable = category === "单词听写" && showDictationFilters;
 
+  // 列表请求代次：筛选变化与刷新并发时只采纳最新一次结果，避免慢响应覆盖新筛选数据
+  const loadEpochRef = useRef(0);
+
   const load = useCallback(async () => {
+    const epoch = ++loadEpochRef.current;
     try {
       const params: {
         category: string; grade_level?: string; question_type?: string;
@@ -978,8 +982,10 @@ function OralRecordsList({
       if (showDictationFilters && filterScope) params.word_scope = filterScope;
       if (showDictationFilters && filterDifficulty) params.difficulty = filterDifficulty;
       const data = await oralService.listRecords(params);
+      if (epoch !== loadEpochRef.current) return; // 已有更新的请求，丢弃本次过期结果
       setRecords(data || []);
     } catch (err) {
+      if (epoch !== loadEpochRef.current) return;
       console.error("加载口语测评记录失败:", err);
     }
   }, [category, showFilters, filterGrade, filterType, showDictationFilters, filterDirection, filterScope, filterDifficulty]);
@@ -1610,6 +1616,8 @@ function ListeningPanel({ active }: { active?: boolean }) {
 
   const submit = useCallback(async () => {
     if (questions.length === 0) return;
+    // 防重复提交：antd Button 的 loading 不阻止 onClick，双击会创建两条评测记录
+    if (submitting) return;
     player.stop();
     setPlayingIndex(null);
     const answerList = questions.map((_, i) => answers[i] || "");
@@ -1628,7 +1636,7 @@ function ListeningPanel({ active }: { active?: boolean }) {
     } finally {
       setSubmitting(false);
     }
-  }, [questions, answers, transcript, meta, player.stop]);
+  }, [questions, answers, transcript, meta, player.stop, submitting]);
 
   /** 删除记录回调：调用 API 删除 */
   const handleDelete = useCallback(async (id: number) => {
@@ -1926,6 +1934,8 @@ function DictationPanel({ active }: { active?: boolean }) {
 
   const submit = useCallback(async () => {
     if (words.length === 0) return;
+    // 防重复提交：antd Button 的 loading 不阻止 onClick，双击会创建两条听写记录
+    if (submitting) return;
     player.stop();
     const extra = { direction, broadcast_text: broadcastText, word_scope: wordScope, difficulty };
     setSubmitting(true);
@@ -1954,7 +1964,7 @@ function DictationPanel({ active }: { active?: boolean }) {
     } finally {
       setSubmitting(false);
     }
-  }, [words, keyboardAnswers, uploadFile, answerMode, direction, difficulty, broadcastText, wordScope, player.stop]);
+  }, [words, keyboardAnswers, uploadFile, answerMode, direction, difficulty, broadcastText, wordScope, player.stop, submitting]);
 
   /** 切换方向时重置 */
   const handleDirectionChange = useCallback((val: string) => {
@@ -2222,6 +2232,8 @@ function MandarinPanel({ active }: { active?: boolean }) {
 
   /** 提交评测（讯飞流式语音评测） */
   const submitEvaluation = useCallback(async () => {
+    // 防重复提交：antd Button 的 loading 不阻止 onClick，双击会创建两条评测记录
+    if (loading) return;
     if (!generatedText.trim()) {
       message.warning("请先生成朗读文本");
       return;
@@ -2254,7 +2266,7 @@ function MandarinPanel({ active }: { active?: boolean }) {
     } finally {
       setLoading(false);
     }
-  }, [recorder.audioBlob, level, generatedText]);
+  }, [recorder.audioBlob, level, generatedText, loading]);
 
   /** 重新开始 */
   const handleReset = useCallback(() => {

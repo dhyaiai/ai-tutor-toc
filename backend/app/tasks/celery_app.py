@@ -28,6 +28,7 @@ celery_app = Celery(
     backend=settings.REDIS_URL,
     include=[
         "app.tasks.analysis_tasks",
+        "app.tasks.composition_tasks",  # 作文批改任务：缺省时 worker 不导入该模块，任务未注册导致 delay() 报错
     ],
 )
 

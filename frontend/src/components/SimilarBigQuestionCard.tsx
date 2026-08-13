@@ -67,37 +67,29 @@ export default function SimilarBigQuestionCard({ question, questionId, onReplace
     (sum, a) => sum + (a.result?.score || 0), 0
   );
 
-  /** 初始化子题作答状态 */
-  const initAnswer = (index: number): SubAnswerState => {
-    if (!answers[index]) {
-      setAnswers((prev) => ({
-        ...prev,
-        [index]: {
-          selectedOptions: [],
-          textAnswer: "",
-          imageFile: null,
-          result: null,
-        },
-      }));
-    }
-    return answers[index] || {
-      selectedOptions: [],
-      textAnswer: "",
-      imageFile: null,
-      result: null,
-    };
-  };
+  /** 默认子题作答状态（无副作用，供 setState updater 内联使用） */
+  const defaultAnswerState = (): SubAnswerState => ({
+    selectedOptions: [],
+    textAnswer: "",
+    imageFile: null,
+    result: null,
+  });
+
+  /** 读取子题当前作答；未初始化时返回默认值（不触发 setState，提交快照用） */
+  const getAnswer = (index: number): SubAnswerState => answers[index] || defaultAnswerState();
 
   const updateAnswer = (index: number, patch: Partial<SubAnswerState>) => {
+    // 直接在 updater 内基于 prev 合并，禁止在 updater 里再读外层闭包 answers
+    //（stale closure 会导致提交评分返回后合并的是旧快照，用户新输入被回退丢失）
     setAnswers((prev) => ({
       ...prev,
-      [index]: { ...initAnswer(index), ...patch },
+      [index]: { ...(prev[index] || defaultAnswerState()), ...patch },
     }));
   };
 
   /** 提交单个子题的作答 */
   const submitSubQuestion = async (index: number, sq: SimilarBigSubQuestion) => {
-    const ans = initAnswer(index);
+    const ans = getAnswer(index);
     const isChoice = sq.question_type?.includes("选") || (sq.options && sq.options.length > 0);
 
     if (isChoice && ans.selectedOptions.length === 0) {

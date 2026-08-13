@@ -188,7 +188,11 @@ def correct_composition_dev(correction_id: int):
 
 
 if celery_app is not None:
-    @celery_app.task(bind=True, name="correct_composition")
+    # 注意：任务级 soft/hard time_limit 必须覆盖多模态批改预算——作文多图视觉批改
+    # 是多次 LLM 串行调用（实测可达 600s+），默认全局 300/360s 会被 SoftTimeLimitExceeded
+    # 杀死并在内部 except 中落库 failed，导致每次重试必败
+    @celery_app.task(bind=True, name="correct_composition",
+                     soft_time_limit=1800, time_limit=2400)
     def correct_composition(self, correction_id: int):
         """生产模式 Celery 任务：在 worker 中执行批改。"""
         loop = asyncio.new_event_loop()

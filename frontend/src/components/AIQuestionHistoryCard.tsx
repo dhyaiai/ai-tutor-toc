@@ -365,7 +365,7 @@ function AISubQuestionCard({
       />
 
       {latestAnswer && (
-        /* 作答结果：得分 / 评语 / 答案 */
+        /* 作答结果：得分 / 评语 / 我的作答（有作答记录时显示） */
         <div
           style={{
             marginTop: 8,
@@ -386,11 +386,35 @@ function AISubQuestionCard({
               评语：{latestAnswer.ai_feedback}
             </Typography.Paragraph>
           )}
-          <details style={{ marginTop: 4 }}>
+          {/* 主观题作答内容（answer_text 只存主观题；选择题由选项勾选态回显） */}
+          {latestAnswer.answer_text && (
+            <Typography.Paragraph style={{ fontSize: 12, marginBottom: 0, marginTop: 4, whiteSpace: "pre-wrap" }}>
+              <Typography.Text strong>我的作答：</Typography.Text>
+              {latestAnswer.answer_text}
+            </Typography.Paragraph>
+          )}
+          {latestAnswer.answer_image_url && (
+            <div style={{ marginTop: 4 }}>
+              <Typography.Text strong style={{ fontSize: 12 }}>我的作答图片：</Typography.Text>
+              <img
+                src={latestAnswer.answer_image_url}
+                alt="我的作答图片"
+                style={{ display: "block", maxWidth: "100%", marginTop: 4, borderRadius: 4 }}
+              />
+            </div>
+          )}
+        </div>
+      )}
+      {/* 查看正确答案：题有答案/解析即可查看（未作答也能看），不依赖作答记录 */}
+      {!hideAnswer && (child.answer || child.analysis) && (
+        <div style={{ marginTop: 8 }}>
+          <details>
             <summary style={{ cursor: "pointer", fontSize: 12, color: "#1677ff" }}>
               查看正确答案
             </summary>
-            <RichText content={child.answer} style={{ fontSize: 12 }} />
+            {child.answer && !isPlaceholderAnswer(child.answer) && (
+              <RichText content={child.answer} style={{ fontSize: 12 }} />
+            )}
             {child.analysis && (
               <div style={{ marginTop: 4 }}>
                 <Typography.Text strong style={{ color: "#722ed1", fontSize: 12 }}>解析：</Typography.Text>
@@ -709,28 +733,56 @@ function StandaloneCard({
             )}
           </div>
         )
-      ) : latestAnswer && (
-        /* 作答结果：得分 / 评语 / 答案 */
-        <div style={{ marginTop: 8, padding: 8, background: "#fafafa", borderRadius: 4 }}>
-          <Typography.Text style={{ fontSize: 12 }}>
-            得分：{latestAnswer.score}/{latestAnswer.full_score}
-          </Typography.Text>
-          {latestAnswer.ai_feedback && (
-            <Typography.Paragraph style={{ fontSize: 12, marginBottom: 0, marginTop: 4 }} type="secondary">
-              评语：{latestAnswer.ai_feedback}
-            </Typography.Paragraph>
+      ) : (
+        <>
+          {latestAnswer && (
+            /* 作答结果：得分 / 评语 / 我的作答（有作答记录时显示） */
+            <div style={{ marginTop: 8, padding: 8, background: "#fafafa", borderRadius: 4 }}>
+              <Typography.Text style={{ fontSize: 12 }}>
+                得分：{latestAnswer.score}/{latestAnswer.full_score}
+              </Typography.Text>
+              {latestAnswer.ai_feedback && (
+                <Typography.Paragraph style={{ fontSize: 12, marginBottom: 0, marginTop: 4 }} type="secondary">
+                  评语：{latestAnswer.ai_feedback}
+                </Typography.Paragraph>
+              )}
+              {/* 主观题作答内容（answer_text 只存主观题；选择题由选项勾选态回显） */}
+              {latestAnswer.answer_text && (
+                <Typography.Paragraph style={{ fontSize: 12, marginBottom: 0, marginTop: 4, whiteSpace: "pre-wrap" }}>
+                  <Typography.Text strong>我的作答：</Typography.Text>
+                  {latestAnswer.answer_text}
+                </Typography.Paragraph>
+              )}
+              {latestAnswer.answer_image_url && (
+                <div style={{ marginTop: 4 }}>
+                  <Typography.Text strong style={{ fontSize: 12 }}>我的作答图片：</Typography.Text>
+                  <img
+                    src={latestAnswer.answer_image_url}
+                    alt="我的作答图片"
+                    style={{ display: "block", maxWidth: "100%", marginTop: 4, borderRadius: 4 }}
+                  />
+                </div>
+              )}
+            </div>
           )}
-          <details style={{ marginTop: 4 }}>
-            <summary style={{ cursor: "pointer", fontSize: 12, color: "#1677ff" }}>查看正确答案</summary>
-            <RichText content={item.answer} style={{ fontSize: 12 }} />
-            {item.analysis && (
-              <div style={{ marginTop: 4 }}>
-                <Typography.Text strong style={{ color: "#722ed1", fontSize: 12 }}>解析：</Typography.Text>
-                <RichText content={item.analysis} style={{ display: "block", fontSize: 12, marginTop: 4 }} />
-              </div>
-            )}
-          </details>
-        </div>
+          {/* 查看正确答案：题有答案/解析即可查看（未作答也能看），不依赖作答记录 */}
+          {!hideAnswer && (item.answer || item.analysis) && (
+            <div style={{ marginTop: 8 }}>
+              <details>
+                <summary style={{ cursor: "pointer", fontSize: 12, color: "#1677ff" }}>查看正确答案</summary>
+                {item.answer && !isPlaceholderAnswer(item.answer) && (
+                  <RichText content={item.answer} style={{ fontSize: 12 }} />
+                )}
+                {item.analysis && (
+                  <div style={{ marginTop: 4 }}>
+                    <Typography.Text strong style={{ color: "#722ed1", fontSize: 12 }}>解析：</Typography.Text>
+                    <RichText content={item.analysis} style={{ display: "block", fontSize: 12, marginTop: 4 }} />
+                  </div>
+                )}
+              </details>
+            </div>
+          )}
+        </>
       )}
 
       {/* AI 生成同类题按钮 */}

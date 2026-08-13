@@ -1520,16 +1520,121 @@ if celery_app is not None:
     @celery_app.task(bind=True, name="generate_similar_questions",
                      soft_time_limit=900, time_limit=1200)
     def generate_similar_questions(self, question_id: int):
-        """同类题生成任务"""
+        """同类题生成任务（批量 3 题/大题）。
+
+        调用 questions.py 的 _run_similar_generation（与 DEV 模式同一份逻辑：
+        支持大题、逐题部分结果、任务状态写 Redis 供跨 worker 轮询）。
+        """
         logger.info("[generate_similar] Starting for question %d", question_id)
         try:
-            result = _run_async(_do_generate_similar(question_id))
-            return result
+            from app.api.v1.questions import _run_similar_generation
+            _run_async(_run_similar_generation(question_id))
+            return {"status": "completed"}
         except Exception as exc:
             logger.error("[generate_similar] Failed: %s", exc)
             return {"error": str(exc)}
+
+    @celery_app.task(bind=True, name="similar_replace",
+                     soft_time_limit=300, time_limit=360)
+    def similar_replace(self, question_id: int, index: int, difficulty: str):
+        """单题替换任务（换一题）：复用 DEV 模式的 _run_single_replace，
+        任务状态写 Redis 供前端轮询 similar-result 的 replace 字段。
+        """
+        logger.info("[similar_replace] Starting for question %d index=%d", question_id, index)
+        try:
+            from app.api.v1.questions import _run_single_replace
+            _run_async(_run_single_replace(question_id, index, difficulty))
+            return {"status": "completed"}
+        except Exception as exc:
+            logger.error("[similar_replace] Failed: %s", exc)
+            return {"error": str(exc)}
+
+    @celery_app.task(bind=True, name="generate_ai_similar_questions",
+                     soft_time_limit=900, time_limit=1200)
+    def generate_ai_similar_questions(self, ai_question_id: int):
+        """AI 题目同类题生成任务（批量 3 题）：复用 DEV 模式的
+        _run_ai_similar_generation，任务状态写 Redis 供跨 worker 轮询。
+        """
+        logger.info("[generate_ai_similar] Starting for question %d", ai_question_id)
+        try:
+            from app.api.v1.ai_questions import _run_ai_similar_generation
+            _run_async(_run_ai_similar_generation(ai_question_id))
+            return {"status": "completed"}
+        except Exception as exc:
+            logger.error("[generate_ai_similar] Failed: %s", exc)
+            return {"error": str(exc)}
+
+    @celery_app.task(bind=True, name="ai_similar_replace",
+                     soft_time_limit=300, time_limit=360)
+    def ai_similar_replace(self, ai_question_id: int, index: int, difficulty: str):
+        """AI 题目单题替换任务（换一题）：复用 DEV 模式的 _run_ai_single_replace，
+        任务状态写 Redis 供前端轮询 similar-result 的 replace 字段。
+        """
+        logger.info("[ai_similar_replace] Starting for question %d index=%d", ai_question_id, index)
+        try:
+            from app.api.v1.ai_questions import _run_ai_single_replace
+            _run_async(_run_ai_single_replace(ai_question_id, index, difficulty))
+            return {"status": "completed"}
+        except Exception as exc:
+            logger.error("[ai_similar_replace] Failed: %s", exc)
+            return {"error": str(exc)}
+
+    @celery_app.task(bind=True, name="transcribe_upload_files",
+                     soft_time_limit=6000, time_limit=6600)
+    def transcribe_upload_files(self, task_id: str, user_id: int, stored_paths: list, meta: dict):
+        """上传试卷转录任务（生产模式）：从存储读回文件 bytes 后走与 DEV
+        完全相同的转录逻辑（_run_transcription_task），任务状态写 Redis
+        供前端跨 worker 轮询（见 upload_questions._set_upload_cache）。
+
+        单文件转录最坏 600s，N 个文件串行处理，超时上限按文件数扩展（6000s）。
+        """
+        logger.info("[transcribe_upload] Starting task %s files=%d", task_id, len(stored_paths))
+        try:
+            from app.api.v1.upload_questions import _run_transcription_task, _set_upload_cache
+
+            async def _load_and_run():
+                # 从存储读回文件内容（落盘失败的空路径跳过）
+                from app.services.file_upload import StorageService
+                storage = StorageService()
+                # 第三项为请求内已落盘路径：转录时直接复用为展示图 URL，
+                # 避免 worker 再保存第二份（同一文件存两份是存储泄漏，
+                # 见 upload_questions._transcribe_one_file 的 original_path 参数）
+                files: list[tuple[bytes, str, str | None]] = []
+                for path in stored_paths:
+                    if not path:
+                        continue
+                    filename = path.rsplit("/", 1)[-1]
+                    file_data = await storage.get_file_bytes(path)
+                    if file_data:
+                        files.append((file_data, filename, path))
+                    else:
+                        logger.warning("转录文件 %s 读取失败（跳过）", path)
+                if not files:
+                    raise ValueError("所有文件均无法从存储读取")
+                await _run_transcription_task(task_id, user_id, files, meta)
+
+            _run_async(_load_and_run())
+            return {"status": "completed"}
+        except Exception as exc:
+            logger.error("[transcribe_upload] Failed: %s", exc)
+            # 兜底写 failed 终态：_load_and_run 的异常（如全部文件读取失败）
+            # 发生在 _run_transcription_task 之外，请求阶段写入的 pending 状态
+            # 无人改写，前端轮询会永远停在 pending（直到 TTL 过期）
+            try:
+                _run_async(_set_upload_cache(task_id, {
+                    "status": "failed",
+                    "error": "转录失败，请重试",
+                    "user_id": user_id,
+                }))
+            except Exception as cache_err:
+                logger.error("写入转录失败终态异常: %s", cache_err)
+            return {"error": str(exc)}
 else:
     generate_similar_questions = None
+    similar_replace = None
+    generate_ai_similar_questions = None
+    ai_similar_replace = None
+    transcribe_upload_files = None
 
 
 async def _do_generate_similar(question_id: int) -> dict:

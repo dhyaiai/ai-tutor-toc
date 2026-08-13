@@ -329,6 +329,17 @@ CORRECTION_SYSTEM_PROMPT = """你是资深的中高考作文阅卷专家，拥�
 """
 
 
+def _has_grading_core_fields(data: dict) -> bool:
+    """
+    批改结果核心字段校验：total_score 或 overall_comment 至少存在一个。
+
+    背景：思考型模型把 token 预算耗在推理上时可能返回空正文，`or "{}"`
+    会把空正文解析成空 dict 正常通过——用户看到"0 分、空评语"的假成功
+    批改结果，且不触发重试。这里在解析后做语义校验拦截。
+    """
+    return (data.get("total_score") is not None) or bool(data.get("overall_comment"))
+
+
 def _get_default_full_score(subject: str, essay_type: str | None = None, grade: str | None = None) -> int:
     """
     根据学科、作文类型和年级计算默认满分。
@@ -443,9 +454,17 @@ class CompositionService:
                 timeout=120,
             )
 
-            raw = response.choices[0].message.content or "{}"
+            raw = response.choices[0].message.content
+            if not raw or not raw.strip():
+                # 空正文（思考型模型 token 预算耗尽无输出）：必须按失败处理
+                # 触发重试，不能静默生成"0 分+空评语"的假成功批改结果
+                raise ValueError("LLM 返回空正文，按失败处理走重试")
             # 首次解析不用 fallback——解析失败说明 JSON 损坏严重，触发重试
             data = _safe_parse_json(raw)
+            if not _has_grading_core_fields(data):
+                # 解析成功但缺核心字段（total_score/overall_comment 全空）：
+                # 同样按失败处理，避免空结果落库
+                raise ValueError("批改结果缺少核心字段（total_score/overall_comment）")
             # 优先使用 LLM 从文件中识别到的分值，否则用默认分值
             recognized = data.get("recognized_full_score")
             if isinstance(recognized, (int, float)) and recognized > 0:
@@ -502,9 +521,15 @@ class CompositionService:
                 response_format={"type": "json_object"},
                 timeout=180,
             )
-            raw = response.choices[0].message.content or "{}"
+            raw = response.choices[0].message.content
+            if not raw or not raw.strip():
+                raise ValueError("LLM 返回空正文，重试仍无输出")
             # 重试时用 fallback——至少返回部分可用数据
             data = _safe_parse_json(raw, fallback={})
+            if not _has_grading_core_fields(data):
+                # 空/损坏结果一律视为重试失败（重试两次仍空 = 真失败，
+                # 由上层落库 failed 而非生成"0 分+空评语"的假成功）
+                raise ValueError("批改结果缺少核心字段（total_score/overall_comment）")
             # 优先使用 LLM 从文件中识别到的分值，否则用默认分值
             recognized = data.get("recognized_full_score")
             full_score = int(recognized) if isinstance(recognized, (int, float)) and recognized > 0 else default_full_score
@@ -606,9 +631,17 @@ class CompositionService:
                 timeout=180,
             )
 
-            raw = response.choices[0].message.content or "{}"
+            raw = response.choices[0].message.content
+            if not raw or not raw.strip():
+                # 空正文（思考型模型 token 预算耗尽无输出）：必须按失败处理
+                # 触发重试，不能静默生成"0 分+空评语"的假成功批改结果
+                raise ValueError("LLM 返回空正文，按失败处理走重试")
             # 首次解析不用 fallback——解析失败说明 JSON 损坏严重，触发重试
             data = _safe_parse_json(raw)
+            if not _has_grading_core_fields(data):
+                # 解析成功但缺核心字段（total_score/overall_comment 全空）：
+                # 同样按失败处理，避免空结果落库
+                raise ValueError("批改结果缺少核心字段（total_score/overall_comment）")
             # 优先使用 LLM 从文件中识别到的分值，否则用默认分值
             recognized = data.get("recognized_full_score")
             full_score = int(recognized) if isinstance(recognized, (int, float)) and recognized > 0 else default_full_score
@@ -670,9 +703,15 @@ class CompositionService:
                 response_format={"type": "json_object"},
                 timeout=240,
             )
-            raw = response.choices[0].message.content or "{}"
+            raw = response.choices[0].message.content
+            if not raw or not raw.strip():
+                raise ValueError("LLM 返回空正文，重试仍无输出")
             # 重试时用 fallback——至少返回部分可用数据
             data = _safe_parse_json(raw, fallback={})
+            if not _has_grading_core_fields(data):
+                # 空/损坏结果一律视为重试失败（重试两次仍空 = 真失败，
+                # 由上层落库 failed 而非生成"0 分+空评语"的假成功）
+                raise ValueError("批改结果缺少核心字段（total_score/overall_comment）")
             # 优先使用 LLM 从文件中识别到的分值，否则用默认分值
             recognized = data.get("recognized_full_score")
             full_score = int(recognized) if isinstance(recognized, (int, float)) and recognized > 0 else default_full_score

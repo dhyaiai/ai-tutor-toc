@@ -35,20 +35,19 @@ function setupCrossTabSync(): void {
       clearSession();
       return;
     }
-    const isTokenKey =
-      event.key === AUTH_KEYS.ACCESS_TOKEN || event.key === AUTH_KEYS.REFRESH_TOKEN;
-    if (!isTokenKey || !event.newValue) return;
-    // 其他标签页刷新成功：同步本地 session。
-    // 注意 refresh_token 单次使用（JTI 黑名单），必须与 access_token 一并同步，
-    // 否则本标签页下次刷新会用已被作废的旧 refresh_token 而被 401 踢下线。
-    // storage 事件在 localStorage 更新后才触发，此处读取到的都是最新值。
-    const accessToken = getAccessToken();
-    const refreshToken = getRefreshToken();
-    if (accessToken) {
-      setSession({
-        access_token: accessToken,
-        refresh_token: refreshToken ?? undefined,
-      });
+    // 其他标签页刷新成功：通过共享键推送了新 refresh_token。
+    // 必须用 event.newValue（另一标签页写入的值），不能用 getRefreshToken()——
+    // refresh_token 存 sessionStorage（每标签页隔离），本页读到的仍是旧值；
+    // 且 refresh_token 单次使用（JTI 黑名单），若不同步新 token，
+    // 本标签页下次刷新会用已作废的旧 token 被 401 强制登出。
+    if (event.key === AUTH_KEYS.SHARED_REFRESH_TOKEN && event.newValue) {
+      sessionStorage.setItem(AUTH_KEYS.REFRESH_TOKEN, event.newValue);
+      return;
+    }
+    // 其他标签页登出：清掉本页 refresh_token（ACCESS_TOKEN 的 storage 事件
+    // 会先触发 clearSession，此处兜底处理共享键单独被清除的场景）
+    if (event.key === AUTH_KEYS.SHARED_REFRESH_TOKEN && !event.newValue) {
+      sessionStorage.removeItem(AUTH_KEYS.REFRESH_TOKEN);
     }
   });
 }
@@ -100,6 +99,10 @@ export function refreshAccessTokenOnce(): Promise<string | null> {
 }
 
 async function _doRefresh(): Promise<string | null> {
+  // 记录刷新前的 access token：401 分支需要区分"跨标签页同步成功（token 变了）"
+  // 与"刷新真失败（token 未变）"——access_token 存 localStorage 永远有值，
+  // 仅凭非空会把本地已过期的旧 token 当刷新成功返回，导致假登录死循环
+  const beforeAccess = getAccessToken();
   try {
     const refreshToken = getRefreshToken();
     if (!refreshToken) return null;
@@ -114,10 +117,13 @@ async function _doRefresh(): Promise<string | null> {
         // 两个标签页同时刷新时只有第一个成功，第二个必然 401。
         // 短暂等待跨标签页同步：若另一 tab 刷新成功已推送新 token，直接用即可，
         // 不要因此把本 tab 强制登出（否则用户会被莫名踢下线）。
-        await waitForCrossTabSync();
-        const syncedAccess = getAccessToken();
-        if (syncedAccess) {
-          return syncedAccess;
+        const synced = await waitForCrossTabSync();
+        const afterAccess = getAccessToken();
+        // 必须同时满足"确实收到另一标签页的 storage 事件"且"token 真的变了"：
+        // 单标签页下 refresh token 真失效（过期/被撤销）时，等 1.5s 超时后
+        // token 未变化，此时应清会话跳登录，而不是把旧 token 当成功返回
+        if (synced && afterAccess && afterAccess !== beforeAccess) {
+          return afterAccess;
         }
         clearSession();
         const redirect = encodeURIComponent(window.location.pathname + window.location.search);

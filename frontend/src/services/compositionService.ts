@@ -109,10 +109,12 @@ export const compositionService = {
     return data;
   },
 
-  /** 获取历史批改列表 */
+  /** 获取历史批改列表（后端支持分页，total 为真实总数） */
   async list(params?: {
     subject?: string;
     grade?: string;
+    page?: number;
+    page_size?: number;
   }): Promise<{ items: CompositionListItem[]; total: number }> {
     const { data } = await api.get(BASE, { params: params || {} });
     return data;

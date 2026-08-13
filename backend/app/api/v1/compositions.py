@@ -18,7 +18,7 @@ import base64
 import os
 from io import BytesIO
 from typing import List as ListType
-from fastapi import APIRouter, Depends, HTTPException, File, Form, UploadFile
+from fastapi import APIRouter, Depends, HTTPException, File, Form, Query, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
@@ -337,21 +337,30 @@ async def correct_composition(
 async def list_compositions(
     subject: str | None = None,
     grade: str | None = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(12, ge=1, le=100),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """获取历史批改列表，支持按年级和科目筛选"""
+    """获取历史批改列表，支持按年级和科目筛选 + 分页。
+    原实现硬 limit(50) 且不接受分页参数，批改记录超过 50 条后旧记录永久不可见，
+    故改为 count + 分页查询，total 返回真实总数。"""
     conditions = [CompositionCorrection.user_id == current_user.id]
     if subject:
         conditions.append(CompositionCorrection.subject == subject)
     if grade:
         conditions.append(CompositionCorrection.grade == grade)
 
+    # 先 count 再分页查询（返回真实总数）
+    total = await db.scalar(
+        select(func.count()).select_from(CompositionCorrection).where(*conditions)
+    ) or 0
     result = await db.execute(
         select(CompositionCorrection)
         .where(*conditions)
         .order_by(CompositionCorrection.create_time.desc())
-        .limit(50)
+        .offset((page - 1) * page_size)
+        .limit(page_size)
     )
     records = result.scalars().all()
 
@@ -374,7 +383,9 @@ async def list_compositions(
             }
             for r in records
         ],
-        "total": len(records),
+        "total": total,
+        "page": page,
+        "page_size": page_size,
     }
 
 

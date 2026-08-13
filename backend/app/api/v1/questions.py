@@ -16,6 +16,13 @@ _similar_single_timestamps: dict[int, list[float]] = defaultdict(list)
 _SIMILAR_SINGLE_MAX_PER_HOUR = 30
 _SIMILAR_SINGLE_RATE_WINDOW = 3600
 
+# 生产模式并发占位锁 TTL（锁 key 为 "similar:{question_id}:lock"，与状态 key 分离，
+# 避免任务完成后状态仍保留、SET NX 永远失败导致 30 分钟内无法再次生成）：
+# 锁在任务启动时释放（redis_state_del），TTL 只兜底覆盖"投递→启动"的窗口，
+# 取任务软超时上限即可（锁 TTL 内任务未启动说明队列积压，应当拦截新任务）。
+_SIMILAR_LOCK_TTL = 900   # 批量生成任务软超时 900s
+_REPLACE_LOCK_TTL = 300   # 单题替换任务软超时 300s
+
 router = APIRouter(prefix="/questions", tags=["questions"])
 
 
@@ -139,12 +146,40 @@ from cachetools import TTLCache
 _similar_cache: TTLCache = TTLCache(maxsize=200, ttl=1800)
 
 
+async def _set_similar_cache(question_id: int, value: dict) -> None:
+    """写同类题生成任务状态：DEV 写进程内 TTLCache；生产写 Redis（跨 worker 共享）。
+
+    生产多 worker 部署时任务跑在 worker A、轮询打到 worker B，进程内缓存互相
+    不可见，必须持久化到 Redis（见 services/redis_state.py）。
+    """
+    from app.core.config import get_settings
+    _similar_cache[question_id] = value
+    if not get_settings().DEV_MODE:
+        from app.services.redis_state import redis_state_set
+        await redis_state_set(f"similar:{question_id}", value)
+
+
+async def _get_similar_cache(question_id: int) -> dict | None:
+    """读同类题生成任务状态（生产模式从 Redis 读，与 _set_similar_cache 对应）。"""
+    from app.core.config import get_settings
+    if get_settings().DEV_MODE:
+        return _similar_cache.get(question_id)
+    from app.services.redis_state import redis_state_get
+    return await redis_state_get(f"similar:{question_id}")
+
+
 async def _run_similar_generation(question_id: int):
     """后台执行同类题生成。
     普通题：生成 3 道（easy/medium/hard）逐题更新缓存。
     父题（大题）：只生成 1 道中等难度类似大题，节省 Token。
     """
     try:
+        # 任务启动即释放并发占位锁（锁只防"投递→启动"窗口的重复触发；
+        # 运行期间由 existing 状态的 pending/processing 拦截新任务）
+        from app.core.config import get_settings
+        if not get_settings().DEV_MODE:
+            from app.services.redis_state import redis_state_del
+            await redis_state_del(f"similar:{question_id}:lock")
         from sqlalchemy import select as _select
         from app.db.session import async_session_factory
         from app.services.similar_generator import SimilarGenerator
@@ -153,7 +188,7 @@ async def _run_similar_generation(question_id: int):
             _result = await _db.execute(_select(Question).where(Question.id == question_id))
             _question = _result.scalar_one_or_none()
             if not _question:
-                _similar_cache[question_id] = {"status": "failed", "error": "题目不存在"}
+                await _set_similar_cache(question_id, {"status": "failed", "error": "题目不存在"})
                 return
 
             generator = SimilarGenerator()
@@ -167,7 +202,7 @@ async def _run_similar_generation(question_id: int):
 
             if children:
                 # ── 大题：生成 1 道类似大题 ──
-                _similar_cache[question_id] = {"status": "processing", "result": None, "is_big_question": True}
+                await _set_similar_cache(question_id, {"status": "processing", "result": None, "is_big_question": True})
 
                 # 构建父题和子题信息字典
                 parent_info = {
@@ -194,15 +229,15 @@ async def _run_similar_generation(question_id: int):
                     )
                 except _asyncio.TimeoutError:
                     logger.error("Similar big question generation timeout for question %d", question_id)
-                    _similar_cache[question_id] = {"status": "failed", "error": "生成超时，请重试", "is_big_question": True}
+                    await _set_similar_cache(question_id, {"status": "failed", "error": "生成超时，请重试", "is_big_question": True})
                     return
                 except Exception as _exc:
                     logger.error("Similar big question generation failed for question %d: %s", question_id, _exc)
-                    _similar_cache[question_id] = {"status": "failed", "error": str(_exc), "is_big_question": True}
+                    await _set_similar_cache(question_id, {"status": "failed", "error": str(_exc), "is_big_question": True})
                     return
 
                 if not big_q:
-                    _similar_cache[question_id] = {"status": "failed", "error": "生成失败，请重试", "is_big_question": True}
+                    await _set_similar_cache(question_id, {"status": "failed", "error": "生成失败，请重试", "is_big_question": True})
                     return
 
                 result_data = {
@@ -223,7 +258,7 @@ async def _run_similar_generation(question_id: int):
                         for sq in big_q.sub_questions
                     ],
                 }
-                _similar_cache[question_id] = {"status": "completed", "result": result_data, "is_big_question": True}
+                await _set_similar_cache(question_id, {"status": "completed", "result": result_data, "is_big_question": True})
                 return
 
             # ── 普通题：逐题生成 3 道（easy/medium/hard）──
@@ -239,7 +274,7 @@ async def _run_similar_generation(question_id: int):
 
             # 逐题生成，每完成1题就更新缓存；单题超时 240s
             SINGLE_TIMEOUT = 240
-            _similar_cache[question_id] = {"status": "processing", "result": all_results, "is_big_question": False}
+            await _set_similar_cache(question_id, {"status": "processing", "result": all_results, "is_big_question": False})
             for diff in difficulties:
                 try:
                     sq = await _asyncio.wait_for(
@@ -286,11 +321,11 @@ async def _run_similar_generation(question_id: int):
                         "options": [],
                     })
                 # 每生成1题立即更新缓存，前端轮询即时获取
-                _similar_cache[question_id] = {"status": "processing", "result": list(all_results), "is_big_question": False}
+                await _set_similar_cache(question_id, {"status": "processing", "result": list(all_results), "is_big_question": False})
 
-        _similar_cache[question_id] = {"status": "completed", "result": all_results, "is_big_question": False}
+        await _set_similar_cache(question_id, {"status": "completed", "result": all_results, "is_big_question": False})
     except Exception as _exc:
-        _similar_cache[question_id] = {"status": "failed", "error": str(_exc)}
+        await _set_similar_cache(question_id, {"status": "failed", "error": str(_exc)})
 
 
 @router.post("/{question_id}/similar", status_code=status.HTTP_202_ACCEPTED)
@@ -315,15 +350,33 @@ async def generate_similar(
     if not a_result.scalar_one_or_none():
         raise HTTPException(status_code=403, detail="Access denied")
 
-    # 检查是否已有进行中的任务
-    existing = _similar_cache.get(question_id)
+    # 检查是否已有进行中的任务（生产模式并发防护：SET NX 原子占位，见下）
+    existing = await _get_similar_cache(question_id)
     if existing and existing["status"] in ("pending", "processing"):
         return {"status": existing["status"], "message": "已有同类题生成任务进行中"}
 
-    # 标记为 pending 并启动后台任务（用 dev_runner.run_async_in_background 防止 GC 回收）
-    _similar_cache[question_id] = {"status": "pending"}
-    from app.tasks.dev_runner import run_async_in_background
-    run_async_in_background(_run_similar_generation(question_id))
+    from app.core.config import get_settings
+    settings = get_settings()
+    if settings.DEV_MODE:
+        # 标记为 pending 并启动后台任务（用 dev_runner.run_async_in_background 防止 GC 回收）
+        await _set_similar_cache(question_id, {"status": "pending"})
+        from app.tasks.dev_runner import run_async_in_background
+        run_async_in_background(_run_similar_generation(question_id))
+    else:
+        # 生产模式：投递 Celery 由 worker 执行（任务内部把状态写 Redis，
+        # 多 worker 下轮询接口才能跨进程读到；见 _set_similar_cache）。
+        # SET NX 原子占位：并发请求同时通过上方 existing 检查存在竞态窗口，
+        # 靠 Redis 原子性兜底，防止同题重复触发双份 LLM 调用。
+        # 注意锁 key 与状态 key 分离（锁 = "similar:{id}:lock"，状态 = "similar:{id}"）：
+        # 若共用同一 key，任务完成后状态仍保留 completed（TTL 1800s），
+        # SET NX 永远失败 → 用户 30 分钟内无法再次生成。任务启动时会删锁。
+        from app.services.redis_state import redis_state_setnx
+        if not await redis_state_setnx(
+            f"similar:{question_id}:lock", {"status": "pending"}, ttl=_SIMILAR_LOCK_TTL
+        ):
+            return {"status": "pending", "message": "已有同类题生成任务进行中"}
+        from app.tasks.analysis_tasks import generate_similar_questions
+        generate_similar_questions.delay(question_id)
 
     return {"status": "pending", "message": "同类题生成任务已创建"}
 
@@ -341,6 +394,11 @@ async def _run_single_replace(question_id: int, index: int, difficulty: str):
     - 失败时不破坏已有结果，只把 replace.status 置为 failed 供前端提示
     """
     try:
+        # 任务启动即释放并发占位锁（与批量生成共用同一把锁；见 _SIMILAR_LOCK_TTL 注释）
+        from app.core.config import get_settings
+        if not get_settings().DEV_MODE:
+            from app.services.redis_state import redis_state_del
+            await redis_state_del(f"similar:{question_id}:lock")
         from sqlalchemy import select as _select
         from app.db.session import async_session_factory
         from app.services.similar_generator import SimilarGenerator
@@ -349,9 +407,10 @@ async def _run_single_replace(question_id: int, index: int, difficulty: str):
             _result = await _db.execute(_select(Question).where(Question.id == question_id))
             _question = _result.scalar_one_or_none()
             if not _question:
-                entry = _similar_cache.get(question_id)
+                entry = await _get_similar_cache(question_id)
                 if entry:
                     entry["replace"] = {"status": "failed", "error": "题目不存在", "index": index, "difficulty": difficulty}
+                    await _set_similar_cache(question_id, entry)
                 return
 
             children_result = await _db.execute(
@@ -361,9 +420,10 @@ async def _run_single_replace(question_id: int, index: int, difficulty: str):
             children = children_result.scalars().all()
 
             generator = SimilarGenerator()
-            entry = _similar_cache.get(question_id)
+            entry = await _get_similar_cache(question_id)
             if entry and entry.get("replace"):
                 entry["replace"]["status"] = "processing"
+                await _set_similar_cache(question_id, entry)
 
             if children:
                 # ── 大题：按指定难度生成 1 道类似大题，整体替换 ──
@@ -388,6 +448,7 @@ async def _run_single_replace(question_id: int, index: int, difficulty: str):
                 if entry:
                     if not big_q:
                         entry["replace"] = {"status": "failed", "error": "生成失败，请重试", "index": index, "difficulty": difficulty}
+                        await _set_similar_cache(question_id, entry)
                         return
                     result_data = {
                         "question_context": big_q.question_context,
@@ -413,6 +474,7 @@ async def _run_single_replace(question_id: int, index: int, difficulty: str):
                         "status": "completed", "question": result_data,
                         "index": index, "difficulty": difficulty, "error": None,
                     }
+                    await _set_similar_cache(question_id, entry)
                 return
 
             # ── 普通题：按指定难度生成 1 道，替换 index 位置 ──
@@ -443,6 +505,7 @@ async def _run_single_replace(question_id: int, index: int, difficulty: str):
             if entry:
                 if not sq:
                     entry["replace"] = {"status": "failed", "error": "生成失败，请重试", "index": index, "difficulty": difficulty}
+                    await _set_similar_cache(question_id, entry)
                     return
                 item = {
                     "question_text": sq.question_text,
@@ -467,11 +530,13 @@ async def _run_single_replace(question_id: int, index: int, difficulty: str):
                     "status": "completed", "question": item,
                     "index": index, "difficulty": difficulty, "error": None,
                 }
+                await _set_similar_cache(question_id, entry)
     except Exception as _exc:
         logger.error("Single replace failed for question %d: %s", question_id, _exc)
-        entry = _similar_cache.get(question_id)
+        entry = await _get_similar_cache(question_id)
         if entry:
             entry["replace"] = {"status": "failed", "error": str(_exc), "index": index, "difficulty": difficulty}
+            await _set_similar_cache(question_id, entry)
 
 
 @router.post("/{question_id}/similar-single", status_code=status.HTTP_202_ACCEPTED)
@@ -514,7 +579,7 @@ async def generate_similar_single(
 
     # 并发守卫：批量生成任务或换题任务进行中时拒绝，避免多个任务同时写缓存
     # 和并发调用 LLM（用户反复点击叠加请求会让模型更慢、更易超时）。
-    existing = _similar_cache.get(question_id)
+    existing = await _get_similar_cache(question_id)
     if existing:
         if existing["status"] in ("pending", "processing"):
             raise HTTPException(status_code=409, detail="同类题正在生成中，请稍候再试")
@@ -523,18 +588,34 @@ async def generate_similar_single(
             raise HTTPException(status_code=409, detail="换题正在生成中，请稍候再试")
     else:
         # 缓存缺失（TTL 过期）：重建占位缓存，保证 replace 任务有可写位置
-        _similar_cache[question_id] = {"status": "completed", "result": [], "is_big_question": False}
+        await _set_similar_cache(question_id, {"status": "completed", "result": [], "is_big_question": False})
 
     difficulty = data.difficulty if data.difficulty in ("easy", "medium", "hard") else "medium"
     index = data.index if data.index is not None else -1
-    entry = _similar_cache[question_id]
+    entry = await _get_similar_cache(question_id)
     entry["replace"] = {
         "status": "pending", "index": index, "difficulty": difficulty,
         "question": None, "error": None,
     }
-    # 用 run_async_in_background 持有任务引用，防止 create_task 裸任务被 GC 回收
-    from app.tasks.dev_runner import run_async_in_background
-    run_async_in_background(_run_single_replace(question_id, index, difficulty))
+    await _set_similar_cache(question_id, entry)
+
+    from app.core.config import get_settings
+    if get_settings().DEV_MODE:
+        # 用 run_async_in_background 持有任务引用，防止 create_task 裸任务被 GC 回收
+        from app.tasks.dev_runner import run_async_in_background
+        run_async_in_background(_run_single_replace(question_id, index, difficulty))
+    else:
+        # 生产模式：投递 Celery 由 worker 执行（状态写 Redis，见 _set_similar_cache）。
+        # SET NX 原子占位：堵住并发请求同时通过上方 existing 检查的竞态窗口
+        #（与批量生成共用同一把锁，任务启动时释放；锁 key 与状态 key 分离，
+        # 避免任务完成后 30 分钟内无法再次触发——见 generate_similar 注释）。
+        from app.services.redis_state import redis_state_setnx
+        if not await redis_state_setnx(
+            f"similar:{question_id}:lock", {"status": "pending"}, ttl=_REPLACE_LOCK_TTL
+        ):
+            raise HTTPException(status_code=409, detail="换题正在生成中，请稍候再试")
+        from app.tasks.analysis_tasks import similar_replace
+        similar_replace.delay(question_id, index, difficulty)
 
     return {"status": "processing", "message": "换题任务已创建"}
 
@@ -561,7 +642,7 @@ async def get_similar_result(
     if not a_result.scalar_one_or_none():
         raise HTTPException(status_code=403, detail="Access denied")
 
-    cached = _similar_cache.get(question_id)
+    cached = await _get_similar_cache(question_id)
     if not cached:
         return {"status": "not_found"}
 
