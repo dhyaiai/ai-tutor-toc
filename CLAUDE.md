@@ -120,7 +120,6 @@ backend/app/
 │   ├── file_upload.py          # MinIO/本地文件操作
 │   ├── file_server.py          # 本地静态文件服务（仅 DEV：路径穿越防护 + 私有目录鉴权）
 │   ├── redis_state.py          # 生产模式任务状态 Redis 存储（跨 worker 共享）
-│   ├── question_pipeline/      # LangGraph 智能出题流水线（search→calibrate→transform→verify 回流重试）
 │   └── agent/                  # AI Agent (关键词路由 + ReAct)
 │       ├── agent_executor.py   # ReAct 循环：LLM 思考 → 工具调用 → 结果返回 → 最终回答
 │       ├── tools.py            # 11 个工具（@tool 装饰器自动注册，见下方清单）
@@ -166,10 +165,6 @@ backend/app/
 1. `POST /api/v1/compositions` 建记录（status=pending）→ 触发 Celery/dev 后台任务批改
 2. `composition_service` 按中高考官方标准评分（语文 60 分定档、英语五档制），字数后端硬统计，仅档外硬扣分记入 deductions
 3. 前端轮询状态（pending→correcting→completed/failed），完成后可下载 PDF 报告
-
-**AI 生成题流水线（question_pipeline）：**
-- LangGraph StateGraph：`search`(联网检索, 未配 SEARCH_API_KEY 自动跳过) → `calibrate`(定难度) → `transform`(变式生成) → `verify`(校验, 不过则带 issues 回流 transform 重改，最多 max_attempts 轮)
-- 用于 AI 挑战出题、上传题转录后生成等场景
 
 **静态文件服务（仅 DEV 模式）：**
 - `GET /api/v1/files/{file_path}` → `services/file_server.py` 从 `LOCAL_STORAGE_DIR` 读取

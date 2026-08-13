@@ -110,13 +110,6 @@ class Settings(BaseSettings):
     # 意图分类时携带的最近历史对话轮数（识别"那英语的呢"等跨轮追问）；0 表示不带历史
     ROUTER_CLASSIFY_HISTORY_TURNS: int = 4
 
-    # ---- 联网搜索（question_pipeline 的 search 节点）----
-    # 未配置时 search 节点自动跳过，不影响出题流水线。
-    # SEARCH_ENGINE: 搜索引擎类型（bing/tavily/百度/博查等，接入时在 search_node 适配返回结构）
-    SEARCH_API_KEY: str = ""
-    SEARCH_BASE_URL: str = ""
-    SEARCH_ENGINE: str = "bing"
-
     # 讯飞语音评测（流式版 ISE，普通话测评用）
     XFYUN_APP_ID: str = ""
     XFYUN_API_KEY: str = ""

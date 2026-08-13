@@ -25,11 +25,6 @@ minio==7.2.10
 # AI / LLM（对齐实际运行环境；视觉模型客户端依赖 2.x API）
 openai==2.53.0
 
-# LangChain 生态（仅智能出题工作流 question_pipeline 使用，与手写 ReAct Agent 并存）
-langchain-core==1.4.9
-langchain-openai==1.3.4
-langgraph==1.2.7
-
 # Image processing（image_preprocess.py 模块级导入 cv2/numpy，切图/分析流程必需）
 opencv-python-headless==4.11.0.86  # 对齐实际运行环境；注意 4.10.x 无 Python 3.14 wheel
 Pillow==11.0.0

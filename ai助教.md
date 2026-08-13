@@ -7,7 +7,6 @@
 | 前端     | React 18 + TypeScript + Vite + Ant Design 5 + TanStack Query + @ant-design/charts |
 | 后端     | FastAPI (异步) + SQLAlchemy 2.0 + aiomysql                    |
 | AI Agent | 大模型工具调用 Agent（关键词路由 → ReAct 循环，11 个工具）    |
-| 出题流水线 | LangGraph StateGraph（search → calibrate → transform → verify 回流重试） |
 | 认证     | JWT (python-jose) + bcrypt + 单设备登录 (token_version)       |
 | 数据库   | MySQL 8.0（唯一数据库，无向量库）                             |
 | 异步任务 | DEV 模式：进程内同步执行（dev_runner）；生产：Celery + Redis（任务状态存 Redis） |
@@ -102,9 +101,6 @@ ai-tutor/
 │   │   │   ├── file_upload.py / file_server.py  # MinIO/本地存储与静态服务
 │   │   │   ├── redis_state.py          # 生产模式任务状态 Redis 存储
 │   │   │   ├── prompt_rules.py / remark_parser.py
-│   │   │   ├── question_pipeline/      # LangGraph 智能出题流水线
-│   │   │   │   ├── graph.py            # StateGraph 组装（search→calibrate→transform→verify）
-│   │   │   │   ├── client.py  schemas.py  state.py  nodes/{search,calibrate,transform,verify}_node.py
 │   │   │   └── agent/                  # AI Agent（工具路由 + ReAct）
 │   │   │       ├── agent_executor.py   # ReAct 循环（LLM 思考→工具→结果→最终回答）
 │   │   │       ├── tools.py            # 11 个工具（@tool 装饰器自动注册）
@@ -209,25 +205,21 @@ ai-tutor/
 5. `analysis_tasks._do_analyze` 逐题调用视觉大模型评分、识别答案、提取知识点、生成常见错误；大题先识别父题类型再拆子题；分析结果写回 `assignment_questions`，作业状态 `completed`。
 6. 可靠性：启动时 `reconcile_all_stuck_assignments` 自愈卡在 grading 的作业；生产模式任务状态存 Redis（redis_state.py）供多 worker 轮询。
 
-### 5.3 智能出题流水线（question_pipeline）
-- LangGraph StateGraph 线性流水线：`search`(联网检索, 可选) → `calibrate`(定难度) → `transform`(变式生成) → `verify`(校验)；校验不过时带 issues 回流 transform 重改（最多 max_attempts 轮），整体超时 180s。
-- 服务 AI 挑战同类题生成、上传题转录质量校验等场景。
-
-### 5.4 作文批改
+### 5.3 作文批改
 - 文本模式（直接传作文）/ 多模态模式（图片 base64 → 视觉 LLM 先识别再批改）。
 - 评分严格按中高考官方标准（先定档再给分）；仅"档外硬扣分"（字数不足/缺标题/错别字/卷面）记入 deductions；字数由后端硬统计（排除标点）。
 - 批改异步化：API 建记录（status=pending）→ Celery/dev 后台任务批改 → 完成后可下载 PDF 报告。
 
-### 5.5 口语测评
+### 5.4 口语测评
 - 英语听力训练：LLM 生成题目（短对话/长对话/短文理解/听写填空）+ 批改。
 - 单词听写：按词库范围生成任务，图片批改用视觉模型，语音播报浏览器 TTS。
 - 普通话测评：朗读模式走讯飞 ISE 流式语音评测（wss），其余 LLM 驱动，得分映射普通话等级。
 - 所有记录统一写入 oral_records，题型/难度/方向冗余为独立列支持 SQL 筛选（旧数据启动时从 detail JSON 回填）。
 
-### 5.6 知识状态追踪
+### 5.5 知识状态追踪
 - 批改完成、讲解反馈、作文批改、口语测评后自动更新 `user_knowledge_state`（mastery_score/level、正误次数），Agent 可查询/更新，跨会话持久化。
 
-### 5.7 用户体系与安全
+### 5.6 用户体系与安全
 - 注册功能已移除，开户走管理员 `POST /users`；空库启动时自动引导创建初始管理员（FIRST_ADMIN_PHONE/PASSWORD，dev 随机密码打印控制台）。
 - 单设备登录：token_version 校验，新登录踢掉旧设备（前端 401 后提示重新登录）。
 - 静态文件服务（DEV 模式）：`/api/v1/files/{path}` 含路径穿越防护 + 私有目录鉴权（reports/oral_audio）+ 容错模糊匹配。
@@ -279,10 +271,6 @@ SINGLE_DEVICE_LOGIN=true
 AGENT_TIME_BUDGET=240
 TOOL_EXEC_TIMEOUT=60
 ROUTE_ENABLED=true
-# 联网搜索（question_pipeline search 节点，未配置则跳过）
-SEARCH_API_KEY=
-SEARCH_BASE_URL=
-SEARCH_ENGINE=bing
 # 讯飞语音评测（普通话朗读）
 XFYUN_APP_ID=
 XFYUN_API_KEY=
