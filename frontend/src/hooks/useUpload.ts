@@ -26,23 +26,24 @@ export function useUpload() {
     filePathsRef.current = [];
     const paths: string[] = [];
 
-    for (let i = 0; i < files.length; i++) {
-      try {
+    try {
+      for (let i = 0; i < files.length; i++) {
         const result = await assignmentService.uploadFile(files[i], (pct) => {
           // 每个文件占 1/N 的进度，当前文件内部的 pct 按比例折算
           const overall = Math.round(((i + pct / 100) / files.length) * 100);
           setProgress(overall);
         });
         paths.push(result.file_path);
-      } catch (err) {
-        throw err; // 单个文件失败即终止
       }
-    }
 
-    filePathsRef.current = paths;
-    setProgress(100);
-    setUploading(false);
-    return paths;
+      filePathsRef.current = paths;
+      setProgress(100);
+      return paths;
+    } finally {
+      // 无论成功失败都复位上传状态：失败时页面可提示并重试，
+      // 而不是卡在全屏 loading（原实现 throw 会跳过 setUploading(false)）
+      setUploading(false);
+    }
   };
 
   /**
@@ -53,13 +54,23 @@ export function useUpload() {
     if (filePathsRef.current.length === 0) {
       throw new Error("文件尚未上传完成");
     }
-    const payload: Record<string, unknown> = { ...params };
+    // 构造符合 assignmentService.upload 参数类型的 payload
+    const payload: {
+      name: string;
+      grade: string;
+      subject: string;
+      semester: string;
+      usage_month: string;
+      layout_type?: string;
+      file_path?: string;
+      file_paths?: string[];
+    } = { ...params };
     if (filePathsRef.current.length > 1) {
       payload.file_paths = filePathsRef.current;
     } else {
       payload.file_path = filePathsRef.current[0];
     }
-    return await assignmentService.upload(payload as any);
+    return await assignmentService.upload(payload);
   };
 
   const reset = () => {

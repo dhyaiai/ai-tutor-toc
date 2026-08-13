@@ -1,7 +1,7 @@
 import { useState } from "react";
-import { useParams, useNavigate } from "react-router-dom";
-import { Card, Typography, Descriptions, Tag, Space, Button, Spin, Alert, message } from "antd";
-import { ArrowLeftOutlined, PlayCircleOutlined, ScissorOutlined, EyeOutlined, UploadOutlined, ReloadOutlined } from "@ant-design/icons";
+import { useParams, useNavigate, useLocation } from "react-router-dom";
+import { Card, Typography, Descriptions, Tag, Space, Button, Spin, Alert, message, FloatButton } from "antd";
+import { ArrowLeftOutlined, PlayCircleOutlined, ScissorOutlined, EyeOutlined, UploadOutlined, ReloadOutlined, VerticalAlignTopOutlined } from "@ant-design/icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { assignmentService } from "../../../services/assignmentService";
 import { ASSIGNMENT_STATUS_MAP } from "../../../utils/constants";
@@ -16,6 +16,7 @@ const ACTIVE_STATES = new Set(["splitting", "splitted", "grading", "processing"]
 export default function AssignmentDetail() {
   const { id } = useParams<{ id: string }>();
   const navigate = useNavigate();
+  const location = useLocation();
   const queryClient = useQueryClient();
   const [analyzing, setAnalyzing] = useState(false);
   const [reSummarizing, setReSummarizing] = useState(false);
@@ -23,7 +24,8 @@ export default function AssignmentDetail() {
   const [answerSplitVisible, setAnswerSplitVisible] = useState(false);
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ["assignment", id],
+    // key 统一用数字（useParams 返回字符串），与 useReanalysis 等处的 invalidate key 匹配
+    queryKey: ["assignment", Number(id)],
     queryFn: () => assignmentService.getDetail(Number(id)),
     // 分析进行中时定期轮询刷新状态
     refetchInterval: (query) => {
@@ -39,7 +41,7 @@ export default function AssignmentDetail() {
     try {
       await assignmentService.analyze(Number(id));
       message.success("分析已开始，请稍候...");
-      queryClient.invalidateQueries({ queryKey: ["assignment", id] });
+      queryClient.invalidateQueries({ queryKey: ["assignment", Number(id)] });
     } catch (err) {
       console.error("启动分析失败:", err);
       message.error("启动分析失败");
@@ -55,7 +57,7 @@ export default function AssignmentDetail() {
     try {
       await assignmentService.reSummarize(Number(id));
       message.success("整卷分析已更新");
-      queryClient.invalidateQueries({ queryKey: ["assignment", id] });
+      queryClient.invalidateQueries({ queryKey: ["assignment", Number(id)] });
     } catch (err) {
       console.error("重新汇总失败:", err);
       message.error("重新汇总失败");
@@ -80,7 +82,8 @@ export default function AssignmentDetail() {
       <Button
         icon={<ArrowLeftOutlined />}
         style={{ marginBottom: 16 }}
-        onClick={() => navigate("/assignments/records")}
+        // 带上进入详情时的 query（筛选/页码），返回记录页时筛选状态保留
+        onClick={() => navigate("/assignments/records" + location.search)}
       >
         返回记录
       </Button>
@@ -201,6 +204,7 @@ export default function AssignmentDetail() {
                 question={q}
                 assignmentId={Number(id)}
                 assignmentStatus={data.status}
+                subject={data.subject}
               />
             ))}
           </Space>
@@ -214,7 +218,7 @@ export default function AssignmentDetail() {
         prefillRegion={null}
         onSuccess={() => {
           setManualSplitVisible(false);
-          queryClient.invalidateQueries({ queryKey: ["assignment", id] });
+          queryClient.invalidateQueries({ queryKey: ["assignment", Number(id)] });
         }}
         onCancel={() => setManualSplitVisible(false)}
       />
@@ -229,9 +233,18 @@ export default function AssignmentDetail() {
         visible={answerSplitVisible}
         onSuccess={() => {
           setAnswerSplitVisible(false);
-          queryClient.invalidateQueries({ queryKey: ["assignment", id] });
+          queryClient.invalidateQueries({ queryKey: ["assignment", Number(id)] });
         }}
         onCancel={() => setAnswerSplitVisible(false)}
+      />
+
+      {/* 回到顶部悬浮按钮：fixed 定位在右下角，位于全局 AI 助手按钮（bottom: 24）上方
+          visibilityHeight=200：页面滚动超过 200px 才显示，避免无意义闪烁 */}
+      <FloatButton.BackTop
+        icon={<VerticalAlignTopOutlined />}
+        visibilityHeight={200}
+        tooltip="回到顶部"
+        style={{ right: 24, bottom: 88 }}
       />
 
     </div>

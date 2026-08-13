@@ -1,5 +1,8 @@
 /**
- * 答案切割弹窗 —— 上传学生答案图片，框选每道题的答案区域。
+ * 答案切割弹窗 —— 上传标准答案（答案解析）文件，框选每道题的标准答案区域。
+ *
+ * 切出的标准答案会在 AI 评分时拼接在题目图下方（标注为 Reference Answer），
+ * 作为 correct_answer 的权威依据，不会被当作学生作答。
  *
  * 与 ManualSplitModal 类似，但：
  * 1. 初始步骤需要先上传答案文件
@@ -15,6 +18,7 @@ import {
   PageInfo,
 } from '../services/assignmentService';
 import type { QuestionItem } from '../services/assignmentService';
+import { rotateImageDataUrl } from '../utils/imageUtils';
 
 const { Dragger } = Upload;
 
@@ -155,33 +159,7 @@ const AnswerSplitModal: React.FC<AnswerSplitModalProps> = ({
     }
   }, [visible]);
 
-  // ── 旋转图片生成 ──
-  const rotateImageDataUrl = useCallback(
-    (imageUrl: string, rotation: number): Promise<string> => {
-      return new Promise((resolve, reject) => {
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = () => {
-          const canvas = document.createElement('canvas');
-          const ctx = canvas.getContext('2d')!;
-          if (rotation === 90 || rotation === 270) {
-            canvas.width = img.naturalHeight;
-            canvas.height = img.naturalWidth;
-          } else {
-            canvas.width = img.naturalWidth;
-            canvas.height = img.naturalHeight;
-          }
-          ctx.translate(canvas.width / 2, canvas.height / 2);
-          ctx.rotate((rotation * Math.PI) / 180);
-          ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
-          resolve(canvas.toDataURL('image/png'));
-        };
-        img.onerror = () => reject(new Error('图片加载失败'));
-        img.src = imageUrl;
-      });
-    },
-    [],
-  );
+  // ── 旋转图片生成（共用实现见 utils/imageUtils.ts） ──
 
   useEffect(() => {
     if (!page) {
@@ -265,16 +243,19 @@ const AnswerSplitModal: React.FC<AnswerSplitModalProps> = ({
       }
     });
 
+    // 拖拽预览（drawing 存的是原图坐标，绘制时需换算回画布坐标）
     if (drawing) {
-      const sx = Math.min(drawing.startX, drawing.endX);
-      const sy = Math.min(drawing.startY, drawing.endY);
-      const sw = Math.abs(drawing.endX - drawing.startX);
-      const sh = Math.abs(drawing.endY - drawing.startY);
+      const sx = Math.min(drawing.startX, drawing.endX) * scaleX;
+      const sy = Math.min(drawing.startY, drawing.endY) * scaleY;
+      const sw = Math.abs(drawing.endX - drawing.startX) * scaleX;
+      const sh = Math.abs(drawing.endY - drawing.startY) * scaleY;
       ctx.strokeStyle = '#52C41A';
       ctx.lineWidth = 2;
       ctx.setLineDash([6, 3]);
       ctx.strokeRect(sx, sy, sw, sh);
       ctx.setLineDash([]);
+      ctx.fillStyle = '#52C41A15';
+      ctx.fillRect(sx, sy, sw, sh);
     }
   }, [regions, selectedId, drawing, currentPage, page, displaySize]);
 
@@ -452,8 +433,15 @@ const AnswerSplitModal: React.FC<AnswerSplitModalProps> = ({
         questionNum = pendingQuestionNum;
         setPendingQuestionNum(null);
       } else {
-        // 答案切割：默认使用第一个可用题号
-        questionNum = questions.length > 0 ? questions[0].question_number : 1;
+        // 答案切割：默认自动递增——取尚未分配区域的最小题号；全部分配完则回退到最后一题
+        const sortedQs = [...questions].sort((a, b) => a.question_number - b.question_number);
+        const usedNums = new Set(regions.map((r) => r.question_number));
+        const nextQ = sortedQs.find((q) => !usedNums.has(q.question_number));
+        questionNum = nextQ
+          ? nextQ.question_number
+          : sortedQs.length > 0
+            ? sortedQs[sortedQs.length - 1].question_number
+            : 1;
       }
       drawOrderRef.current += 1;
       const newRegion: DrawnRegion = {
@@ -521,16 +509,7 @@ const AnswerSplitModal: React.FC<AnswerSplitModalProps> = ({
   );
 
   // ── Submit ──
-  const handleSubmit = async () => {
-    if (regions.length === 0) {
-      message.warning('请至少绘制一个答案区域');
-      return;
-    }
-    if (!answerFileUrl) {
-      message.error('缺少答案文件路径，请重新上传');
-      return;
-    }
-
+  const doSubmit = async () => {
     const sorted = [...regions].sort(
       (a, b) => a.question_number - b.question_number || a.draw_order - b.draw_order,
     );
@@ -555,6 +534,42 @@ const AnswerSplitModal: React.FC<AnswerSplitModalProps> = ({
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const handleSubmit = () => {
+    if (regions.length === 0) {
+      message.warning('请至少绘制一个答案区域');
+      return;
+    }
+    if (!answerFileUrl) {
+      message.error('缺少答案文件路径，请重新上传');
+      return;
+    }
+
+    // 校验切割数量：已框选的题号数少于题目列表题数时提醒用户
+    const coveredNums = new Set(regions.map((r) => r.question_number));
+    const missingNums = questions
+      .map((q) => q.question_number)
+      .filter((n) => !coveredNums.has(n))
+      .sort((a, b) => a - b);
+    if (missingNums.length > 0) {
+      Modal.confirm({
+        title: '切割数量与题目数量不一致',
+        content: (
+          <div>
+            <p>题目列表共 {questions.length} 题，当前仅切割了 {coveredNums.size} 题。</p>
+            <p>未切割的题号：{missingNums.map((n) => `第${n}题`).join('、')}</p>
+            <p>是否仍要提交？未切割的题目将没有标准答案。</p>
+          </div>
+        ),
+        okText: '仍然提交',
+        cancelText: '返回补充',
+        onOk: doSubmit,
+      });
+      return;
+    }
+
+    doSubmit();
   };
 
   // ── 可选题号列表 ──
@@ -597,7 +612,7 @@ const AnswerSplitModal: React.FC<AnswerSplitModalProps> = ({
               <InboxOutlined />
             </p>
             <p className="ant-upload-text">
-              {uploading ? '正在上传并处理...' : '点击或拖拽上传学生答案文件'}
+              {uploading ? '正在上传并处理...' : '点击或拖拽上传标准答案（答案解析）文件'}
             </p>
             <p className="ant-upload-hint">
               支持 PDF、PNG、JPG、WebP 格式，最大 50MB

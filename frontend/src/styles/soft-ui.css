@@ -1,0 +1,1110 @@
+/**
+ * ============================================================================
+ * Soft-UI 全局样式（纯 CSS 重构，不修改任何组件结构 / 业务逻辑）
+ * ============================================================================
+ *
+ * 设计语言：K12 教育 B 端 · Soft-UI 柔和 B 端 · 【局部毛玻璃方案】
+ *
+ * 规则（与 taste-skill 旋钮对应：布局实验度 0.2 / 动效强度 0.1 / 信息密度 0.6）：
+ *   1. 顶部导航栏：浅色毛玻璃（半透明白 + backdrop-filter: blur），与页面浅色基调一致
+ *   2. 上传卡片 / 表单 / 记录卡片：纯白底 + 柔和浅阴影 + 圆角 14px，
+ *      禁止大面积毛玻璃，保证文字阅读清晰度
+ *   3. 弹窗 / 下拉菜单 / 右下角悬浮聊天按钮：毛玻璃
+ *   4. 页面背景极淡 #f7f8fa，无图片、无夸张渐变
+ *   5. 主交互色为深蓝色；主按钮实色填充，次要按钮文字样式；输入框 focus 高亮
+ *   6. hover 克制：卡片轻微上浮，无循环动画
+ *
+ * 实现说明：
+ * - 项目为 antd v5（CSS-in-JS）+ 大量内联样式，本文件通过选择器 + !important
+ *   以"样式表覆盖"方式完成换肤，不改动任何 TSX 结构。
+ * - 毛玻璃为 web 端 backdrop-filter 近似实现（非 Apple Liquid Glass 官方方案）。
+ * - 覆盖所有 antd 全局弹层组件（Modal / Message / Dropdown / Select 下拉 /
+ *   Popconfirm），样式一致；聊天抽屉通过宽度特征（480px）精准定位，避免
+ *   误伤作文详情抽屉（1000px，阅读场景保持纯白底）。
+ * ============================================================================
+ */
+
+/* ==========================================================================
+   1. 设计令牌（Design Tokens）
+   --------------------------------------------------------------------------
+   单一深蓝主色，锁定全页；语义状态色（绿/琥珀/红）沿用 antd 默认值不替换。
+   ========================================================================== */
+:root {
+  /* 主交互色：深蓝（对比度 6.2:1，AA 达标） */
+  --soft-primary: #1a56db;
+  --soft-primary-hover: #1547b8;
+  --soft-primary-active: #103a99;
+  /* focus 高亮光环（4px 半透明深蓝） */
+  --soft-focus-ring: rgba(26, 86, 219, 0.16);
+  /* 页面背景：极淡浅灰 */
+  --soft-page-bg: #f7f8fa;
+  /* 卡片纯白底 */
+  --soft-surface: #ffffff;
+  /* 柔和浅阴影（带蓝色调，不纯黑） */
+  --soft-shadow: 0 1px 2px rgba(23, 43, 77, 0.04), 0 10px 28px rgba(23, 43, 77, 0.07);
+  --soft-shadow-hover: 0 2px 4px rgba(23, 43, 77, 0.05), 0 16px 40px rgba(23, 43, 77, 0.11);
+  /* 描边 / 分割线 */
+  --soft-border: #e9edf4;
+  /* 文字：主 / 次 / 弱（次级文字 5.8:1，占位符 4.6:1，均达 AA） */
+  --soft-text-primary: #1f2733;
+  --soft-text-secondary: #5a6370;
+  --soft-text-placeholder: #6f7480;
+  /* 顶部导航深蓝（毛玻璃底色的不透明基色） */
+  --soft-header-base: #0d1c42;
+  /* 圆角规则：卡片 14px / 弹层 16px / 小控件沿用 antd 8px */
+  --soft-radius-card: 14px;
+  --soft-radius-overlay: 16px;
+}
+
+/* ==========================================================================
+   2. 页面基底
+   --------------------------------------------------------------------------
+   背景 #f7f8fa，替代 antd 默认白 / 原 #f5f5f5；无图片、无渐变。
+   ========================================================================== */
+body,
+.ant-layout {
+  background-color: var(--soft-page-bg);
+}
+
+/* 内容区（AppLayout 内联了 #f5f5f5，此处统一） */
+.ant-layout-content {
+  background-color: var(--soft-page-bg) !important;
+}
+
+/* 全局文字主色，避免组件默认黑过度刺眼 */
+body {
+  color: var(--soft-text-primary);
+}
+
+/* 次级文字（antd type="secondary"）加深至 AA 达标；不作用于导航栏内的白色文字 */
+.ant-typography.ant-typography-secondary {
+  color: var(--soft-text-secondary) !important;
+}
+
+/* ==========================================================================
+   3. 顶部导航栏：浅色毛玻璃
+   --------------------------------------------------------------------------
+   - position: sticky 使内容滚动穿过导航下方，"磨砂"效果才可见
+   - 半透明白底（0.8）+ 16px 模糊：透出页面浅灰底与滚动内容，呈现玻璃
+     磨砂质感，与页面浅色调、白色卡片语言一致（不采用深色导航，避免
+     与浅色 Soft-UI 风格割裂）
+   - 底部淡灰发丝线 + 顶部内高光，模拟玻璃边缘折射
+   ========================================================================== */
+.ant-layout-header {
+  position: sticky !important;
+  top: 0;
+  z-index: 100;
+  background: rgba(255, 255, 255, 0.8) !important;
+  backdrop-filter: blur(16px) saturate(150%);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  border-bottom: 1px solid rgba(23, 43, 77, 0.08);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
+}
+
+/* 导航内文字按钮 hover：浅色玻璃上的主色浅染，与全站 hover 风格一致
+   （同侧边栏菜单、下拉菜单项 hover，替代 antd 默认灰底） */
+.ant-layout-header .ant-btn-text:not(.ant-btn-primary):hover {
+  background: rgba(26, 86, 219, 0.06) !important;
+}
+
+/* ==========================================================================
+   4. 卡片（上传 Hero / 记录卡片 / 详情内容卡）
+   --------------------------------------------------------------------------
+   纯白底 + 柔和浅阴影 + 圆角 14px。hover 仅轻微上浮 3px（hoverable 卡片），
+   无循环动画。阴影带蓝色调，与背景同色系。
+   ========================================================================== */
+.ant-card {
+  background: var(--soft-surface) !important;
+  border-color: var(--soft-border) !important;
+  border-radius: var(--soft-radius-card) !important;
+  box-shadow: var(--soft-shadow) !important;
+  transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+
+/* hover 克制：轻微上浮，阴影略加深 */
+.ant-card.ant-card-hoverable:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--soft-shadow-hover) !important;
+}
+
+/* ==========================================================================
+   5. 上传拖拽区
+   --------------------------------------------------------------------------
+   浅灰底 + 虚线描边（soft），hover / 拖入时描边与底色变为深蓝浅染。
+   ========================================================================== */
+.ant-upload-drag {
+  background: #fbfcfe !important;
+  border-color: #d4dbe8 !important;
+  border-radius: 12px !important;
+  transition: border-color 0.2s ease, background-color 0.2s ease;
+}
+
+.ant-upload-drag:hover,
+.ant-upload-drag.ant-upload-drag-hover {
+  border-color: var(--soft-primary) !important;
+  background: rgba(26, 86, 219, 0.03) !important;
+}
+
+/* 上传区主图标跟随主色 */
+.ant-upload-drag .anticon-inbox {
+  color: var(--soft-primary) !important;
+}
+
+/* ==========================================================================
+   6. 表单控件：输入框 / 下拉选择
+   --------------------------------------------------------------------------
+   白底 + 浅描边；hover 描边转主色，focus 深蓝描边 + 4px 半透明光环。
+   占位符加深至 AA（4.6:1）。
+   ========================================================================== */
+.ant-input {
+  background: var(--soft-surface) !important;
+}
+
+.ant-input:hover {
+  border-color: var(--soft-primary) !important;
+}
+
+.ant-input:focus,
+.ant-input-focused {
+  border-color: var(--soft-primary) !important;
+  box-shadow: 0 0 0 3px var(--soft-focus-ring) !important;
+}
+
+.ant-input::placeholder {
+  color: var(--soft-text-placeholder) !important;
+}
+
+/* Select 选择器（含 hover / focus / 打开态） */
+.ant-select:not(.ant-select-disabled):hover .ant-select-selector {
+  border-color: var(--soft-primary) !important;
+}
+
+.ant-select-focused .ant-select-selector,
+.ant-select-open .ant-select-selector {
+  border-color: var(--soft-primary) !important;
+  box-shadow: 0 0 0 3px var(--soft-focus-ring) !important;
+}
+
+/* 占位符（单选中未选时显示，层级在 selector 内部） */
+.ant-select .ant-select-selection-placeholder {
+  color: var(--soft-text-placeholder) !important;
+}
+
+/* 表单标签 / 错误提示沿用 antd 语义色（红色错误必须醒目，不替换） */
+
+/* ==========================================================================
+   7. 按钮
+   --------------------------------------------------------------------------
+   主按钮：深蓝实色填充 + 微投影（实色填充，可读性优先）。
+   次按钮（default / text / link）：文字样式，仅 hover 变色，无实底喧宾夺主。
+   danger 语义按钮（红）保留 antd 默认，不覆盖。
+   ========================================================================== */
+.ant-btn-primary {
+  background: var(--soft-primary) !important;
+  border-color: var(--soft-primary) !important;
+  box-shadow: 0 2px 10px rgba(26, 86, 219, 0.22) !important;
+}
+
+.ant-btn-primary:hover:not(:disabled) {
+  background: var(--soft-primary-hover) !important;
+  border-color: var(--soft-primary-hover) !important;
+}
+
+.ant-btn-primary:active:not(:disabled) {
+  background: var(--soft-primary-active) !important;
+  border-color: var(--soft-primary-active) !important;
+}
+
+/* 禁用态：恢复 antd 惯例的灰底灰字。
+   不加这条时，上方深蓝实底 !important 仍会命中 disabled 按钮，
+   导致"深蓝底 + antd 浅灰文字"，字几乎看不清（如作文页的"开始批改"）。 */
+.ant-btn-primary:disabled,
+.ant-btn-primary[disabled] {
+  background: #f0f2f5 !important;
+  border-color: #d9d9d9 !important;
+  color: rgba(0, 0, 0, 0.25) !important;
+  box-shadow: none !important;
+}
+
+/* 文字链接按钮：跟随主色（danger 链接保持红色语义） */
+.ant-btn-link:not(.ant-btn-dangerous) {
+  color: var(--soft-primary) !important;
+}
+
+.ant-btn-link:not(.ant-btn-dangerous):hover {
+  color: var(--soft-primary-hover) !important;
+}
+
+/* 次要按钮（default）hover 描边跟随主色，保持"文字样式"克制的底色变化 */
+.ant-btn-default:not(:disabled):hover {
+  border-color: var(--soft-primary) !important;
+  color: var(--soft-primary) !important;
+}
+
+/* ==========================================================================
+   8. 标签页 / 分页 / 进度 / 加载 / 标签
+   --------------------------------------------------------------------------
+   全部主色化，保证页面内"一个强调色"贯穿到底。
+   ========================================================================== */
+/* Tabs：激活标签文字 + 底部指示条 */
+.ant-tabs .ant-tabs-tab:hover {
+  color: var(--soft-primary) !important;
+}
+
+.ant-tabs .ant-tabs-tab-active .ant-tabs-tab-btn {
+  color: var(--soft-primary) !important;
+}
+
+.ant-tabs .ant-tabs-ink-bar {
+  background: var(--soft-primary) !important;
+}
+
+/* ==========================================================================
+   8.1 大号分段切换器（作文批改 语文/英语、听力与口语 子板块共用）
+   --------------------------------------------------------------------------
+   浅灰蓝轨道 + 52px 大号项 + 图标；激活项深蓝实底白字 + 微投影
+   （同主按钮视觉），切换一目了然。仅作用于挂此 class 的 Segmented，
+   不污染其他 Segmented 组件。未激活项 hover 文字转主色，动效仅过渡无循环。
+   ========================================================================== */
+.soft-section-switcher.ant-segmented {
+  background: #eef1f7 !important;
+  border-radius: 12px !important;
+  padding: 5px;
+  max-width: 520px;
+}
+
+.soft-section-switcher .ant-segmented-item {
+  min-height: 52px;
+  border-radius: 9px !important;
+  font-size: 16px;
+  font-weight: 600;
+  transition: color 0.2s ease, background-color 0.2s ease, box-shadow 0.2s ease;
+}
+
+.soft-section-switcher .ant-segmented-item .ant-segmented-item-label {
+  min-height: 52px;
+  line-height: 52px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+}
+
+.soft-section-switcher .ant-segmented-item-icon {
+  font-size: 17px;
+}
+
+/* 未激活 hover：文字转主色 */
+.soft-section-switcher .ant-segmented-item:not(.ant-segmented-item-selected):hover {
+  color: var(--soft-primary) !important;
+}
+
+/* 激活项：深蓝实底 + 白字 + 微投影（与主按钮一致） */
+.soft-section-switcher .ant-segmented-item-selected,
+.soft-section-switcher .ant-segmented-item-selected:hover {
+  background: var(--soft-primary) !important;
+  color: #fff !important;
+  box-shadow: 0 2px 10px rgba(26, 86, 219, 0.22) !important;
+}
+
+.soft-section-switcher .ant-segmented-item-selected .ant-segmented-item-icon {
+  color: #fff !important;
+}
+
+/* Pagination：当前页描边 + 数字 */
+.ant-pagination .ant-pagination-item-active {
+  border-color: var(--soft-primary) !important;
+}
+
+.ant-pagination .ant-pagination-item-active a {
+  color: var(--soft-primary) !important;
+}
+
+/* 上传进度条 */
+.ant-progress .ant-progress-bg {
+  background: var(--soft-primary) !important;
+}
+
+/* 加载转圈 */
+.ant-spin .ant-spin-dot-item {
+  background: var(--soft-primary) !important;
+}
+
+/* 空状态辅助文字（antd 默认偏浅，略加深保证可读） */
+.ant-empty .ant-empty-description {
+  color: var(--soft-text-secondary) !important;
+}
+
+/* ==========================================================================
+   9. 弹层毛玻璃（弹窗 / 消息 / 下拉菜单 / 选择下拉 / 气泡确认）
+   --------------------------------------------------------------------------
+   规则：弹窗、下拉菜单、悬浮聊天按钮使用毛玻璃。
+   不透明度 ≥ 0.86，配合 16-20px 模糊：文字仍落在近白底上，阅读无损失。
+   玻璃元素统一加 1px 白描边 + 柔和投影，符合"局部毛玻璃"方案。
+   ========================================================================== */
+/* Modal 弹窗 */
+.ant-modal .ant-modal-content {
+  background: rgba(255, 255, 255, 0.86) !important;
+  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(20px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.65);
+  border-radius: var(--soft-radius-overlay) !important;
+  box-shadow: 0 24px 64px rgba(15, 30, 60, 0.18) !important;
+}
+
+/* 消息 toast */
+.ant-message .ant-message-notice-content {
+  background: rgba(255, 255, 255, 0.88) !important;
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 10px !important;
+  box-shadow: 0 12px 32px rgba(15, 30, 60, 0.14) !important;
+}
+
+/* 用户下拉菜单（右上角头像菜单等） */
+.ant-dropdown .ant-dropdown-menu {
+  background: rgba(255, 255, 255, 0.9) !important;
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 12px !important;
+  box-shadow: 0 12px 32px rgba(15, 30, 60, 0.12) !important;
+}
+
+/* 顶部导航右上角用户下拉菜单：右边缘与触发元素(用户名)对齐。
+   头部 padding 为 24px，故将下拉右缘固定在视口右缘 24px 处，避免整体偏右错位 */
+.header-user-dropdown {
+  inset-inline-end: 24px !important;
+}
+
+/* 下拉菜单项 hover 底色淡染主色，选中项浅蓝底 + 主色文字 */
+.ant-dropdown .ant-dropdown-menu .ant-dropdown-menu-item:hover {
+  background: rgba(26, 86, 219, 0.06) !important;
+}
+
+/* 表单下拉（Select 弹出层） */
+.ant-select-dropdown {
+  background: rgba(255, 255, 255, 0.9) !important;
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 12px !important;
+  box-shadow: 0 12px 32px rgba(15, 30, 60, 0.12) !important;
+}
+
+.ant-select-dropdown .ant-select-item-option-selected {
+  background: rgba(26, 86, 219, 0.08) !important;
+  color: var(--soft-primary) !important;
+}
+
+.ant-select-dropdown .ant-select-item-option-active:not(.ant-select-item-option-disabled) {
+  background: rgba(26, 86, 219, 0.05) !important;
+}
+
+/* 气泡确认（Popconfirm 删除 / 重新批改前） */
+.ant-popover .ant-popover-inner {
+  background: rgba(255, 255, 255, 0.9) !important;
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  border-radius: 12px !important;
+  box-shadow: 0 12px 32px rgba(15, 30, 60, 0.12) !important;
+}
+
+/* ==========================================================================
+   10. 右下角悬浮聊天按钮 + 聊天抽屉（毛玻璃）
+   --------------------------------------------------------------------------
+   - 悬浮按钮：深蓝半透明玻璃圆钮
+   - 聊天抽屉（宽度 480px）：整体毛玻璃面板；用户消息气泡 / 链接跟随主色
+   - 作文详情抽屉（宽度 1000px）阅读密集，保持纯白底，不被本规则误伤
+   ========================================================================== */
+/* 悬浮聊天按钮：毛玻璃深蓝 */
+.ant-float-btn.ant-float-btn-primary .ant-float-btn-body {
+  background: rgba(26, 86, 219, 0.85) !important;
+  backdrop-filter: blur(10px) saturate(140%);
+  -webkit-backdrop-filter: blur(10px) saturate(140%);
+  box-shadow: 0 8px 24px rgba(26, 86, 219, 0.32) !important;
+}
+
+.ant-float-btn.ant-float-btn-primary:hover .ant-float-btn-body {
+  background: rgba(21, 71, 184, 0.92) !important;
+}
+
+/* 聊天抽屉：仅 480px 宽度命中（ChatDrawer），详情抽屉 1000px 不受影响 */
+.ant-drawer-content-wrapper[style*="width: 480px"] .ant-drawer-content {
+  background: rgba(247, 248, 250, 0.82) !important;
+  backdrop-filter: blur(24px) saturate(150%);
+  -webkit-backdrop-filter: blur(24px) saturate(150%);
+}
+
+.ant-drawer-content-wrapper[style*="width: 480px"] .ant-drawer-header {
+  background: transparent !important;
+  border-bottom-color: rgba(23, 43, 77, 0.08);
+}
+
+/* ==========================================================================
+   11. 主色统一（替换历史内联样式中的 #1677ff 亮蓝）
+   --------------------------------------------------------------------------
+   React 内联 color/background/border 为 "#1677ff" 的元素（上传图标、文件图标、
+   进度条填充、用户消息气泡、Markdown 链接、详情页总评边框等）在 DOM 中统一
+   渲染为 rgb(22, 119, 255)，此处一并映射到深蓝，保证全页单一强调色。
+   ========================================================================== */
+/* 宽泛 color 映射必须排除 background 形式：用户消息气泡为
+   background 主色 + color 白字，若不排除，白字会被强制改为深蓝导致不可读。
+   React 内联样式经 CSSOM 序列化为 rgb 形式（如 #1677ff → rgb(22, 119, 255)），
+   故此处以 rgb 形式为精确匹配。 */
+[style*="rgb(22, 119, 255)"]:not([style*="background: rgb(22, 119, 255)"]):not([style*="background-color: rgb(22, 119, 255)"]) {
+  color: var(--soft-primary) !important;
+  border-color: var(--soft-primary) !important;
+}
+
+/* 背景即主色的内联元素（进度条填充、用户消息气泡等）：映射深蓝。
+   注意：背景映射必须精确命中"background 简写/background-color 即主色"，
+   不可并入上方宽泛规则——浅灰底 + 主色边框的元素（听力对话块、作文总评块）
+   会被误染成深蓝底导致文字不可读（此前 bug，已拆出修复）。 */
+[style*="background: rgb(22, 119, 255)"],
+[style*="background-color: rgb(22, 119, 255)"] {
+  background-color: var(--soft-primary) !important;
+}
+
+/* 弱化灰文字（内联 #8c8c8c）略加深，小字号说明文字达 AA */
+[style*="rgb(140, 140, 140)"] {
+  color: var(--soft-text-secondary) !important;
+}
+
+/* ==========================================================================
+   12. 审计修复（impeccable detector 发现项，纯 CSS 移除不必要装饰）
+   --------------------------------------------------------------------------
+   以下两处装饰/动效在详情抽屉的既有内联样式中，不动 TSX 结构，仅用
+   样式表覆盖移除：
+   - 总评卡片左侧 3px 蓝色强调条（side-tab 装饰）：移除边框，保留浅蓝底色
+     区分块级语义，视觉更干净
+   - 维度评分条 width 过渡动画（布局属性动画，滚动性能差）：关闭为静态，
+     与"动效强度 0.1，无多余动画"的整体规则一致
+   ========================================================================== */
+/* impeccable-disable-next-line side-tab — 此选择器用于将既有 3px 侧边强调条宽度归零（移除装饰，非新增），detector 外观匹配为伪阳性 */
+[style*="border-left: 3px solid rgb(22, 119, 255)"] {
+  border-left-width: 0 !important;
+}
+
+[style*="width 0.6s ease"] {
+  transition: none !important;
+}
+
+/* ==========================================================================
+   13. 动效克制与无障碍降级
+   --------------------------------------------------------------------------
+   动效强度 0.1：仅 hover 过渡，无循环动画。
+   - prefers-reduced-motion：关闭一切过渡 / 动画
+   - prefers-reduced-transparency：毛玻璃降级为近实底，保证可读与性能
+   ========================================================================== */
+@media (prefers-reduced-motion: reduce) {
+  .ant-card,
+  .ant-upload-drag,
+  .ant-btn,
+  .ant-input,
+  .ant-select-selector,
+  .soft-section-switcher .ant-segmented-item {
+    transition: none !important;
+  }
+}
+
+@media (prefers-reduced-transparency: reduce) {
+  .ant-modal .ant-modal-content,
+  .ant-message .ant-message-notice-content,
+  .ant-dropdown .ant-dropdown-menu,
+  .ant-select-dropdown,
+  .ant-popover .ant-popover-inner,
+  .ant-float-btn .ant-float-btn-body {
+    background: #ffffff !important;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .ant-drawer-content-wrapper[style*="width: 480px"] .ant-drawer-content {
+    background: #ffffff !important;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  /* 顶部导航降级为近实白底 */
+  .ant-layout-header {
+    background: rgba(255, 255, 255, 0.97) !important;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+/* ==========================================================================
+   14. 听力与口语页面专项（OralAssessment，纯 CSS 覆盖，不动 TSX）
+   --------------------------------------------------------------------------
+   该页面历史记录使用 Table / List、作答方式使用 Radio.Button、普通话测评
+   朗读文本为内联实线边框。此处按 Soft-UI 规则统一软化：
+   - 朗读文本段落：移除 1px 生硬实线边框（保留浅灰底区分块级语义）
+   - 表格：表头浅冷底、行分隔线淡化、hover 行淡蓝浅染
+   - 列表：分隔线淡化
+   - 作答方式分段切换（Radio.Button）：两端圆角 + 选中深蓝实底
+   - Divider / 输入控件边框：统一淡蓝灰描边
+   全部仅色彩与圆角，无新增动画、无毛玻璃，不影响任何布局。
+   ========================================================================== */
+
+/* 14.1 普通话测评「朗读文本」：内联 1px 实线边框 → 移除
+   （以完整内联样式组合命中，仅影响该段落，不误伤作文页等同色边框的图片） */
+[style*="border-radius: 8px; font-size: 16px; line-height: 2; border: 1px solid rgb(240, 240, 240)"] {
+  border: none !important;
+}
+
+/* 14.2 记录表格（英语听力 / 单词听写历史记录）
+   - 表头：默认 #fafafa → 淡蓝灰 #f5f7fb，与页面冷灰基调统一
+   - 表头分隔线：默认深灰 → 主题描边色
+   - 行分隔线：默认 #f0f0f0 → 更淡的 #eef1f6，弱化"实线网格感"
+   - 行 hover：默认浅灰 → 极淡主色浅染，克制且呼应主题 */
+.ant-table-thead > tr > th {
+  background: #f5f7fb !important;
+  border-bottom-color: var(--soft-border) !important;
+}
+
+.ant-table-tbody > tr > td {
+  border-bottom-color: #eef1f6 !important;
+}
+
+.ant-table-tbody > tr:hover > td {
+  background: rgba(26, 86, 219, 0.03) !important;
+}
+
+/* 14.3 记录列表（普通话测评记录等 List 场景）：分隔线淡化 */
+.ant-list-split .ant-list-item {
+  border-block-end-color: #eef1f6 !important;
+}
+
+/* 14.4 作答方式分段切换（Radio.Button，仅本页面使用）
+   - 默认描边：antd 生硬 #d9d9d9 → 淡蓝灰，两端圆角 8px
+   - hover：文字 + 描边转主色
+   - 选中项：深蓝实底白字（映射 antd 默认亮蓝 #1677ff → 全页主色），
+     左侧 ::before 分隔线同步转主色，避免相邻选中项露出灰线 */
+.ant-radio-button-wrapper {
+  border-color: #d4dbe8 !important;
+}
+
+.ant-radio-button-wrapper:first-child {
+  border-radius: 8px 0 0 8px !important;
+}
+
+.ant-radio-button-wrapper:last-child {
+  border-radius: 0 8px 8px 0 !important;
+}
+
+.ant-radio-button-wrapper:hover:not(.ant-radio-button-wrapper-checked) {
+  border-color: var(--soft-primary) !important;
+  color: var(--soft-primary) !important;
+}
+
+.ant-radio-button-wrapper-checked {
+  background: var(--soft-primary) !important;
+  border-color: var(--soft-primary) !important;
+  color: #fff !important;
+}
+
+/* 选中项 hover：跟随主色加深（antd 默认 hover 为亮蓝，需统一深蓝系） */
+.ant-radio-button-wrapper-checked:hover:not(.ant-radio-button-wrapper-disabled) {
+  background: var(--soft-primary-hover) !important;
+  border-color: var(--soft-primary-hover) !important;
+}
+
+.ant-radio-button-wrapper-checked:not(.ant-radio-button-wrapper-disabled)::before {
+  background-color: var(--soft-primary) !important;
+}
+
+/* 14.5 Divider 分割线：默认深灰 → 主题描边色，弱化硬分隔 */
+.ant-divider {
+  border-block-start-color: var(--soft-border) !important;
+}
+
+/* 14.6 输入控件描边：默认 #d9d9d9 偏生硬 → 淡蓝灰，与页面整体观感一致
+   （hover / focus 仍走第 6 节主色规则；error 红框为语义色必须醒目，明确排除） */
+.ant-input:not(.ant-input-status-error),
+.ant-input-number:not(.ant-input-status-error),
+.ant-input-affix-wrapper:not(.ant-input-status-error) {
+  border-color: #d4dbe8 !important;
+}
+
+.ant-input-number:not(.ant-input-number-disabled):not(.ant-input-status-error):hover,
+.ant-input-affix-wrapper:not(.ant-input-affix-wrapper-disabled):not(.ant-input-status-error):hover {
+  border-color: var(--soft-primary) !important;
+}
+
+/* 14.7 Alert 信息提示：icon 亮蓝 #1677ff → 深蓝主色，底色淡染主题色
+   （呼应第 11 节"全页单一强调色"原则；warning/error 语义色保留） */
+.ant-alert-info {
+  background-color: rgba(26, 86, 219, 0.05) !important;
+  border-color: rgba(26, 86, 219, 0.12) !important;
+}
+
+.ant-alert-info .ant-alert-icon {
+  color: var(--soft-primary) !important;
+}
+
+/* 14.8 动效克制：以上新增元素仅颜色过渡，无循环动画；跟随降级规则 */
+@media (prefers-reduced-motion: reduce) {
+  .ant-radio-button-wrapper,
+  .ant-table-tbody > tr > td {
+    transition: none !important;
+  }
+}
+
+/* ==========================================================================
+   15. 学情分析页面专项（LearningAnalytics · /analytics，纯 CSS 覆盖，不动 TSX）
+   --------------------------------------------------------------------------
+   页面特征：外层 Card 内为默认尺寸 Tabs，三个子面板（作业统计 / 学生学情
+   看板 / 知识点热力图）全部由 size="small" 卡片 + bordered 表格 + G2 图表
+   构成。
+   作用域限定：本页 Tabs 为默认尺寸（.ant-tabs-large 原先用于口语测评页的
+   大号 Tabs，该页已改为分段切换器，此处保留 :not(.ant-tabs-large) 以免未来
+   复用 large Tabs 的页面被误伤），故所有选择器以 :not(.ant-tabs-large) 区分。
+   --------------------------------------------------------------------------
+   规则落点：
+   - 内层小卡片去投影：阴影只留给外层 Tabs 容器卡，消除"卡中卡"双层投影
+     （impeccable 审计"移除不必要装饰"）；内层卡保留白底 + 淡描边 + 圆角
+   - 卡片内边距 12px → 16px/20px，标题行加高加粗（信息密度 0.6）
+   - bordered 表格描边统一淡蓝灰，合计行浅冷底，弱化网格感
+   - G2 图表 tooltip 毛玻璃（弹层规则，仅小面积跟随元素，性能可控）
+   - 热力图图例灰字（内联 #888）加深至 AA 对比度
+   ========================================================================== */
+
+/* 15.1 Tabs 页签：激活项加粗（hover / 激活主色已有第 8 节全局规则） */
+.ant-tabs:not(.ant-tabs-large) > .ant-tabs-nav .ant-tabs-tab-active .ant-tabs-tab-btn {
+  font-weight: 600;
+}
+
+/* 15.2 内层小卡片：去投影，内边距舒适化 */
+.ant-tabs:not(.ant-tabs-large) .ant-card-size-small {
+  box-shadow: none !important;
+}
+
+/* 标题行：加高 + 左右留白（small 卡默认 12px 过局促） */
+.ant-tabs:not(.ant-tabs-large) .ant-card-size-small > .ant-card-head {
+  min-height: 48px;
+  padding: 0 20px;
+}
+
+.ant-tabs:not(.ant-tabs-large) .ant-card-size-small .ant-card-head-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.ant-tabs:not(.ant-tabs-large) .ant-card-size-small > .ant-card-body {
+  padding: 16px 20px;
+}
+
+/* 15.3 bordered 表格：统一淡蓝灰描边，弱化网格感
+   （表头淡冷底 #f5f7fb 已有 14.2 全局规则；行分隔线同样淡化） */
+.ant-tabs:not(.ant-tabs-large) .ant-table-bordered .ant-table-cell {
+  border-inline-end-color: #eef1f6 !important;
+  border-bottom-color: #eef1f6 !important;
+}
+
+/* 合计行（Table.Summary）：浅冷底 + 主题描边 */
+.ant-tabs:not(.ant-tabs-large) .ant-table-summary {
+  background: #f7f9fc !important;
+}
+
+.ant-tabs:not(.ant-tabs-large) .ant-table-summary .ant-table-cell {
+  border-top-color: var(--soft-border) !important;
+}
+
+/* 15.4 G2 图表 tooltip：毛玻璃弹层（全局生效，所有图表页统一；
+   仅小面积跟随元素，backdrop-filter 成本可控） */
+.g2-tooltip {
+  background: rgba(255, 255, 255, 0.92) !important;
+  backdrop-filter: blur(16px) saturate(140%);
+  -webkit-backdrop-filter: blur(16px) saturate(140%);
+  border: 1px solid rgba(255, 255, 255, 0.7) !important;
+  border-radius: 10px !important;
+  box-shadow: 0 12px 32px rgba(15, 30, 60, 0.14) !important;
+  padding: 10px 12px !important;
+}
+
+/* 15.5 热力图图例说明文字（内联 #888）加深至 AA（5.8:1）
+   （与 11 节 #8c8c8c 同款全局映射，灰色辅助文字统一加深） */
+[style*="rgb(136, 136, 136)"] {
+  color: var(--soft-text-secondary) !important;
+}
+
+/* 15.6 作业多选 Select 标签：主题色浅染（仅学情分析页作用域内生效） */
+.ant-tabs:not(.ant-tabs-large) .ant-select-multiple .ant-select-selection-item {
+  background: rgba(26, 86, 219, 0.06) !important;
+  border-color: rgba(26, 86, 219, 0.18) !important;
+  color: var(--soft-primary) !important;
+  border-radius: 6px !important;
+}
+
+/* 15.7 无障碍降级：图表 tooltip 毛玻璃跟随 13 节规则降级为实底 */
+@media (prefers-reduced-transparency: reduce) {
+  .g2-tooltip {
+    background: #ffffff !important;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+}
+
+/* ==========================================================================
+   16. 作业管理模块专项（AssignmentManagement · /assignments，纯 CSS 覆盖）
+   --------------------------------------------------------------------------
+   覆盖范围：上传作业 / 作业记录 / 作业详情 / 错题归纳 / 繁星驱动 五页，
+   以及其承载组件（QuestionCard / ErrorQuestionCard / AIQuestionHistoryCard /
+   UploadModal / ManualSplitModal / AnswerSplitModal / 同类题卡片 / 分析进度弹窗）。
+   规则落点（沿用 1-15 节设计令牌，无新增颜色、无新增动画）：
+   - 侧边栏白底 + 右侧发丝线，菜单选中项深蓝浅染 + 主色文字（替换 antd 亮蓝）
+   - 弹窗内文件列表 / 预览区 / 答案块：浅灰底统一为淡蓝灰，描边统一为主题色
+   - 题目卡片子题 3px 左侧边条：亮蓝 #1890ff → 深蓝主色（与全局一致）
+   - 内联样式映射：React 经 CSSOM 序列化为 rgb 形式（实测确认），以 rgb
+     为主匹配、hex 字面兜底（手写 setAttribute / SSR 场景），双保险
+   -------------------------------------------------------------------------- */
+
+/* 16.1 作业管理布局：侧边栏与菜单
+   --------------------------------------------------------------------------
+   - AssignmentLayout 外层 Layout 内联 #f5f5f5（无 class 可用），字面映射为
+     页面背景 #f7f8fa，与 AppLayout 内容区一致
+   - Sider 保持纯白（卡片式侧栏），右侧加 1px 发丝线分隔内容区
+   - 菜单选中项：antd 默认亮蓝浅染 #e6f4ff + 亮蓝文字 → 深蓝浅染 + 主色文字，
+     右侧选中指示条跟随主色；hover 文字转主色，无多余动效
+   ========================================================================== */
+.ant-layout[style*="background: rgb(245, 245, 245)"],
+.ant-layout[style*="background: #f5f5f5"],
+.ant-layout[style*="background:#f5f5f5"] {
+  background-color: var(--soft-page-bg) !important;
+}
+
+.ant-layout-sider {
+  background: #ffffff !important;
+  border-right: 1px solid var(--soft-border);
+}
+
+.ant-layout-sider .ant-menu {
+  background: transparent !important;
+  border-inline-end: none !important;
+}
+
+.ant-layout-sider .ant-menu-light .ant-menu-item-selected {
+  background: rgba(26, 86, 219, 0.08) !important;
+  color: var(--soft-primary) !important;
+  font-weight: 600;
+}
+
+.ant-layout-sider .ant-menu-light .ant-menu-item-selected::after {
+  border-inline-end-color: var(--soft-primary) !important;
+}
+
+.ant-layout-sider .ant-menu-light .ant-menu-item-selected .anticon {
+  color: var(--soft-primary) !important;
+}
+
+.ant-layout-sider .ant-menu-light .ant-menu-item:not(.ant-menu-item-selected):hover {
+  color: var(--soft-primary) !important;
+  background: rgba(26, 86, 219, 0.05) !important;
+}
+
+.ant-layout-sider .ant-menu-light .ant-menu-item:not(.ant-menu-item-selected):hover .anticon {
+  color: var(--soft-primary) !important;
+}
+
+/* 上传作业：重点高亮区分（渐变背景 + 加粗 + 图标醒目色） */
+.ant-layout-sider .ant-menu-item.menu-item-featured {
+  background: linear-gradient(135deg, #1677ff 0%, #4096ff 100%) !important;
+  color: #fff !important;
+  font-weight: 600;
+  margin: 8px 8px !important;
+  border-radius: 8px !important;
+  height: 44px !important;
+  line-height: 44px !important;
+}
+.ant-layout-sider .ant-menu-item.menu-item-featured .anticon {
+  color: #fff !important;
+}
+.ant-layout-sider .ant-menu-item.menu-item-featured:hover {
+  background: linear-gradient(135deg, #0958d9 0%, #1677ff 100%) !important;
+  color: #fff !important;
+}
+/* 上传作业选中态：保持渐变加深 */
+.ant-layout-sider .ant-menu-item.menu-item-featured.ant-menu-item-selected {
+  background: linear-gradient(135deg, #0958d9 0%, #1677ff 100%) !important;
+  color: #fff !important;
+}
+
+/* 16.2 作业详情：Descriptions 标签文字加深至 AA（antd 默认 45% 黑对比度边缘） */
+.ant-descriptions-item-label {
+  color: var(--soft-text-secondary) !important;
+}
+
+/* 16.3 题目卡片（QuestionCard）：子题 3px 左侧边条亮蓝 → 深蓝主色
+   （错误红 / 正确绿边条为批改语义色，保留不替换） */
+[style*="#1890ff"],
+[style*="rgb(24, 144, 255)"] {
+  border-color: var(--soft-primary) !important;
+}
+
+/* 16.4 弹窗内文件列表 / 预览区 / 答案块：浅灰底统一为淡蓝灰
+   --------------------------------------------------------------------------
+   - UploadModal 文件列表项、AIQuestionHistoryCard 阅读材料块：#fafafa 底 +
+     #e8e8e8 描边 → 淡蓝灰底 + 主题描边
+   - ManualSplitModal / AnswerSplitModal 预览区 #f5f5f5 → 页面底色同系淡蓝灰
+   - ErrorQuestionCard / AI 挑战卡答案块 #fafafa → 淡蓝灰
+   - ErrorQuestionCard 得分分隔线 dashed #d9d9d9 → 主题描边色
+   全部仅色彩替换，不改变任何布局 / 交互。
+   ========================================================================== */
+[style*="border: 1px solid rgb(232, 232, 232)"],
+[style*="border: 1px solid #e8e8e8"] {
+  border-color: var(--soft-border) !important;
+}
+
+[style*="border-top: 1px dashed rgb(217, 217, 217)"],
+[style*="border-top: 1px dashed #d9d9d9"],
+[style*="border-top:1px dashed #d9d9d9"] {
+  border-top-color: var(--soft-border) !important;
+}
+
+/* 16.5 筛选栏文字（错题归纳 / 繁星驱动 得分率标签 #666、分隔符 ~ #999）
+   → 统一为次级文字色，保证小字号 AA 对比度。
+   React 内联样式序列化为 rgb 形式，rgb 为主匹配、hex 字面为兜底。 */
+[style*="color: rgb(102, 102, 102)"],
+[style*="color: #666"],
+[style*="color:#666"] {
+  color: var(--soft-text-secondary) !important;
+}
+
+[style*="color: rgb(153, 153, 153)"],
+[style*="color: #999"],
+[style*="color:#999"] {
+  color: var(--soft-text-secondary) !important;
+}
+
+/* 16.6 重新生成备注 Popover 内等待文字（内联 #888）加深至 AA
+   （rgb 形式已由 15.5 节全局覆盖，此处 hex 字面兜底） */
+[style*="color: #888"],
+[style*="color:#888"] {
+  color: var(--soft-text-secondary) !important;
+}
+
+/* ==========================================================================
+   17. 内联样式映射补齐（作业管理相关色值，与 11 节互补）
+   --------------------------------------------------------------------------
+   实测确认：React 内联 style 经 CSSOM setProperty 序列化为 rgb 形式
+   （#1677ff → rgb(22, 119, 255)、#fafafa → rgb(250, 250, 250)），
+   故全部映射以 rgb 形式为主匹配；hex 字面保留为兜底（手写 setAttribute /
+   SSR 场景）。覆盖：上传图标 / 文件图标 / 进度条 / 聊天用户气泡 /
+   查看答案 summary / 同类题强调文字 / 各浅灰底与描边。
+   #fafafa / #f5f5f5 / #f0f0f0 浅灰底统一为冷灰系（与页面基调一致）。
+   ========================================================================== */
+
+/* 17.1 主色系：color / border 映射深蓝（hex 字面兜底形式）。
+   React 内联样式经 CSSOM 序列化为 rgb 形式（11 节已按 rgb 精确匹配，
+   并排除 background 形式防误伤白字）；此处 hex 字面形式覆盖手写
+   setAttribute / SSR 等场景，同样排除 background。 */
+[style*="#1677ff"]:not([style*="background: #1677ff"]):not([style*="background:#1677ff"]):not([style*="background-color: #1677ff"]):not([style*="background-color:#1677ff"]) {
+  color: var(--soft-primary) !important;
+  border-color: var(--soft-primary) !important;
+}
+
+/* 背景即主色（用户消息气泡、进度条填充等）：精确命中 background 简写形式。
+   rgb 与 hex 双写，与 17.1 的 :not 排除条件对应，保证气泡白字不被误染。 */
+[style*="background: rgb(22, 119, 255)"],
+[style*="background-color: rgb(22, 119, 255)"],
+[style*="background: #1677ff"],
+[style*="background:#1677ff"],
+[style*="background-color: #1677ff"],
+[style*="background-color:#1677ff"] {
+  background-color: var(--soft-primary) !important;
+}
+
+/* 17.2 浅灰底统一为淡蓝灰（背景映射，避免命中 color 场景）。
+   React 序列化形式 rgb(250, 250, 250) / rgb(245, 245, 245) 为主匹配，
+   hex 字面为兜底。 */
+[style*="background: rgb(250, 250, 250)"],
+[style*="background-color: rgb(250, 250, 250)"],
+[style*="background: #fafafa"],
+[style*="background:#fafafa"],
+[style*="background-color: #fafafa"],
+[style*="background-color:#fafafa"] {
+  background-color: #f5f7fb !important;
+}
+
+[style*="background: rgb(245, 245, 245)"],
+[style*="background-color: rgb(245, 245, 245)"],
+[style*="background: #f5f5f5"],
+[style*="background:#f5f5f5"],
+[style*="background-color: #f5f5f5"],
+[style*="background-color:#f5f5f5"] {
+  background-color: var(--soft-page-bg) !important;
+}
+
+/* 17.3 描边类：antd 默认边框色统一为主题描边色（rgb 主匹配 + hex 兜底） */
+[style*="rgb(240, 240, 240)"],
+[style*="rgb(232, 232, 232)"],
+[style*="rgb(217, 217, 217)"],
+[style*="#f0f0f0"],
+[style*="#e8e8e8"],
+[style*="#d9d9d9"] {
+  border-color: var(--soft-border) !important;
+}
+
+/* 17.4 紫色强调文字（AI 挑战"解析："标签）→ 主色，保证单一强调色 */
+[style*="#722ed1"],
+[style*="rgb(114, 46, 209)"] {
+  color: var(--soft-primary) !important;
+}
+
+/* 17.5 无障碍降级：17 节新增映射均为纯色彩替换、无动画属性，
+   毛玻璃弹层已由 13 节统一降级，此处无需新增规则 */
+
+/* ==========================================================================
+   18. 账号区三页专项（助教设置 / 数据看板 / 账号设置，纯 CSS 覆盖，不动 TSX）
+   --------------------------------------------------------------------------
+   入口：右上角用户账号下拉菜单 → 助教设置 / 数据看板 / 账号设置。
+   页面特征定位（沿用 16/17 节"内联样式选择器"手法，全站唯一）：
+   - 助教设置 /settings/personality：容器 max-width: 900px 且含 Slider
+   - 账号设置 /settings/account：容器 max-width: 900px 且含 Table
+   - 数据看板 /dashboard：容器 max-width: 1200px
+   规则落点：
+   - 助教设置：表单区提升为白色卡片（呼应第 4 节卡片语言，替代裸平铺）
+   - 数据看板：汇总数值大号化、bordered 表格网格弱化、紫色折线统一主色
+   - 账号设置：标题层级与其他两页对齐
+   - 全局补全：普通 Radio 圆点 / Slider 轨道把手统一深蓝（第 8 节单一强调色原则）
+   全部仅颜色、间距、字号、圆角，无新增动画、无新增毛玻璃。
+   ========================================================================== */
+
+/* 18.1 助教设置页：表单区白卡化
+   --------------------------------------------------------------------------
+   Divider（自定义微调）之后的表单 Row 提升为卡片：白底 + 柔和阴影 +
+   圆角 14px + 淡描边，与全站卡片语言一致；不改变任何控件结构与交互。
+   仅命中"900px 容器内含 Slider"的助教设置页（Oral/讲解组件的 Slider
+   不在 900px 容器内，互不污染）。 */
+div[style*="max-width: 900px"]:has(.ant-slider) > .ant-divider + .ant-row {
+  background: var(--soft-surface);
+  border: 1px solid var(--soft-border);
+  border-radius: var(--soft-radius-card);
+  box-shadow: var(--soft-shadow);
+  padding: 24px 24px 12px;
+}
+
+/* 18.2 数据看板：页面内 small 卡片统一舒适内边距与标题层级
+   --------------------------------------------------------------------------
+   8 张 size="small" 卡（4 汇总 + 1 表格 + 1 柱状 + 2 折线）统一：
+   head 加高 48px、标题 15px 加粗、body 内边距 20px 24px（呼应 15.2 节
+   学情页同款处理，信息密度 0.6）。 */
+div[style*="max-width: 1200px"] .ant-card-size-small > .ant-card-head {
+  min-height: 48px;
+  padding: 0 20px;
+}
+
+div[style*="max-width: 1200px"] .ant-card-size-small .ant-card-head-title {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+div[style*="max-width: 1200px"] .ant-card-size-small > .ant-card-body {
+  padding: 20px 24px !important;
+}
+
+/* 18.3 汇总指标卡：数值大号加粗，标题次级色（一眼可读，无需点击进详情） */
+div[style*="max-width: 1200px"] .ant-statistic-title {
+  color: var(--soft-text-secondary);
+  font-size: 13px;
+}
+
+div[style*="max-width: 1200px"] .ant-statistic-content-value {
+  font-size: 26px;
+  font-weight: 600;
+  line-height: 1.25;
+  color: var(--soft-text-primary);
+}
+
+/* 18.4 bordered 统计表：网格线淡化（与 15.3 节学情页同款，弱化"实线网格感"，
+   移除不必要的视觉装饰；表头淡冷底与行 hover 已有 14.2 节全局规则） */
+div[style*="max-width: 1200px"] .ant-table-bordered .ant-table-cell {
+  border-inline-end-color: #eef1f6 !important;
+  border-bottom-color: #eef1f6 !important;
+}
+
+/* 18.5 折线图：紫色系列（内联 #722ed1）统一为深蓝主色，保证全页单一强调色；
+   绿色系列（调用次数）为语义色保留区分。仅命中 Token 趋势折线所在的第一
+   个 lg=12 列，柱状图（单独卡片）与右侧折线不受影响。G2 v5 渲染的
+   数据线 / 数据点在 .g2-line / .g2-point 容器内，网格线在 .g2-grid，
+   不会误伤。 */
+div[style*="max-width: 1200px"] .ant-row > .ant-col-lg-12:first-child .g2-line path {
+  stroke: var(--soft-primary) !important;
+}
+
+div[style*="max-width: 1200px"] .ant-row > .ant-col-lg-12:first-child .g2-point {
+  fill: var(--soft-primary) !important;
+  stroke: var(--soft-primary) !important;
+}
+
+/* G2 轴标签文字：统一次级色（小字号对比度提升至 5.8:1，AA 达标） */
+div[style*="max-width: 1200px"] .g2-axis-label {
+  color: var(--soft-text-secondary) !important;
+}
+
+/* 18.6 账号设置页：标题层级与其他两页对齐（h4 → 22px，弱化级别差） */
+div[style*="max-width: 900px"]:has(.ant-table) h4.ant-typography {
+  font-size: 22px;
+}
+
+/* 18.7 全局补全：普通 Radio 圆点统一深蓝
+   --------------------------------------------------------------------------
+   编辑用户角色（账号设置）、AI 挑战选项（SimilarQuestionCard 等）使用的
+   是普通 Radio（非 14.4 节的 Radio.Button），圆点仍为 antd 亮蓝，此处
+   按全页单一强调色原则统一为深蓝。 */
+.ant-radio-wrapper:hover .ant-radio-inner,
+.ant-radio-wrapper:focus-within .ant-radio-inner {
+  border-color: var(--soft-primary) !important;
+}
+
+.ant-radio-checked .ant-radio-inner {
+  border-color: var(--soft-primary) !important;
+  background-color: var(--soft-primary) !important;
+}
+
+/* 选中后的涟漪扩散环（antd 默认亮蓝）跟随主色 */
+.ant-radio-checked::after {
+  border-color: var(--soft-primary) !important;
+}
+
+/* 18.8 全局补全：Slider 轨道 / 把手 / 激活刻度点统一深蓝
+   --------------------------------------------------------------------------
+   助教设置"评分严格度"、听力倍速、讲解字号等 Slider 仍为 antd 亮蓝，
+   此处统一主色；轨道保持 antd 浅灰语义，激活段与把手为主色。 */
+.ant-slider-track {
+  background-color: var(--soft-primary) !important;
+}
+
+.ant-slider:hover .ant-slider-track {
+  background-color: var(--soft-primary-hover) !important;
+}
+
+.ant-slider-handle::after {
+  box-shadow: 0 0 0 2px var(--soft-primary) !important;
+}
+
+.ant-slider:hover .ant-slider-handle::after {
+  box-shadow: 0 0 0 2px var(--soft-primary-hover) !important;
+}
+
+.ant-slider-dot-active {
+  border-color: var(--soft-primary) !important;
+}
+
+/* 刻度文字：统一次级色（提升小字号对比度至 5.8:1，AA 达标） */
+.ant-slider-mark-text {
+  color: var(--soft-text-secondary) !important;
+}
+
+/* 18.9 无障碍降级：18 节全部为颜色 / 字号 / 圆角，无新增动画；
+   Radio / Slider 的 antd 自带过渡跟随 13 节 reduced-motion 一并关闭 */
+@media (prefers-reduced-motion: reduce) {
+  .ant-radio-inner,
+  .ant-slider-track,
+  .ant-slider-handle::after {
+    transition: none !important;
+  }
+}

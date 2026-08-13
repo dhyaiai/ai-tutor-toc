@@ -24,6 +24,9 @@ export interface AISubQuestionItem {
   knowledge_point: string | null;
   difficulty: string | null;
   options: Array<{ label: string; text: string }> | null;
+  image_svg?: string | null;
+  /** 上传转录的自有试题原图 URL（预签名后可直接访问）；AI 生成为空 */
+  image_url?: string | null;
   user_answers?: AIUserAnswer[];
   created_at: string | null;
 }
@@ -32,6 +35,10 @@ export interface AIQuestionItem {
   // 独立题字段（大题时 id 为 null）
   id: number | null;
   source_question_id: number | null;
+  /** 年级（上传题用自有值，老题回落原题所属作业；收藏页展示用） */
+  grade?: string;
+  /** 科目（上传题用自有值，老题回落原题所属作业；收藏页展示用） */
+  subject?: string;
   question_text?: string;
   answer?: string;
   analysis?: string | null;
@@ -39,6 +46,9 @@ export interface AIQuestionItem {
   knowledge_point?: string | null;
   difficulty?: string | null;
   options?: Array<{ label: string; text: string }> | null;
+  image_svg?: string | null;
+  /** 上传转录的自有试题原图 URL（预签名后可直接访问）；AI 生成为空 */
+  image_url?: string | null;
   user_answers?: AIUserAnswer[];
   created_at?: string | null;
 
@@ -46,9 +56,12 @@ export interface AIQuestionItem {
   is_big_question?: boolean;
   group_id?: string;
   question_context?: string;
+  context_image_svg?: string | null;
   children?: AISubQuestionItem[];
   total_count?: number;
   score_rate?: number;
+  /** 是否已收藏（收藏按钮初始状态回显；大题以组内第一子题锚点判断） */
+  is_favorited?: boolean;
 }
 
 export interface SubmitAnswerParams {
@@ -57,7 +70,7 @@ export interface SubmitAnswerParams {
   answer_image?: File;
 }
 
-import type { SimilarQuestionItem, SimilarBigQuestion, SimilarBigSubQuestion } from "./questionService";
+import type { SimilarQuestionItem, SimilarBigQuestion, SimilarBigSubQuestion, SimilarReplaceInfo } from "./questionService";
 
 export const aiQuestionService = {
   async save(sourceQuestionId: number, question: SimilarQuestionItem): Promise<{ id: number }> {
@@ -70,6 +83,7 @@ export const aiQuestionService = {
       knowledge_point: question.knowledge_point,
       difficulty: question.difficulty,
       options: question.options,
+      image_svg: question.image_svg || null,
     });
     return data;
   },
@@ -78,12 +92,14 @@ export const aiQuestionService = {
   async saveBigQuestion(params: {
     source_question_id: number;
     question_context: string;
+    context_image_svg?: string;
     difficulty: string;
     sub_questions: Array<SimilarBigSubQuestion & { existing_question_id?: number | null }>;
   }): Promise<{ ids: number[]; count: number; message: string }> {
     const { data } = await api.post("/ai-questions/big-question", {
       source_question_id: params.source_question_id,
       question_context: params.question_context,
+      question_context_image_svg: params.context_image_svg || null,
       difficulty: params.difficulty,
       sub_questions: params.sub_questions.map((sq) => ({
         question_text: sq.question_text,
@@ -93,6 +109,7 @@ export const aiQuestionService = {
         knowledge_point: sq.knowledge_point,
         options: sq.options || [],
         full_score: sq.full_score,
+        image_svg: sq.image_svg || null,
         existing_question_id: sq.existing_question_id ?? null,
       })),
     });
@@ -128,6 +145,7 @@ export const aiQuestionService = {
     knowledge_point: string;
     difficulty: string;
     options: Array<{ label: string; text: string }>;
+    image_svg?: string;
     selected_options?: string[];
     answer_text?: string;
     answer_image?: File;
@@ -150,6 +168,9 @@ export const aiQuestionService = {
     formData.append("knowledge_point", params.knowledge_point);
     formData.append("difficulty", params.difficulty);
     formData.append("options_json", JSON.stringify(params.options));
+    if (params.image_svg) {
+      formData.append("image_svg", params.image_svg);
+    }
     if (params.selected_options) {
       formData.append("selected_options", JSON.stringify(params.selected_options));
     }
@@ -198,13 +219,42 @@ export const aiQuestionService = {
     status: string;
     similar_questions?: SimilarQuestionItem[];
     error?: string;
+    replace?: SimilarReplaceInfo | null;
   }> {
     const { data } = await api.get(`/ai-questions/${id}/similar-result`);
     return data;
   },
 
-  async generateSimilarSingle(id: number): Promise<SimilarQuestionItem> {
-    const { data } = await api.post(`/ai-questions/${id}/similar-single`, {});
+  /** 创建换一题任务（异步，202 立即返回；结果需轮询 getSimilarResult 的 replace 字段） */
+  async generateSimilarSingle(id: number, difficulty?: string, index?: number): Promise<{ status: string; message: string }> {
+    const { data } = await api.post(`/ai-questions/${id}/similar-single`, {
+      difficulty: difficulty || "medium",
+      index: index ?? -1,
+    });
+    return data;
+  },
+
+  /** 更新 AI 题内容（题干/答案/解析/选项；大题按 id 更新子题并支持 question_context 背景材料）。
+   * URL 传收藏锚点 id：独立题即自身 id，大题即组内第一子题 id。
+   * 全量发送（覆盖语义），只允许内容字段，不触碰难度/配图/作答记录。 */
+  async updateContent(
+    id: number,
+    payload: {
+      question_text?: string;
+      answer?: string;
+      analysis?: string;
+      options?: Array<{ label: string; text: string }>;
+      question_context?: string;
+      children?: Array<{
+        id: number;
+        question_text?: string;
+        answer?: string;
+        analysis?: string;
+        options?: Array<{ label: string; text: string }>;
+      }>;
+    },
+  ): Promise<{ updated: number[]; message: string }> {
+    const { data } = await api.put(`/ai-questions/${id}/content`, payload);
     return data;
   },
 };

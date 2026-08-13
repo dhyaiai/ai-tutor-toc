@@ -4,12 +4,14 @@
 覆盖 3 个子功能：
 - 英语听力训练：生成题目 + 批改
 - 单词听写：生成任务 + 批改
-- 普通话测评：评测评分
+- 普通话测评：评测评分（朗读模式使用讯飞流式语音评测，其余由 LLM 驱动）
 
-所有题目生成和评分均由 LLM 驱动。
+题目生成和批改由 LLM 驱动。
 TTS 语音播报使用浏览器内置 SpeechSynthesis（无需后端）。
 """
 
+import asyncio
+import base64
 import json
 import logging
 import re
@@ -17,6 +19,23 @@ from openai import AsyncOpenAI
 from app.core.config import get_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _mandarin_level(score: float) -> str:
+    """按普通话水平测试标准将百分制得分映射为等级"""
+    if score >= 97:
+        return "一级甲等"
+    if score >= 92:
+        return "一级乙等"
+    if score >= 87:
+        return "二级甲等"
+    if score >= 80:
+        return "二级乙等"
+    if score >= 70:
+        return "三级甲等"
+    if score >= 60:
+        return "三级乙等"
+    return "未入级"
 
 
 class OralService:
@@ -457,9 +476,15 @@ class OralService:
             {"type": "text", "text": instruction},
             {"type": "image_url", "image_url": {"url": f"data:{image_mime};base64,{image_base64}"}},
         ]
+        # 视觉识别走多模态专用配置（VISION_*），DeepSeek 不支持视觉输入
+        vision_settings = get_settings()
+        vision_client = AsyncOpenAI(
+            api_key=vision_settings.VISION_API_KEY,
+            base_url=vision_settings.VISION_API_BASE,
+        )
         try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
+            response = await vision_client.chat.completions.create(
+                model=vision_settings.VISION_MODEL,
                 messages=[{"role": "user", "content": content_parts}],
                 max_tokens=2000,
                 temperature=0.1,
@@ -557,159 +582,116 @@ class OralService:
         return data
 
     async def evaluate_mandarin(
-        self, test_level: str, test_part: str | None = None,
-        text_content: str = "", strict_level: int = 3,
-        audio_base64: str = "", audio_format: str = "webm",
-        evaluation_mode: str = "text",  # "ai_generated" | "free_speech" | "text"（兼容旧调用）
+        self, test_level: str, text_content: str,
+        audio_base64: str, audio_format: str = "wav",
         personality_directive: str | None = None,
     ) -> dict:
-        """普通话水平测试评分。
+        """普通话朗读测评（讯飞流式语音评测）。
 
-        支持两种模式：
-        - text: 纯文本评测（旧版兼容）
-        - ai_generated: AI生成文本，用户朗读，对比原文评测发音
-        - free_speech: 用户自行发挥，评测口语表达
+        用户朗读 AI 生成的参考文本，录音由讯飞 ISE 引擎评测发音；
+        评分维度（百分制）：声韵（发音）、调型（声调）、流畅度、完整度；
+        评语与改进建议由 LLM 基于讯飞评测数据生成（失败则规则兜底）。
 
-        如果有音频数据，将音频发送给多模态LLM进行语音评测；
-        否则回退到纯文本评测。
+        前置要求：
+        - audio_base64: 16k/16bit/单声道 WAV（前端录音后已转码）
+        - text_content: 朗读参考文本（必填）
+        参数缺失、格式不符或讯飞调用失败时抛出异常，由 API 层转为错误响应。
         """
-        # 有音频数据时，使用多模态LLM进行语音评测
-        if audio_base64 and evaluation_mode in ("ai_generated", "free_speech"):
-            return await self._evaluate_with_audio(
-                audio_base64=audio_base64,
-                audio_format=audio_format,
-                test_level=test_level,
-                reference_text=text_content if evaluation_mode == "ai_generated" else "",
-                evaluation_mode=evaluation_mode,
-                personality_directive=personality_directive,
-            )
+        from app.services.xfyun_ise import XfyunIseClient, extract_pcm_from_wav
 
-        # 纯文本评测（旧版兼容 / 降级方案）
+        if not audio_base64:
+            raise ValueError("缺少录音数据")
+        if not text_content.strip():
+            raise ValueError("缺少朗读参考文本")
+        if audio_format not in ("wav", "pcm"):
+            raise ValueError(f"音频格式 {audio_format} 不支持评测（需 16k/16bit/单声道 wav/pcm）")
+        client = XfyunIseClient()
+        if not client.configured:
+            raise RuntimeError("讯飞评测鉴权信息未配置（XFYUN_APP_ID/API_KEY/API_SECRET）")
+
+        audio_bytes = base64.b64decode(audio_base64)
+        pcm = audio_bytes if audio_format == "pcm" else extract_pcm_from_wav(audio_bytes)
+        ise = await client.evaluate_reading(pcm, text_content, category="read_chapter")
+
+        total = ise["total_score"]
+        level = _mandarin_level(total)
+        result: dict = {
+            "engine": "xfyun_ise",
+            "total_score": total,
+            "dimension_scores": {
+                "pronunciation": ise["phone_score"],
+                "tone": ise["tone_score"],
+                "fluency": ise["fluency_score"],
+                "completeness": ise["integrity_score"],
+            },
+            "dimension_full_score": 100,
+            "transcribed_text": "",
+            "level": level,
+            "is_rejected": ise["is_rejected"],
+            "error_chars": ise["error_chars"],
+        }
+
+        # 基于讯飞评测数据由 LLM 生成评语与改进建议（失败则规则兜底）
+        error_hint = "、".join(ise["error_chars"]) if ise["error_chars"] else "无"
+        rejected_hint = "注意：检测到朗读内容与参考文本严重不符（乱读）。\n" if ise["is_rejected"] else ""
         prompt = (
-            f"请对以下普通话水平测试内容进行评分。\n"
-            f"目标等级：{test_level}\n"
-            f"测试分项：{test_part or '完整测试'}\n"
-            f"评分维度：语音标准度、词汇语法规范度、自然流畅度、内容完整度（各25分，总分100）\n"
-            f"评分严格度：{strict_level}/5（越高越严格）\n"
-            f"测试内容：{text_content[:500]}\n"
-            f"请返回JSON：{{\"total_score\": 85, \"dimension_scores\": "
-            f"{{\"pronunciation\": 22, \"grammar\": 21, \"fluency\": 20, \"completeness\": 22}}, "
-            f"\"suggestions\": \"改进建议...\", \"error_detail\": []}}"
+            f"学生完成了一次普通话朗读测评，以下是讯飞专业语音评测引擎的结果：\n"
+            f"总分：{total}/100（对应普通话等级：{level}，目标等级：{test_level}）\n"
+            f"声韵（发音）得分：{ise['phone_score']}/100\n"
+            f"调型（声调）得分：{ise['tone_score']}/100\n"
+            f"流畅度得分：{ise['fluency_score']}/100\n"
+            f"完整度得分：{ise['integrity_score']}/100\n"
+            f"朗读有误的字词：{error_hint}\n"
+            f"{rejected_hint}"
+            f"请根据以上数据给出综合评语和针对性的改进建议。\n"
+            f'请严格以JSON格式返回：{{"ai_comment": "50~120字综合评语", "suggestions": ["建议1", "建议2", "建议3"]}}'
         )
         if personality_directive:
-            # 用户自定义微调：性格/说话风格/评分严格度对所有批改生效
+            # 用户自定义微调：性格/说话风格对评语生效
             prompt = f"{personality_directive}\n\n{prompt}"
-        return await self._call_llm(prompt)
-
-    async def _evaluate_with_audio(
-        self, audio_base64: str, audio_format: str,
-        test_level: str, reference_text: str, evaluation_mode: str,
-        personality_directive: str | None = None,
-    ) -> dict:
-        """使用多模态LLM对录音进行语音评测。
-
-        将音频以 base64 格式发送给支持音频输入的LLM，
-        由LLM完成语音识别（STT）和发音评测。
-        """
-        # 构建多模态消息内容
-        content_parts: list[dict] = []
-
-        # 评测指令文本
-        if evaluation_mode == "ai_generated":
-            instruction = (
-                f"请仔细聆听以下普通话朗读录音，完成以下任务：\n"
-                f"1. 将录音内容转写为文字（transcribed_text）\n"
-                f"2. 对照以下参考文本，评测发音准确度：\n"
-                f"   参考文本：{reference_text}\n"
-                f"3. 从以下维度评分（各25分，总分100）：\n"
-                f"   - 语音标准度(pronunciation)：声母、韵母、声调是否准确\n"
-                f"   - 流畅度(fluency)：朗读是否连贯自然\n"
-                f"   - 完整度(completeness)：是否完整朗读了参考文本\n"
-                f"   - 语调自然度(intonation)：重音、停顿、语调是否自然\n"
-                f"目标普通话等级：{test_level}\n"
-                f"4. 给出具体的改进建议（suggestions，字符串列表）\n"
-                f"5. 给出综合评语（ai_comment，50~150字的总体评价）\n"
-                f"请严格以JSON格式返回："
-                f'{{"transcribed_text": "转写文本", "total_score": 85, '
-                f'"dimension_scores": {{"pronunciation": 22, "fluency": 21, "completeness": 20, "intonation": 22}}, '
-                f'"ai_comment": "综合评语...", "suggestions": ["建议1", "建议2"], "level": "二级甲等"}}'
-            )
+        comment_data = await self._call_llm(prompt)
+        if isinstance(comment_data, dict) and comment_data.get("ai_comment"):
+            result["ai_comment"] = comment_data["ai_comment"]
+            suggestions = comment_data.get("suggestions")
+            result["suggestions"] = suggestions if isinstance(suggestions, list) else []
         else:
-            instruction = (
-                f"请仔细聆听以下普通话口语录音，完成以下任务：\n"
-                f"1. 将录音内容转写为文字（transcribed_text）\n"
-                f"2. 从以下维度评分（各25分，总分100）：\n"
-                f"   - 语音标准度(pronunciation)：声母、韵母、声调是否准确\n"
-                f"   - 词汇语法规范度(grammar)：用词和语法是否规范\n"
-                f"   - 流畅度(fluency)：表达是否连贯自然\n"
-                f"   - 内容完整度(completeness)：内容是否充实、逻辑清晰\n"
-                f"目标普通话等级：{test_level}\n"
-                f"3. 给出具体的改进建议（suggestions，字符串列表）\n"
-                f"4. 给出综合评语（ai_comment，50~150字的总体评价）\n"
-                f"请严格以JSON格式返回："
-                f'{{"transcribed_text": "转写文本", "total_score": 85, '
-                f'"dimension_scores": {{"pronunciation": 22, "grammar": 21, "fluency": 20, "completeness": 22}}, '
-                f'"ai_comment": "综合评语...", "suggestions": ["建议1", "建议2"], "level": "二级甲等"}}'
+            # LLM 不可用时的规则兜底评语
+            result["ai_comment"] = (
+                f"本次朗读总分{total}分，达到{level}水平。"
+                + (f"以下字词发音有误：{error_hint}，建议加强练习。" if ise["error_chars"] else "发音整体较为准确，继续保持。")
             )
-
-        content_parts.append({"type": "text", "text": instruction})
-        if personality_directive:
-            # 用户自定义微调：性格/说话风格/评分严格度对所有批改生效
-            content_parts.insert(0, {"type": "text", "text": personality_directive})
-
-        # 音频内容（使用 audio_url 格式，兼容多数 OpenAI 兼容 API）
-        mime_type = f"audio/{audio_format}" if audio_format != "mp3" else "audio/mpeg"
-        audio_data_url = f"data:{mime_type};base64,{audio_base64}"
-        content_parts.append({
-            "type": "audio_url",
-            "audio_url": {"url": audio_data_url},
-        })
-
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": content_parts}],
-                max_tokens=2000,
-                temperature=0.3,
-                response_format={"type": "json_object"},
-                timeout=180,
-            )
-            result = json.loads(response.choices[0].message.content or "{}")
-            # 确保必要字段存在
-            result.setdefault("transcribed_text", "")
-            result.setdefault("ai_comment", "")
-            result.setdefault("total_score", 0)
-            result.setdefault("dimension_scores", {})
-            result.setdefault("suggestions", [])
-            result.setdefault("level", test_level)
-            return result
-        except Exception as e:
-            logger.error("音频评测LLM调用失败: %s", e)
-            # 降级：返回错误信息，但保留音频文件供后续查看
-            return {
-                "transcribed_text": "",
-                "total_score": 0,
-                "dimension_scores": {},
-                "suggestions": [],
-                "ai_comment": f"音频评测失败（{str(e)[:100]}），请确认LLM模型支持音频输入，或联系管理员。",
-                "level": test_level,
-                "error": str(e),
-            }
+            result["suggestions"] = []
+        return result
 
     # ============ 工具方法 ============
 
     async def _call_llm(self, prompt: str, max_tokens: int = 1500) -> dict:
-        """调用 LLM 并解析 JSON 响应"""
-        try:
-            response = await self.client.chat.completions.create(
-                model=self.model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=max_tokens,
-                temperature=0.6,
-                response_format={"type": "json_object"},
-                timeout=120,
-            )
-            return json.loads(response.choices[0].message.content or "{}")
-        except Exception as e:
-            logger.error("口语服务LLM调用失败: %s", e)
-            return {"error": str(e)}
+        """调用 LLM 并解析 JSON 响应（失败自动重试 1 次）。
+
+        LLM 服务存在偶发失败（网络抖动、5xx、返回非 JSON），
+        直接失败会让用户看到"生成失败"甚至长时间无响应，
+        重试一次可将成功率提升到接近 100%，代价仅多等 1 秒。
+        """
+        last_error: Exception | None = None
+        for attempt in range(2):
+            try:
+                response = await self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[{"role": "user", "content": prompt}],
+                    max_tokens=max_tokens,
+                    temperature=0.6,
+                    response_format={"type": "json_object"},
+                    timeout=120,
+                )
+                content = response.choices[0].message.content or "{}"
+                data = json.loads(content)
+                if isinstance(data, dict):
+                    return data
+                last_error = ValueError("LLM 返回内容不是 JSON 对象")
+            except Exception as e:
+                last_error = e
+                logger.warning("口语服务LLM调用失败(第 %d 次): %s", attempt + 1, e)
+                if attempt == 0:
+                    await asyncio.sleep(1)
+        logger.error("口语服务LLM调用最终失败: %s", last_error)
+        return {"error": str(last_error)}

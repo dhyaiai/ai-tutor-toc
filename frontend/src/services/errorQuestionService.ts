@@ -6,6 +6,8 @@ export interface SubQuestionItem {
   id: number;
   sub_question_index: number;
   question_type: string | null;
+  /** 识别出的题干文本（含 $...$ 包裹的 LaTeX 公式，KaTeX 渲染） */
+  question_text?: string | null;
   student_answer: string | null;
   correct_answer: string | null;
   score: number | null;
@@ -20,9 +22,15 @@ export interface ErrorQuestionItem {
   id: number;
   assignment_id: number;
   assignment_name: string;
+  /** 年级（来自所属作业，收藏页展示用） */
+  grade?: string;
+  /** 科目（来自所属作业，收藏页展示用） */
+  subject?: string;
   question_number: number;
   question_type: string | null;
   image_url: string;
+  /** 识别出的题干文本（含 $...$ 包裹的 LaTeX 公式，KaTeX 渲染） */
+  question_text?: string | null;
   student_answer: string | null;
   correct_answer: string | null;
   score: number | null;
@@ -40,6 +48,8 @@ export interface ErrorQuestionItem {
   error_count?: number;
   /** 大题下总小题数 */
   total_count?: number;
+  /** 是否已收藏（收藏按钮初始状态回显） */
+  is_favorited?: boolean;
 }
 
 export const errorQuestionService = {

@@ -10,7 +10,7 @@
 """
 
 from datetime import datetime
-from sqlalchemy import String, Integer, DateTime, ForeignKey
+from sqlalchemy import String, Integer, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 from app.db.session import Base
 
@@ -27,6 +27,9 @@ class UserKnowledgeState(Base):
     - last_practice_time 和 update_time 分开记录，前者记录实际练习时间，后者记录更新时间
     """
     __tablename__ = "user_knowledge_state"
+    __table_args__ = (
+        UniqueConstraint("user_id", "subject", "point_name", name="uq_knowledge_state_user_subject_point"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     user_id: Mapped[int] = mapped_column(

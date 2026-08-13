@@ -1,7 +1,7 @@
 /**
  * 助教性格配置 API 服务
  *
- * 封装自定义微调配置（性格类型/说话风格/评分严格度）的查询与更新操作。
+ * 封装自定义微调配置（性格类型/说话风格/语音音色/评分严格度）的查询与更新操作。
  * 配置对系统内所有 AI 批改统一生效。
  * 所有请求通过 api 实例自动携带 JWT token。
  */
@@ -14,6 +14,8 @@ export interface PersonalityConfig {
   user_id: number;
   personality_type: string;
   speaking_style: string;
+  /** 语音音色：male/female，对助教讲解/英语听力/单词听写的 TTS 播报生效 */
+  voice_tone: string;
   strict_level: number;
   update_time?: string | null;
 }

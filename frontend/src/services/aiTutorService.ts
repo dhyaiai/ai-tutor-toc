@@ -1,13 +1,7 @@
-const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api/v1";
+import api from "./api";
+import { authedFetch } from "../utils/authedFetch";
 
-/** 获取带认证头的请求配置 */
-function authHeaders(): Record<string, string> {
-  const token = localStorage.getItem("access_token");
-  return {
-    "Content-Type": "application/json",
-    ...(token ? { Authorization: `Bearer ${token}` } : {}),
-  };
-}
+const API_BASE = import.meta.env.VITE_API_BASE_URL || "/api/v1";
 
 export interface SSECallbacks {
   onReasoning?: (content: string) => void;
@@ -18,32 +12,32 @@ export interface SSECallbacks {
   onDone?: () => void;
 }
 
-// ============ 分步讲解相关 ============
+// ============ 完整讲解 + 思考题相关 ============
 
-/** 分步讲解请求参数 */
+/** 完整讲解请求参数 */
 export interface ExplainRequest {
   exercise_content: string;
   subject?: string;
   explanation_style?: "分步引导式" | "直接讲解式" | "基础科普式";
-  card_mode?: boolean;
   strict_level?: number;
+  /**
+   * 关联题目 ID：后端据此读取该题的切割原图（含题干）喂给视觉模型，
+   * 让 AI 真正看到题目，避免"讲一道看不见的题"
+   */
+  question_id?: number;
 }
 
-/** 分步讲解步骤 */
-export interface ExplainStep {
-  step_number: number;
-  title: string;
-  content: string;
-  key_point: string;
-  follow_up_question: string;
-}
-
-/** 分步讲解结果 */
+/** 完整讲解结果：讲解文本 + 一道思考题 */
 export interface ExplainResult {
   knowledge_points: string[];
-  total_steps: number;
-  steps: ExplainStep[];
-  final_summary: string;
+  explanation: string;
+  thinking_question: string;
+}
+
+/** 思考题判题结果 */
+export interface ThinkingCheckResult {
+  verdict: "correct" | "partial" | "wrong";
+  feedback: string;
 }
 
 /** 讲解反馈请求 */
@@ -55,113 +49,68 @@ export interface FeedbackRequest {
 }
 
 /**
- * 获取单题分步讲解
- * 直接调用 Agent 的 explain_exercise 工具
+ * 获取单题完整讲解（含思考题）
+ * 调用后端 /ai-tutor/explain 直连接口（不经过 Agent，返回结构化 JSON）
  */
 export async function explainExercise(
   params: ExplainRequest
 ): Promise<ExplainResult> {
-  // 通过 chat 接口以工具调用模式触发讲解
-  const token = localStorage.getItem("access_token");
-  const message = `请对以下题目进行分步讲解：\n\n${params.exercise_content}\n\n学科：${params.subject || "未知"}\n讲解风格：${params.explanation_style || "分步引导式"}`;
-
-  const response = await fetch(`${API_BASE}/ai-tutor/chat`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      message,
-      history: [],
-      context: { subject: params.subject },
-    }),
+  const { data } = await api.post("/ai-tutor/explain", {
+    exercise_content: params.exercise_content,
+    subject: params.subject || "未知",
+    explanation_style: params.explanation_style || "直接讲解式",
+    strict_level: params.strict_level ?? 3,
+    // 题目 ID 可选：有则后端附带切割原图做多模态讲解（无公式科目开放）
+    question_id: params.question_id ?? undefined,
   });
-
-  if (!response.ok) {
-    throw new Error(`讲解请求失败: HTTP ${response.status}`);
-  }
-
-  // 从 SSE 流中收集讲解步骤
-  const reader = response.body?.getReader();
-  if (!reader) throw new Error("无法读取响应");
-
-  const decoder = new TextDecoder();
-  let buffer = "";
-  const steps: ExplainStep[] = [];
-  let knowledgePoints: string[] = [];
-  let finalSummary = "";
-  let assistantContent = "";
-
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
-
-    for (const line of lines) {
-      if (line.startsWith("data: ")) {
-        try {
-          const event = JSON.parse(line.slice(6));
-          if (event.type === "token") {
-            assistantContent += event.content || "";
-          }
-        } catch {
-          // 跳过解析失败的事件
-        }
-      }
-    }
-  }
-
-  // 尝试从 assistant 回复中解析 JSON
-  try {
-    // 提取 JSON 块
-    const jsonMatch = assistantContent.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      const data = JSON.parse(jsonMatch[0]);
-      knowledgePoints = data.knowledge_points || [];
-      steps.push(
-        ...(data.steps || []).map((s: Record<string, unknown>, i: number) => ({
-          step_number: (s.step_number as number) || i + 1,
-          title: (s.title as string) || "",
-          content: (s.content as string) || "",
-          key_point: (s.key_point as string) || "",
-          follow_up_question: (s.follow_up_question as string) || "",
-        }))
-      );
-      finalSummary = (data.final_summary as string) || "";
-    }
-  } catch {
-    // JSON 解析失败，使用原始文本
-  }
-
   return {
-    knowledge_points: knowledgePoints,
-    total_steps: steps.length,
-    steps,
-    final_summary: finalSummary || assistantContent.slice(0, 200) || "讲解已完成",
+    knowledge_points: data.knowledge_points || [],
+    explanation: data.explanation || "",
+    thinking_question: data.thinking_question || "",
   };
 }
 
 /**
- * 记录讲解反馈
- * 调用后端 record_mastery_feedback 工具
+ * 提交思考题回答并判题
+ * 后端 LLM 自行解题后对比判定，参考答案不经过前端
+ */
+export async function checkThinkingAnswer(params: {
+  exercise_content: string;
+  thinking_question: string;
+  user_answer: string;
+  subject?: string;
+}): Promise<ThinkingCheckResult> {
+  const { data } = await api.post("/ai-tutor/explain/check", {
+    exercise_content: params.exercise_content,
+    thinking_question: params.thinking_question,
+    user_answer: params.user_answer,
+    subject: params.subject || "未知",
+  });
+  return {
+    verdict: data.verdict === "correct" || data.verdict === "wrong" ? data.verdict : "partial",
+    feedback: data.feedback || "",
+  };
+}
+
+/**
+ * 记录讲解反馈（直接更新知识点掌握状态）
+ *
+ * 走后端专用接口 /ai-tutor/feedback，直接调用 KnowledgeTracker 落库，
+ * 不经过 Agent 聊天链路——原实现把反馈伪装成一条聊天消息发给 /chat，
+ * 会触发一轮完整 ReAct（耗时且反馈是否真正记录取决于 Agent 是否恰好调用工具）。
+ * 失败时抛错，调用方需提示用户重试。
  */
 export async function recordFeedback(params: FeedbackRequest): Promise<void> {
-  const token = localStorage.getItem("access_token");
-  await fetch(`${API_BASE}/ai-tutor/chat`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify({
-      message: `记录反馈：知识点"${params.knowledge_point}"，反馈"${params.feedback_level}"`,
-      history: [],
-    }),
+  await api.post("/ai-tutor/feedback", {
+    knowledge_point: params.knowledge_point,
+    feedback_level: params.feedback_level,
+    question_id: params.question_id || null,
+    session_id: params.session_id || null,
   });
 }
+
+/** SSE 流空闲超时（毫秒）：4 分钟无任何事件判定为挂死并中断 */
+const STREAM_IDLE_TIMEOUT_MS = 4 * 60 * 1000;
 
 export async function streamChat(
   message: string,
@@ -171,21 +120,43 @@ export async function streamChat(
   signal?: AbortSignal,
   sessionId?: number,
 ): Promise<void> {
-  const token = localStorage.getItem("access_token");
   const body: Record<string, unknown> = { message, history, context };
   // 如果传入了 session_id，附带到请求中，后端会自动保存消息到对应会话
   if (sessionId) {
     body.session_id = sessionId;
   }
-  const response = await fetch(`${API_BASE}/ai-tutor/chat`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${token}`,
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
+
+  // 内部 AbortController：链接触入的 signal（停止按钮仍生效），
+  // 额外用于空闲超时中断——reader.read() 本身没有超时，服务端挂起会无限等待
+  const internal = new AbortController();
+  if (signal) {
+    if (signal.aborted) {
+      internal.abort();
+    } else {
+      signal.addEventListener("abort", () => internal.abort(), { once: true });
+    }
+  }
+
+  let response: Response;
+  try {
+    // 走 authedFetch：自动附加 Bearer token + 401 自动刷新重放，
+    // 避免 access token 过期后聊天主流程直接 "HTTP 401" 失败
+    response = await authedFetch(`${API_BASE}/ai-tutor/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(body),
+      signal: internal.signal,
+    });
+  } catch {
+    // 用户主动停止/空闲超时中断：静默返回（用户已知情）
+    if (internal.signal.aborted) return;
+    // 网络层失败（后端不可达）：必须提示，否则 AI 气泡显示空回复，
+    // 用户会以为是 AI 没说话
+    callbacks.onError?.("网络连接失败，请检查网络后重试");
+    return;
+  }
 
   if (!response.ok) {
     callbacks.onError?.(`HTTP ${response.status}`);
@@ -197,43 +168,72 @@ export async function streamChat(
 
   const decoder = new TextDecoder();
   let buffer = "";
+  let timedOut = false;
+  let lastEventAt = Date.now();
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  // 空闲检测定时器：周期检查距上次收到事件的时间，超过阈值则中断请求
+  const idleTimer = setInterval(() => {
+    if (Date.now() - lastEventAt > STREAM_IDLE_TIMEOUT_MS) {
+      timedOut = true;
+      internal.abort();
+    }
+  }, 5000);
 
-    buffer += decoder.decode(value, { stream: true });
-    const lines = buffer.split("\n");
-    buffer = lines.pop() || "";
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
 
-    for (const line of lines) {
-      if (line.startsWith("data: ")) {
-        try {
-          const event = JSON.parse(line.slice(6));
-          switch (event.type) {
-            case "reasoning":
-              callbacks.onReasoning?.(event.content);
-              break;
-            case "tool_call":
-              callbacks.onToolCall?.(event.name, event.args);
-              break;
-            case "tool_result":
-              callbacks.onToolResult?.(event.name, event.summary);
-              break;
-            case "token":
-              callbacks.onToken?.(event.content);
-              break;
-            case "error":
-              callbacks.onError?.(event.content);
-              break;
-            case "done":
-              callbacks.onDone?.();
-              break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          // 收到任何事件都重置空闲计时
+          lastEventAt = Date.now();
+          try {
+            const event = JSON.parse(line.slice(6));
+            switch (event.type) {
+              case "reasoning":
+                callbacks.onReasoning?.(event.content);
+                break;
+              case "tool_call":
+                callbacks.onToolCall?.(event.name, event.args);
+                break;
+              case "tool_result":
+                callbacks.onToolResult?.(event.name, event.summary);
+                break;
+              case "token":
+                callbacks.onToken?.(event.content);
+                break;
+              case "error":
+                callbacks.onError?.(event.content);
+                break;
+              case "done":
+                callbacks.onDone?.();
+                break;
+            }
+          } catch {
+            // skip malformed events
           }
-        } catch {
-          // skip malformed events
         }
       }
     }
+  } catch {
+    // 流被中断。三种情况：
+    // - 空闲超时（timedOut=true）：下方统一提示
+    // - 用户主动停止（signal.aborted）：静默返回
+    // - 其他（连接中途断开）：明确提示，避免界面永远停在"执行中"转圈
+    if (!timedOut && !internal.signal.aborted) {
+      callbacks.onError?.("连接中断，回复可能不完整，请重试");
+    }
+  } finally {
+    clearInterval(idleTimer);
+  }
+
+  // 空闲超时中断时给出明确提示，避免用户看到"无响应"却不知道为什么
+  if (timedOut) {
+    callbacks.onError?.("长时间未收到响应，已中断，请重试");
   }
 }

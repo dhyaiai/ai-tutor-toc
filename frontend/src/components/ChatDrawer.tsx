@@ -37,8 +37,12 @@ import {
   FileTextOutlined,
   BookOutlined,
   LineChartOutlined,
+  CalendarOutlined,
+  StopOutlined,
 } from "@ant-design/icons";
 import { streamChat } from "../services/aiTutorService";
+import api from "../services/api";
+import { parseImageSize } from "./MarkdownPreview";
 import {
   conversationService,
   type ConversationListItem,
@@ -47,6 +51,85 @@ import {
 
 /** 消息文本中的 URL/文件链接正则 */
 const FILE_URL_REGEX = /(\/api\/v1\/files\/[^\s<>"'\]\)]+)/g;
+
+/**
+ * 工具名称 → 中文进度文案。
+ * AI 调用工具时在消息气泡内展示执行进度，让用户看到 AI 正在做什么，
+ * 而不是只有"思考中"转圈（此前工具调用全程无感知，长任务像卡死）。
+ */
+const TOOL_STEP_LABELS: Record<string, string> = {
+  generate_analysis_report: "正在生成学情分析报告（约需1分钟）",
+  generate_correction_workbook: "正在整理错题订正本",
+  generate_study_plan: "正在制定学习计划",
+  get_assignment_score: "正在查询作业成绩统计",
+  get_error_knowledge: "正在查询错题知识点分布",
+  get_score_trend: "正在查询分数趋势",
+  query_knowledge_state: "正在查询知识点掌握度",
+  correct_composition: "正在批改作文",
+  explain_exercise: "正在讲解题目",
+  update_knowledge_state: "正在更新知识点状态",
+  record_mastery_feedback: "正在记录学习反馈",
+};
+
+/**
+ * 点击时经带自动刷新 token 的 axios 实例拉取文件流后在新标签页打开。
+ * 链接 href 不再拼接 ?token=：JWT 放进 URL 会落入 uvicorn 访问日志、
+ * 浏览器历史与 Referer 头，泄露后可被整串重放冒充用户。
+ * 正常点击走本函数（axios 自动带 Authorization 头 + 401 自动刷新）；
+ * 之前的做法是渲染时把 access_token 拼进 href，token 30 分钟过期后
+ * 再点击链接会得到 401；改为点击时请求可确保凭证新鲜（401 自动刷新）。
+ */
+// 模块级 Blob URL 清理定时器（openFileLink 在模块作用域，无法访问组件 ref）
+let _blobRevokeTimer: ReturnType<typeof setTimeout> | null = null;
+// 追踪当前未回收的 Blob URL，确保清理时能正确撤销
+let _pendingBlobUrl: string | null = null;
+
+/**
+ * 撤销待清理的 Blob URL（供组件卸载时调用，防止内存泄漏）
+ */
+export function revokePendingBlobUrl(): void {
+  if (_blobRevokeTimer) {
+    clearTimeout(_blobRevokeTimer);
+    _blobRevokeTimer = null;
+  }
+  if (_pendingBlobUrl) {
+    URL.revokeObjectURL(_pendingBlobUrl);
+    _pendingBlobUrl = null;
+  }
+}
+
+async function openFileLink(url: string) {
+  // 先同步打开空白窗口，避免异步请求完成后 window.open 被浏览器拦截
+  const win = window.open("", "_blank");
+  try {
+    const [base, query] = url.split("?");
+    const params = new URLSearchParams(query || "");
+    params.delete("token"); // 移除历史消息中可能残留的过期 token（后端优先读查询参数）
+    const q = params.toString();
+    // api 实例的 baseURL 已含 /api/v1，去掉前缀避免重复拼接
+    const path = base.replace(/^\/api\/v1/, "") + (q ? `?${q}` : "");
+    const res = await api.get(path, { responseType: "blob" });
+    const blobUrl = URL.createObjectURL(res.data as Blob);
+    if (win) {
+      win.location.href = blobUrl;
+    } else {
+      window.open(blobUrl, "_blank");
+    }
+    // 清理旧的 Blob URL 定时器，设置新的清理任务
+    if (_blobRevokeTimer) clearTimeout(_blobRevokeTimer);
+    _pendingBlobUrl = blobUrl;
+    _blobRevokeTimer = setTimeout(() => {
+      if (_pendingBlobUrl) {
+        URL.revokeObjectURL(_pendingBlobUrl);
+        _pendingBlobUrl = null;
+      }
+      _blobRevokeTimer = null;
+    }, 60_000);
+  } catch {
+    win?.close();
+    message.error("文件打开失败，请刷新页面或重新登录后重试");
+  }
+}
 
 /**
  * 预处理 markdown 文本：将纯文本的文件路径转为 markdown 链接。
@@ -79,10 +162,15 @@ function renderUserMessage(text: string): React.ReactNode {
       result.push(<span key={`t-${i}`}>{part}</span>);
     }
     if (matchIndex < matches.length) {
+      const fileUrl = matches[matchIndex];
       result.push(
         <a
           key={`link-${matchIndex}`}
-          href={matches[matchIndex]}
+          href={fileUrl}
+          onClick={(e) => {
+            e.preventDefault();
+            void openFileLink(fileUrl);
+          }}
           target="_blank"
           rel="noopener noreferrer"
           style={{ color: "#fff", textDecoration: "underline" }}
@@ -97,12 +185,31 @@ function renderUserMessage(text: string): React.ReactNode {
   return <>{result}</>;
 }
 
+/** AI 工具调用的进度步骤（流式实时展示） */
+interface ToolStep {
+  name: string;
+  status: "running" | "done" | "error";
+  /** 工具执行结果摘要（来自 tool_result 事件，后端已截断为 200 字符） */
+  summary?: string;
+}
+
 /** 前端消息数据结构（与后端 ConversationMessage 对应） */
 interface Message {
+  /** 稳定唯一标识，用于 React key，避免流式更新时 DOM 重建 */
+  id: string;
   role: "user" | "assistant";
   content: string;
   reasoning?: string;
   toolCalls?: string[];
+  /** 本次流式的工具步骤展示（可选字段，历史消息无此数据时不影响渲染） */
+  toolSteps?: ToolStep[];
+}
+
+let _msgIdCounter = 0;
+
+/** 生成稳定唯一消息 ID */
+function nextMsgId(): string {
+  return `msg-${Date.now()}-${++_msgIdCounter}`;
 }
 
 interface Props {
@@ -135,19 +242,54 @@ export default function ChatDrawer({ open, onClose }: Props) {
   const [editingTitleId, setEditingTitleId] = useState<number | null>(null);
   const [editingTitle, setEditingTitle] = useState("");
 
-  /** 流式响应中断控制器 */
+    /** 流式响应中断控制器 */
   const abortRef = useRef<AbortController | null>(null);
+  /** Blob URL 清理定时器 ID（组件卸载时清除） */
+  const revokeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /**
+   * 当前流式请求归属的会话ID（跨会话守卫）。
+   * 发起请求时记录；切换/新建/关闭会话时由 stopStream 置空，
+   * SSE 回调中先校验此值，确保旧会话的流不会污染新会话的消息。
+   */
+  const activeSessionRef = useRef<number | null>(null);
   /** 思考过程累积（避免闭包陷阱） */
   const reasoningRef = useRef("");
   /** 工具调用累积 */
   const toolCallsRef = useRef<string[]>([]);
+  /** 工具步骤累积（含状态与摘要，供流式过程实时渲染） */
+  const toolStepsRef = useRef<ToolStep[]>([]);
   /** 消息列表 ref（用于在回调中获取最新值） */
   const messagesRef = useRef<Message[]>([]);
+  // 指向"最新"的 updateSessionAfterChat 实现（每次渲染后同步）：
+  // handleSend 依赖数组不包含它（避免声明顺序 TDZ），但流结束回调必须调用最新版，
+  // 否则首次对话把标题从"新对话"改为前30字后，第二轮对话仍持有旧闭包，
+  // 会把标题再次覆盖成新消息的前 30 字（用户手动改名同样会被覆盖）。
+  const updateSessionAfterChatRef = useRef<((text: string) => Promise<void>) | null>(null);
 
   // 同步 messages 到 ref
   useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
+
+  /**
+   * 终止当前流式请求并复位相关状态。
+   *
+   * 点击停止按钮、切换会话、新建会话时调用（关闭抽屉即最小化时不调用，
+   * 正在生成的对话需在后台继续存活）。
+   * 先失效会话守卫（activeSessionRef），让在途的 SSE 回调全部被忽略，
+   * 再 abort 请求并复位 loading，保证一个会话的生成状态不会影响另一个会话。
+   */
+  const stopStream = useCallback(() => {
+    activeSessionRef.current = null; // 失效守卫，后续流式回调全部忽略
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setLoading(false);
+    setCurrentReasoning("");
+    setCurrentToolCalls([]);
+    reasoningRef.current = "";
+    toolCallsRef.current = [];
+    toolStepsRef.current = [];
+  }, []);
 
   // ============ 会话数据加载 ============
 
@@ -187,6 +329,7 @@ export default function ChatDrawer({ open, onClose }: Props) {
       setCurrentTitle(detail.title);
       // 将后端消息格式映射为前端 Message 格式
       const msgs: Message[] = detail.messages.map((m: ConversationMessage) => ({
+        id: m.id ? `hist-${m.id}` : nextMsgId(),
         role: m.role as "user" | "assistant",
         content: m.content,
         reasoning: m.reasoning || undefined,
@@ -225,16 +368,28 @@ export default function ChatDrawer({ open, onClose }: Props) {
     }
   }, [open, loadSessions]);
 
-  // 关闭抽屉时清理状态
+  // 关闭抽屉（最小化）时不再终止在途流式请求：
+  // 点击网页其他区域/遮罩关闭抽屉只是收起界面，正在生成的对话必须在后台继续存活，
+  // 重新打开抽屉后仍能看到完整回复，不能因最小化而中断。
+  // 主动停止（停止按钮/切换会话/新建会话）仍走 stopStream。
+
+  // 组件真正卸载时（退出登录/页面切换/路由销毁）终止在途流式请求：
+  // Drawer 收起（open=false）并不卸载组件，因此上面的"最小化不中断"设计不受影响；
+  // 只有组件被销毁时才需要 abort，避免连接与回调在组件销毁后继续运行。
   useEffect(() => {
-    if (!open) {
-      // 关闭时不清除 currentSessionId，下次打开时可以恢复
-      setCurrentReasoning("");
-      setCurrentToolCalls([]);
-      reasoningRef.current = "";
-      toolCallsRef.current = [];
-    }
-  }, [open]);
+    return () => {
+      activeSessionRef.current = null; // 失效会话守卫，让在途 SSE 回调全部被忽略
+      abortRef.current?.abort();
+      abortRef.current = null;
+      // 清理未执行的 Blob URL 撤销定时器
+      if (revokeTimerRef.current) {
+        clearTimeout(revokeTimerRef.current);
+        revokeTimerRef.current = null;
+      }
+      // 清理模块级 Blob URL 撤销定时器（防止内存泄漏）
+      revokePendingBlobUrl();
+    };
+  }, []);
 
   // ============ 消息发送 ============
 
@@ -256,6 +411,7 @@ export default function ChatDrawer({ open, onClose }: Props) {
     setCurrentToolCalls([]);
     reasoningRef.current = "";
     toolCallsRef.current = [];
+    toolStepsRef.current = [];
 
     // 构建对话历史（最近10轮，防止 token 过长）
     const history = messagesRef.current
@@ -263,32 +419,74 @@ export default function ChatDrawer({ open, onClose }: Props) {
       .map((m) => ({ role: m.role, content: m.content }));
 
     // 追加用户消息到界面
-    const userMsg: Message = { role: "user", content: text };
+    const userMsg: Message = { id: nextMsgId(), role: "user", content: text };
     const newMessages = [...messagesRef.current, userMsg];
     setMessages(newMessages);
 
     // AI 回复占位
-    const assistantMsg: Message = { role: "assistant", content: "" };
+    const assistantMsg: Message = { id: nextMsgId(), role: "assistant", content: "" };
     setMessages([...newMessages, assistantMsg]);
+
+    // 记录本次请求归属的会话，流式回调据此做跨会话守卫
+    const sessionIdAtSend = currentSessionId;
+    activeSessionRef.current = sessionIdAtSend;
 
     setLoading(true);
     const controller = new AbortController();
     abortRef.current = controller;
 
+    // 注意：不使用绝对超时。aiTutorService 已实现空闲超时（距上次事件 > 4 分钟则终止），
+    // 工具执行（报告/学习计划/订正本）最长需要 180s，绝对超时会导致这些工具被误杀。
     try {
       await streamChat(
         text,
         history,
         {
           onReasoning: (content) => {
+            // 会话守卫：若期间切换/新建了会话，忽略旧流的事件
+            if (activeSessionRef.current !== sessionIdAtSend) return;
             reasoningRef.current += content;
             setCurrentReasoning((prev) => prev + content);
           },
           onToolCall: (name) => {
+            // 会话守卫：若期间切换/新建了会话，忽略旧流的事件
+            if (activeSessionRef.current !== sessionIdAtSend) return;
             toolCallsRef.current = [...toolCallsRef.current, name];
             setCurrentToolCalls((prev) => [...prev, name]);
+            // 追加 running 步骤并实时写入最后一条消息，让用户在工具执行期间看到进度
+            toolStepsRef.current = [
+              ...toolStepsRef.current,
+              { name, status: "running" },
+            ];
+            setMessages((prev) =>
+              prev.map((msg, idx) =>
+                idx === prev.length - 1 && msg.role === "assistant"
+                  ? { ...msg, toolSteps: [...toolStepsRef.current] }
+                  : msg
+              )
+            );
+          },
+          onToolResult: (name, summary) => {
+            // 会话守卫：若期间切换/新建了会话，忽略旧流的事件
+            if (activeSessionRef.current !== sessionIdAtSend) return;
+            // 把最后一条同名 running 步骤标记为 done（同一工具可能多轮调用）
+            const steps = [...toolStepsRef.current];
+            const idx = steps.map((s) => s.name).lastIndexOf(name);
+            if (idx !== -1 && steps[idx].status === "running") {
+              steps[idx] = { ...steps[idx], status: "done", summary };
+            }
+            toolStepsRef.current = steps;
+            setMessages((prev) =>
+              prev.map((msg, i) =>
+                i === prev.length - 1 && msg.role === "assistant"
+                  ? { ...msg, toolSteps: [...steps] }
+                  : msg
+              )
+            );
           },
           onToken: (content) => {
+            // 会话守卫：若期间切换/新建了会话，忽略旧流的事件
+            if (activeSessionRef.current !== sessionIdAtSend) return;
             setMessages((prev) =>
               prev.map((msg, idx) =>
                 idx === prev.length - 1 && msg.role === "assistant"
@@ -298,35 +496,53 @@ export default function ChatDrawer({ open, onClose }: Props) {
             );
           },
           onDone: () => {
-            // 将累积的 reasoning 和 toolCalls 写入最后一条消息
+            // 会话守卫：若期间切换/新建了会话，忽略旧流的事件
+            if (activeSessionRef.current !== sessionIdAtSend) return;
+            // 将累积的 reasoning 和 toolCalls 写入最后一条消息（toolSteps 已在流中实时写入）
+            // 注意：必须返回新对象而非修改旧对象，避免 React state mutation
             setMessages((prev) => {
-              const updated = [...prev];
-              const last = updated[updated.length - 1];
-              if (last && last.role === "assistant") {
-                last.reasoning =
-                  reasoningRef.current || undefined;
-                last.toolCalls =
-                  toolCallsRef.current.length > 0
+              const last = prev[prev.length - 1];
+              if (!last || last.role !== "assistant") return prev;
+              return [
+                ...prev.slice(0, -1),
+                {
+                  ...last,
+                  reasoning: reasoningRef.current || undefined,
+                  toolCalls: toolCallsRef.current.length > 0
                     ? [...toolCallsRef.current]
-                    : undefined;
-              }
-              return [...updated];
+                    : undefined,
+                  toolSteps: toolStepsRef.current.length > 0
+                    ? [...toolStepsRef.current]
+                    : undefined,
+                },
+              ];
             });
 
             // 后端 SSE stream 已在 done 事件时自动保存了消息，前端不再重复保存
             // 只需更新会话标题（首次对话时）和刷新会话列表
             if (currentSessionId) {
-              updateSessionAfterChat(text);
+              updateSessionAfterChatRef.current?.(text);
             }
           },
           onError: (error) => {
+            // 会话守卫：若期间切换/新建了会话，忽略旧流的事件
+            if (activeSessionRef.current !== sessionIdAtSend) return;
+            // 将仍在 running 的工具步骤标记为 error，避免界面残留"转圈"假象
+            const steps = toolStepsRef.current.map((s) =>
+              s.status === "running" ? { ...s, status: "error" as const } : s
+            );
+            toolStepsRef.current = steps;
             setMessages((prev) => {
               const updated = [...prev];
               const last = updated[updated.length - 1];
               if (last && last.role === "assistant") {
-                last.content = `[错误] ${error}`;
+                updated[updated.length - 1] = {
+                  ...last,
+                  toolSteps: steps.length > 0 ? [...steps] : undefined,
+                  content: `[错误] ${error}`,
+                };
               }
-              return [...updated];
+              return updated;
             });
           },
         },
@@ -338,9 +554,14 @@ export default function ChatDrawer({ open, onClose }: Props) {
     } catch {
       // 用户取消或网络错误，静默处理
     } finally {
-      setLoading(false);
+      // 仅当本会话仍活跃时才复位 loading（切换/新建会话时已由 stopStream 复位）
+      if (activeSessionRef.current === sessionIdAtSend) {
+        setLoading(false);
+      }
       abortRef.current = null;
     }
+    // 依赖无需包含 updateSessionAfterChat：通过 ref 始终调用最新实现，
+    // 避免声明顺序（handleSend 在前）造成 TDZ，同时根治标题重复覆盖问题
   }, [input, loading, currentSessionId]);
 
   /**
@@ -373,6 +594,12 @@ export default function ChatDrawer({ open, onClose }: Props) {
     [currentSessionId, currentTitle]
   );
 
+  // 同步最新实现到 ref（标题更新后 currentTitle 变化 → updateSessionAfterChat
+  // 重建 → 本 effect 刷新 ref，handleSend 无需重建也能拿到最新版）
+  useEffect(() => {
+    updateSessionAfterChatRef.current = updateSessionAfterChat;
+  }, [updateSessionAfterChat]);
+
   // ============ 会话操作 ============
 
   /**
@@ -382,6 +609,9 @@ export default function ChatDrawer({ open, onClose }: Props) {
   const switchSession = useCallback(
     async (sessionId: number) => {
       if (sessionId === currentSessionId) return;
+
+      // 先终止当前会话的流式请求，防止其状态/回调影响目标会话
+      stopStream();
 
       // 后端在每次 SSE 对话完成时已自动保存消息，直接切换即可
       // 加载目标会话
@@ -393,7 +623,7 @@ export default function ChatDrawer({ open, onClose }: Props) {
         setSessions(list);
       } catch {}
     },
-    [currentSessionId, loadSession]
+    [currentSessionId, loadSession, stopStream]
   );
 
   /**
@@ -401,6 +631,9 @@ export default function ChatDrawer({ open, onClose }: Props) {
    * 先保存当前会话，再创建新会话
    */
   const handleNewSession = useCallback(async () => {
+    // 先终止当前会话的流式请求（若仍在生成中），再处理新建逻辑
+    stopStream();
+
     // 当前会话为空时，不创建新会话，避免产生一堆空白会话
     if (messagesRef.current.length === 0) {
       message.info("当前已是空白会话，无需新建");
@@ -409,7 +642,7 @@ export default function ChatDrawer({ open, onClose }: Props) {
 
     // 后端在每次 SSE 对话完成时已自动保存消息，直接创建新会话即可
     await createNewSession();
-  }, [currentSessionId, createNewSession]);
+  }, [createNewSession, stopStream]);
 
   /**
    * 删除指定会话
@@ -652,7 +885,7 @@ export default function ChatDrawer({ open, onClose }: Props) {
 
           {messages.map((msg, i) => (
             <div
-              key={i}
+              key={msg.id}
               style={{
                 marginBottom: 12,
                 textAlign: msg.role === "user" ? "right" : "left",
@@ -687,6 +920,59 @@ export default function ChatDrawer({ open, onClose }: Props) {
                     💭 思考: {msg.reasoning}
                   </Typography.Text>
                 )}
+                {/* AI 工具调用进度展示：转圈=执行中 / ✓=完成 / ✗=失败，
+                    让用户看到长任务（报告/计划/订正本）正在做什么 */}
+                {msg.toolSteps && msg.toolSteps.length > 0 && (
+                  <div
+                    style={{
+                      marginBottom: 4,
+                      fontSize: 12,
+                      color: "#666",
+                    }}
+                  >
+                    {msg.toolSteps.map((step, si) => (
+                      <div
+                        key={si}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 6,
+                          marginBottom: 2,
+                        }}
+                      >
+                        {step.status === "running" ? (
+                          <Spin size="small" />
+                        ) : step.status === "done" ? (
+                          <span style={{ color: "#52c41a", lineHeight: 1 }}>
+                            ✓
+                          </span>
+                        ) : (
+                          <span style={{ color: "#ff4d4f", lineHeight: 1 }}>
+                            ✗
+                          </span>
+                        )}
+                        <span>
+                          {TOOL_STEP_LABELS[step.name] || step.name}
+                        </span>
+                        {step.summary && step.status === "done" && (
+                          <span
+                            title={step.summary}
+                            style={{
+                              color: "#999",
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              maxWidth: 140,
+                              flexShrink: 1,
+                            }}
+                          >
+                            {step.summary}
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
                 {/* 消息正文：用户消息纯文本，AI 消息 Markdown 渲染 */}
                 {msg.content ? (
                   msg.role === "assistant" ? (
@@ -694,16 +980,40 @@ export default function ChatDrawer({ open, onClose }: Props) {
                       <ReactMarkdown
                         remarkPlugins={[remarkGfm]}
                         components={{
-                          a: ({ href, children }) => (
-                            <a
-                              href={href}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              style={{ color: "#1677ff" }}
-                            >
-                              {children}
-                            </a>
-                          ),
+                          img: ({ src, alt, title }) => {
+                            // 与 MarkdownPreview 口径一致：支持 title 尺寸指令（"=300x" 等）
+                            const size = parseImageSize(title);
+                            return (
+                              <img
+                                src={src}
+                                alt={alt || ""}
+                                title={size ? undefined : title}
+                                style={{ maxWidth: "100%", ...(size ?? {}) }}
+                              />
+                            );
+                          },
+                          a: ({ href, children }) => {
+                            const url = href || "";
+                            const isFile = url.startsWith("/api/v1/files/");
+                            return (
+                              <a
+                                href={url}
+                                onClick={
+                                  isFile
+                                    ? (e) => {
+                                        e.preventDefault();
+                                        void openFileLink(url);
+                                      }
+                                    : undefined
+                                }
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                style={{ color: "#1677ff" }}
+                              >
+                                {children}
+                              </a>
+                            );
+                          },
                           table: ({ children }) => (
                             <table
                               style={{
@@ -748,7 +1058,10 @@ export default function ChatDrawer({ open, onClose }: Props) {
                     renderUserMessage(msg.content)
                   )
                 ) : i === messages.length - 1 && loading ? (
-                  "思考中..."
+                  // 有工具正在执行时显示"正在执行..."，否则显示"思考中..."
+                  msg.toolSteps?.some((s) => s.status === "running")
+                    ? "正在执行..."
+                    : "思考中..."
                 ) : (
                   ""
                 )}
@@ -770,6 +1083,7 @@ export default function ChatDrawer({ open, onClose }: Props) {
             { icon: <FileTextOutlined />, label: "生成报告", prompt: "帮我生成最近一次作业的分析报告" },
             { icon: <BookOutlined />, label: "查看错题", prompt: "帮我整理最近的错题订正本" },
             { icon: <LineChartOutlined />, label: "查看学情", prompt: "分析我最近的学情状态" },
+            { icon: <CalendarOutlined />, label: "制定计划", prompt: "帮我制定一周的数学专项学习计划" },
           ].map((cmd) => (
             <Button
               key={cmd.label}
@@ -798,9 +1112,10 @@ export default function ChatDrawer({ open, onClose }: Props) {
           />
           <Button
             type="primary"
-            icon={<SendOutlined />}
-            onClick={handleSend}
-            loading={loading}
+            danger={loading}
+            icon={loading ? <StopOutlined /> : <SendOutlined />}
+            onClick={loading ? stopStream : handleSend}
+            title={loading ? "停止生成" : "发送"}
           />
         </Space.Compact>
       </div>

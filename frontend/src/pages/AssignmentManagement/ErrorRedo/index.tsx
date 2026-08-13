@@ -9,7 +9,7 @@ export default function ErrorRedo() {
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState({
     grade: "",
-    subject: "",
+    subject: "数学",
     semester: "",
     question_type: "",
     score_rate_min: null as number | null,
@@ -40,7 +40,7 @@ export default function ErrorRedo() {
 
   return (
     <Card>
-      <Typography.Title level={4}>错题重做</Typography.Title>
+      <Typography.Title level={4}>错题归纳</Typography.Title>
       <Space style={{ marginBottom: 16 }} wrap>
         <Select
           placeholder="年级"

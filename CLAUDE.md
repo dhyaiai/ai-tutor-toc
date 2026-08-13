@@ -20,8 +20,9 @@ AI 助教系统：上传作业试卷 → 切割分题 → 多模态大模型评�
 | 数据库 | MySQL（仍需要） | MySQL |
 | 文件存储 | 本地 `./uploads/` | MinIO (S3) |
 | 异步任务 | 同步 inline 执行 | Celery + Redis |
-| 向量检索 | 有损降级（返回空或 DB 查询） | Qdrant |
 | Docker | 不需要 | Docker Compose |
+
+> 注：RAG/向量检索已整体移除（rag_service.py、vector_tasks.py 已删除），Agent 工具不再有向量检索。
 
 ## 数据库
 
@@ -73,17 +74,16 @@ backend/app/
 │   ├── ai_grader.py            # 多模态 LLM 评分、答案识别
 │   ├── similar_generator.py    # 同类题生成
 │   ├── knowledge_extractor.py  # 知识点提取
-│   ├── rag_service.py          # Qdrant 向量检索（dev 模式降级）
+│   ├── llm_json.py             # LLM JSON 请求统一封装（重试 + 容错解析）
 │   ├── analytics_aggregator.py # 学情聚合计算
 │   ├── file_upload.py          # MinIO/本地文件操作
 │   └── agent/                  # AI Agent (ReAct 模式)
 │       ├── agent_executor.py   # ReAct 循环：LLM 思考 → 工具调用 → 结果返回 → 最终回答
-│       ├── tools.py            # 4 个工具：search_analysis_chunks / get_assignment_score / get_error_knowledge / get_score_trend
+│       ├── tools.py            # 11 个工具：成绩/错题/趋势查询、作文批改、学情报告、订正本、学习计划、分步讲解、知识状态读写
 │       └── prompts.py          # 系统提示词和用户上下文模板
 ├── tasks/               # 异步任务
 │   ├── celery_app.py    # Celery 实例（生产模式）
 │   ├── analysis_tasks.py   # 作业整体分析、单题重分析
-│   ├── vector_tasks.py     # 向量化入库
 │   └── dev_runner.py       # DEV 模式同步任务执行器（替代 Celery）
 └── db/
     ├── session.py       # create_async_engine + async_session_factory

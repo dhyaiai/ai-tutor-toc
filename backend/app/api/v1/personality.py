@@ -1,8 +1,9 @@
 """
 助教性格配置 API
 
-提供用户自定义微调配置（性格类型/说话风格/评分严格度）的查询与更新。
-配置保存后实时生效，对系统内所有 AI 批改和 Agent 对话统一生效。
+提供用户自定义微调配置（性格类型/说话风格/语音音色/评分严格度）的查询与更新。
+配置保存后实时生效，对系统内所有 AI 批改和 Agent 对话统一生效；
+语音音色（male/female）对助教讲解、英语听力、单词听写的 TTS 播报生效。
 """
 
 from fastapi import APIRouter, Depends
@@ -20,6 +21,12 @@ from app.schemas.personality import (
 from app.services.personality_service import DEFAULT_PERSONALITY
 
 router = APIRouter(prefix="/personality", tags=["personality"])
+
+
+def _normalize_voice_tone(value: str | None) -> str:
+    """归一化音色值：仅显式保存过 male 才返回男声，
+    历史遗留值（如建表默认的「沉稳男声」）一律视为女声，与历史 TTS 实际行为保持一致。"""
+    return "male" if value == "male" else "female"
 
 
 @router.get("", response_model=PersonalityResponse)
@@ -45,6 +52,7 @@ async def get_personality(
         user_id=config.user_id,
         personality_type=config.personality_type,
         speaking_style=config.speaking_style,
+        voice_tone=_normalize_voice_tone(config.voice_tone),
         strict_level=config.strict_level,
         update_time=config.update_time.isoformat() if config.update_time else None,
     )
@@ -68,6 +76,8 @@ async def update_personality(
             config.personality_type = req.personality_type
         if req.speaking_style is not None:
             config.speaking_style = req.speaking_style
+        if req.voice_tone is not None:
+            config.voice_tone = req.voice_tone
         if req.strict_level is not None:
             config.strict_level = req.strict_level
     else:
@@ -76,6 +86,7 @@ async def update_personality(
             user_id=current_user.id,
             personality_type=req.personality_type or DEFAULT_PERSONALITY["personality_type"],
             speaking_style=req.speaking_style or DEFAULT_PERSONALITY["speaking_style"],
+            voice_tone=req.voice_tone or DEFAULT_PERSONALITY["voice_tone"],
             strict_level=req.strict_level or DEFAULT_PERSONALITY["strict_level"],
         )
         db.add(config)
@@ -88,6 +99,7 @@ async def update_personality(
         user_id=config.user_id,
         personality_type=config.personality_type,
         speaking_style=config.speaking_style,
+        voice_tone=_normalize_voice_tone(config.voice_tone),
         strict_level=config.strict_level,
         update_time=config.update_time.isoformat() if config.update_time else None,
     )

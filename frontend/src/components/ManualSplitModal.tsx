@@ -6,6 +6,7 @@ import {
   PageInfo,
   ManualRegion,
 } from '../services/assignmentService';
+import { rotateImageDataUrl } from '../utils/imageUtils';
 
 // ── Types ──
 
@@ -18,6 +19,9 @@ interface DrawnRegion {
   w: number;
   h: number;
   draw_order: number; // 绘制顺序，用于保持同题多区域的先后关系
+  // 区域类型：question=普通题目；answer_sheet=客观题识别区（不创建题目，
+  // 评分时作为 [Answer Sheet] 拼入每道题）。未设置时视为 question。
+  region_type?: 'question' | 'answer_sheet';
 }
 
 interface ManualSplitModalProps {
@@ -26,11 +30,19 @@ interface ManualSplitModalProps {
   /** Existing question bboxes for pre-filling (single question adjust mode) */
   prefillRegion?: {
     question_id: number;
+    /** 用于展示的题号（question_id 是数据库主键，不能当题号显示） */
+    question_number?: number;
     page_index: number;
     x: number;
     y: number;
     w: number;
     h: number;
+  } | null;
+  /** 插入模式：在指定题目下方插入一道新题（补切漏切题目） */
+  insertAfter?: {
+    question_id: number;
+    question_number: number;
+    page_index: number;
   } | null;
   /** Called after successful split/adjust */
   onSuccess: () => void;
@@ -43,6 +55,9 @@ const COLORS = [
   '#FF4D4F', '#1890FF', '#52C41A', '#FAAD14', '#722ED1',
   '#EB2F96', '#13C2C2', '#F5222D', '#2F54EB', '#FA541C',
 ];
+
+// 客观题识别区专用配色（区别于普通题目区域，避免与 COLORS 轮转色混淆）
+const ANSWER_SHEET_COLOR = '#08979C';
 
 // Resize handle directions (including 'move' for drag-to-move)
 const HANDLE_SIZE = 8;
@@ -65,6 +80,7 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
   assignmentId,
   visible,
   prefillRegion,
+  insertAfter,
   onSuccess,
   onCancel,
 }) => {
@@ -102,37 +118,12 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
 
   const page = pages[currentPage];
   const currentRotation = pageRotations[currentPage] || 0;
+  // 调整/插入模式下题号固定，不允许编辑题号/标记识别区
+  const isFixedNumberMode = !!prefillRegion || !!insertAfter;
+  // 插入模式下新题的展示题号 = 当前题题号 + 1
+  const insertQuestionNum = insertAfter ? insertAfter.question_number + 1 : null;
 
-  // ── 旋转图片生成函数 ──
-  const rotateImageDataUrl = useCallback(
-    (imageUrl: string, rotation: number): Promise<string> => {
-      return new Promise((resolve, reject) => {
-        const img = new Image();
-        img.crossOrigin = 'anonymous';
-        img.onload = () => {
-          const canvas = document.createElement('canvas');
-          const ctx = canvas.getContext('2d')!;
-
-          if (rotation === 90 || rotation === 270) {
-            canvas.width = img.naturalHeight;
-            canvas.height = img.naturalWidth;
-          } else {
-            canvas.width = img.naturalWidth;
-            canvas.height = img.naturalHeight;
-          }
-
-          ctx.translate(canvas.width / 2, canvas.height / 2);
-          ctx.rotate((rotation * Math.PI) / 180);
-          ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
-
-          resolve(canvas.toDataURL('image/png'));
-        };
-        img.onerror = () => reject(new Error('图片加载失败'));
-        img.src = imageUrl;
-      });
-    },
-    [],
-  );
+  // ── 旋转图片生成（共用实现见 utils/imageUtils.ts） ──
 
   // ── 旋转角度改变时重新生成显示图片 ──
   useEffect(() => {
@@ -164,6 +155,10 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
   // ── Load source pages ──
   useEffect(() => {
     if (!visible) return;
+    // 清空上次会话的旋转状态（D3）：本组件常驻挂载（destroyOnClose 只销毁
+    // Modal 内部 DOM，state 保留），若不清空，切到另一份作业再打开时
+    // 会错误继承上一次作业的页面旋转角度
+    setPageRotations({});
     (async () => {
       setLoading(true);
       try {
@@ -176,7 +171,7 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
           drawOrderRef.current += 1;
           const initRegion: DrawnRegion = {
             id: uid(),
-            question_number: prefillRegion.question_id,
+            question_number: prefillRegion.question_number ?? prefillRegion.question_id,
             page_index: prefillRegion.page_index,
             x: prefillRegion.x,
             y: prefillRegion.y,
@@ -186,6 +181,14 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
           };
           setRegions([initRegion]);
           setSelectedId(initRegion.id);
+        } else if (insertAfter) {
+          // 插入模式：定位到当前题所在页，由用户自行框选新题区域
+          setCurrentPage(
+            data.pages[insertAfter.page_index] ? insertAfter.page_index : 0
+          );
+          setRegions([]);
+          setSelectedId(null);
+          drawOrderRef.current = 0;
         } else {
           setCurrentPage(0);
           setRegions([]);
@@ -226,19 +229,22 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
       const rw = r.w * scaleX;
       const rh = r.h * scaleY;
       const isSelected = r.id === selectedId;
-      const color = COLORS[idx % COLORS.length];
+      const isSheet = r.region_type === 'answer_sheet';
+      const color = isSheet ? ANSWER_SHEET_COLOR : COLORS[idx % COLORS.length];
 
       // Fill
       ctx.fillStyle = isSelected ? color + '30' : color + '15';
       ctx.fillRect(rx, ry, rw, rh);
 
-      // Border
+      // Border（识别区用虚线以区分于题目区域）
       ctx.strokeStyle = isSelected ? color : color + '99';
       ctx.lineWidth = isSelected ? 2.5 : 1.5;
+      if (isSheet) ctx.setLineDash([8, 4]);
       ctx.strokeRect(rx, ry, rw, rh);
+      ctx.setLineDash([]);
 
-      // Question number label
-      const label = `第${r.question_number}题`;
+      // Label：识别区显示“客观题识别区”并附带原题号便于区分，普通题目显示题号
+      const label = isSheet ? `客观题识别区(第${r.question_number}题)` : `第${r.question_number}题`;
       const fontSize = Math.max(12, 14 * scaleX);
       ctx.fillStyle = color;
       ctx.font = `bold ${fontSize}px sans-serif`;
@@ -265,19 +271,21 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
       }
     });
 
-    // Drawing preview
+    // Drawing preview（drawing 存的是原图坐标，绘制时需换算回画布坐标）
     if (drawing) {
-      const sx = Math.min(drawing.startX, drawing.endX);
-      const sy = Math.min(drawing.startY, drawing.endY);
-      const sw = Math.abs(drawing.endX - drawing.startX);
-      const sh = Math.abs(drawing.endY - drawing.startY);
+      const sx = Math.min(drawing.startX, drawing.endX) * scaleX;
+      const sy = Math.min(drawing.startY, drawing.endY) * scaleY;
+      const sw = Math.abs(drawing.endX - drawing.startX) * scaleX;
+      const sh = Math.abs(drawing.endY - drawing.startY) * scaleY;
       ctx.strokeStyle = '#1890FF';
       ctx.lineWidth = 2;
       ctx.setLineDash([6, 3]);
       ctx.strokeRect(sx, sy, sw, sh);
       ctx.setLineDash([]);
+      ctx.fillStyle = '#1890FF15';
+      ctx.fillRect(sx, sy, sw, sh);
     }
-  }, [regions, selectedId, drawing, currentPage, page]);
+  }, [regions, selectedId, drawing, currentPage, page, displaySize]);
 
   useEffect(() => {
     redraw();
@@ -337,7 +345,7 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
       }
       return null;
     },
-    [selectedId, regions, currentPage, page],
+    [selectedId, regions, currentPage, page, displaySize],
   );
 
   // ── Mouse handlers ──
@@ -492,7 +500,10 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
         questionNum = pendingQuestionNum;
         setPendingQuestionNum(null);
       } else if (prefillRegion) {
-        questionNum = prefillRegion.question_id;
+        questionNum = prefillRegion.question_number ?? prefillRegion.question_id;
+      } else if (insertQuestionNum !== null) {
+        // 插入模式：所有区域都属于同一道新题
+        questionNum = insertQuestionNum;
       } else {
         questionNum =
           regions.length > 0
@@ -550,6 +561,17 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
     );
   };
 
+  /** 切换区域类型：普通题目 ⇄ 客观题识别区 */
+  const toggleRegionType = (id: string) => {
+    setRegions((prev) =>
+      prev.map((r) =>
+        r.id === id
+          ? { ...r, region_type: r.region_type === 'answer_sheet' ? 'question' : 'answer_sheet' }
+          : r,
+      ),
+    );
+  };
+
   /** 点击 + 后进入"待框选"状态，由用户在图片上自行框选区域 */
   const startExtraRegion = (sourceRegion: DrawnRegion) => {
     setPendingQuestionNum(sourceRegion.question_number);
@@ -575,6 +597,12 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
       return;
     }
 
+    // 手动切割模式下，识别区不创建题目，必须至少存在一个普通题目区域
+    if (!isFixedNumberMode && !regions.some((r) => r.region_type !== 'answer_sheet')) {
+      message.warning('请至少绘制一个题目区域（客观题识别区不能单独提交）');
+      return;
+    }
+
     // 按题号→绘制顺序排列，保证同题多区域先后正确
     const sorted = [...regions].sort(
       (a, b) => a.question_number - b.question_number || a.draw_order - b.draw_order,
@@ -589,13 +617,14 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
       h: r.h,
       draw_order: r.draw_order,
       rotation: pageRotations[r.page_index] || 0,
+      region_type: r.region_type || 'question',
     }));
 
     setSubmitting(true);
     try {
-      if (prefillRegion) {
-        // Adjust single question: first region is primary, the rest are extra regions
-        // (dual-column / cross-page), merged vertically on the backend
+      if (prefillRegion || insertAfter) {
+        // Adjust/insert single question: first region is primary, the rest are extra
+        // regions (dual-column / cross-page), merged vertically on the backend
         const [primary, ...extras] = payload;
         const adjPayload = {
           ...primary,
@@ -609,10 +638,14 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
             rotation: r.rotation || 0,
           })),
         };
-        await (
-          await import('../services/questionService')
-        ).questionService.adjustRegion(prefillRegion.question_id, adjPayload);
-        message.success('题目区域已调整');
+        const { questionService } = await import('../services/questionService');
+        if (insertAfter) {
+          await questionService.insertBelow(insertAfter.question_id, adjPayload);
+          message.success(`新题已插入第${insertAfter.question_number}题下方，AI 分析中`);
+        } else {
+          await questionService.adjustRegion(prefillRegion!.question_id, adjPayload);
+          message.success('题目区域已调整');
+        }
       } else {
         await assignmentService.manualSplit(assignmentId, payload);
         message.success(`手动切割完成，共 ${payload.length} 个区域`);
@@ -628,7 +661,13 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
   // ── Render ──
   return (
     <Modal
-      title={prefillRegion ? '调整题目区域' : '手动切割题目'}
+      title={
+        insertAfter
+          ? `插入新题（第${insertAfter.question_number}题下方）`
+          : prefillRegion
+            ? '调整题目区域'
+            : '手动切割题目'
+      }
       open={visible}
       onCancel={onCancel}
       width="95vw"
@@ -637,7 +676,7 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
         <Space>
           <Button onClick={onCancel}>取消</Button>
           <Button type="primary" loading={submitting} onClick={handleSubmit}>
-            {prefillRegion ? '确认调整' : '确认切割'}
+            {insertAfter ? '确认插入' : prefillRegion ? '确认调整' : '确认切割'}
           </Button>
         </Space>
       }
@@ -788,15 +827,26 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
             }}
           >
             <h4 style={{ margin: '0 0 8px' }}>
-              {prefillRegion ? '当前区域' : `已选区域 (${regions.length})`}
+              {insertAfter
+                ? `新题区域（将插入为第${insertQuestionNum}题）`
+                : prefillRegion
+                  ? '当前区域'
+                  : `已选区域 (${regions.length})`}
             </h4>
             {allRegionsSorted.length === 0 ? (
-              <div style={{ color: '#999', fontSize: 13 }}>在图片上拖拽绘制题目区域</div>
+              <div style={{ color: '#999', fontSize: 13 }}>
+                {insertAfter
+                  ? `在图片上拖拽框选漏切题目的区域，插入后后续题号自动后移`
+                  : '在图片上拖拽绘制题目区域'}
+              </div>
             ) : (
               allRegionsSorted.map((r) => {
                 const isSelected = r.id === selectedId;
                 const isOnCurrentPage = r.page_index === currentPage;
-                const color = COLORS[allRegionsSorted.indexOf(r) % COLORS.length];
+                const isSheet = r.region_type === 'answer_sheet';
+                const color = isSheet
+                  ? ANSWER_SHEET_COLOR
+                  : COLORS[allRegionsSorted.indexOf(r) % COLORS.length];
                 const hasContinuation = allRegionsSorted.filter(
                   (other) => other.question_number === r.question_number && other.id !== r.id
                 ).length > 0;
@@ -835,33 +885,55 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
                             background: color,
                           }}
                         />
-                        <strong>第</strong>
-                        {prefillRegion ? (
-                          <span>{r.question_number}</span>
+                        {isSheet ? (
+                          <>
+                            <strong style={{ color }}>客观题识别区</strong>
+                            <span style={{ color: '#888', fontSize: 12 }}>（第{r.question_number}题）</span>
+                          </>
                         ) : (
-                          <InputNumber
-                            size="small"
-                            min={1}
-                            max={200}
-                            value={r.question_number}
-                            onChange={(v) => updateQuestionNumber(r.id, v || 1)}
-                            style={{ width: 55 }}
-                            onClick={(e) => e.stopPropagation()}
-                          />
+                          <>
+                            <strong>第</strong>
+                            {isFixedNumberMode ? (
+                              <span>{r.question_number}</span>
+                            ) : (
+                              <InputNumber
+                                size="small"
+                                min={1}
+                                max={200}
+                                value={r.question_number}
+                                onChange={(v) => updateQuestionNumber(r.id, v || 1)}
+                                style={{ width: 55 }}
+                                onClick={(e) => e.stopPropagation()}
+                              />
+                            )}
+                            <strong>题</strong>
+                          </>
                         )}
-                        <strong>题</strong>
                       </Space>
-                      {!prefillRegion ? (
+                      {!isFixedNumberMode ? (
                         <Space size={2}>
-                          {/* + button for adding extra region (same-page dual-column or cross-page) */}
-                          <Tooltip title="添加同题区域（双栏/跨页）">
+                          {/* 标记/取消 客观题识别区 */}
+                          <Tooltip title={isSheet ? '改回普通题目区域' : '标记为客观题识别区（评分时作为答题卡拼入每道题）'}>
                             <Button
                               size="small"
-                              type="text"
-                              icon={<PlusOutlined />}
-                              onClick={(e) => { e.stopPropagation(); startExtraRegion(r); }}
-                            />
+                              type={isSheet ? 'primary' : 'text'}
+                              onClick={(e) => { e.stopPropagation(); toggleRegionType(r.id); }}
+                              style={{ fontSize: 12, padding: '0 6px', color: isSheet ? undefined : ANSWER_SHEET_COLOR }}
+                            >
+                              {isSheet ? '题目' : '识别区'}
+                            </Button>
                           </Tooltip>
+                          {/* + button for adding extra region（识别区不支持同题多区域合并） */}
+                          {!isSheet && (
+                            <Tooltip title="添加同题区域（双栏/跨页）">
+                              <Button
+                                size="small"
+                                type="text"
+                                icon={<PlusOutlined />}
+                                onClick={(e) => { e.stopPropagation(); startExtraRegion(r); }}
+                              />
+                            </Tooltip>
+                          )}
                           <Popconfirm
                             title="确认删除此区域？"
                             onConfirm={(e) => { e?.stopPropagation(); deleteRegion(r.id); }}
@@ -887,8 +959,8 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
                               onClick={(e) => { e.stopPropagation(); startExtraRegion(r); }}
                             />
                           </Tooltip>
-                          {/* 至少保留一个区域 */}
-                          {allRegionsSorted.length > 1 && (
+                          {/* 调整模式至少保留一个区域；插入模式允许删光重画 */}
+                          {(!!insertAfter || allRegionsSorted.length > 1) && (
                             <Popconfirm
                               title="确认删除此区域？"
                               onConfirm={(e) => { e?.stopPropagation(); deleteRegion(r.id); }}
@@ -919,6 +991,7 @@ const ManualSplitModal: React.FC<ManualSplitModalProps> = ({
             <div style={{ fontSize: 12, color: '#999', marginTop: 8 }}>
               提示：选中切块后，拖动边缘/角上的白色方块可拉伸调整大小；拖动内部可移动位置。
               点击 "+" 进入框选模式，在图片上拖拽即可为该题添加额外区域（A4双栏左右分栏等）。
+              若试卷卷首有客观题答题卡，框选后点 "识别区" 标记为客观题识别区；它不单独成题，而是评分时作为答题卡拼入每道题供 AI 优先识别客观题作答。
             </div>
           </div>
         </div>

@@ -6,7 +6,10 @@ from app.models.knowledge_state import UserKnowledgeState
 from app.models.personality import AgentPersonality
 from app.models.composition import CompositionCorrection
 from app.models.oral_assessment import ListeningTest, DictationTask, MandarinTestRecord, OralRecord
+from app.models.llm_usage import LlmUsageLog
+from app.models.favorite import UserFavorite
 
 __all__ = ["User", "Assignment", "Question", "Conversation", "ConversationMessage",
            "UserKnowledgeState", "AgentPersonality", "CompositionCorrection",
-           "ListeningTest", "DictationTask", "MandarinTestRecord", "OralRecord"]
+           "ListeningTest", "DictationTask", "MandarinTestRecord", "OralRecord",
+           "LlmUsageLog", "UserFavorite"]

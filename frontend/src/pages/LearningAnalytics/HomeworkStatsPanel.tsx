@@ -26,18 +26,43 @@ import {
   toSelectOptions,
 } from "../../utils/filterConfig";
 
-/** 饼状图配色方案（按科目固定颜色，区分度大） */
+/**
+ * 饼状图配色：低饱和度柔和商务配色（背景白色、标签黑色）
+ * - 9 科目固定低饱和色，色相均匀分布（相邻约 40°）、同一亮度/饱和度带，整体协调
+ * - 无大红大绿，以蓝-橙为主对比，经 CVD 色盲模拟校验；CVD 下橙/绿等无解对
+ *   （色盲视锥限制）由外置标签 + 图例 + 左侧表格兜底
+ * - 占比最大的扇区使用同色相"饱和强化版"，其余扇区低饱和弱化，突出重点
+ */
 const SUBJECT_COLORS: Record<string, string> = {
-  语文: "#10c2f9",
-  数学: "#7265e6",
-  英语: "#ffbf00",
-  物理: "#00a2ae",
-  化学: "#0c100e",
-  生物: "#e8590c",
-  政治: "#c41a1a",
-  历史: "#6e71c4",
-  地理: "#086322",
+  语文: "#3A5E96", // 蓝
+  数学: "#7A66B0", // 藕紫
+  英语: "#B09A48", // 金
+  物理: "#4E96A0", // 青
+  化学: "#B07084", // 玫瑰
+  生物: "#4E7A56", // 深绿
+  政治: "#C0674A", // 红橙
+  历史: "#8A5E3E", // 棕
+  地理: "#5E7A9E", // 蓝灰
 };
+
+/** 各科目的"饱和强化版"（同色相、饱和度稍高、亮度略降），用于占比最大的扇区 */
+const SATURATED_SUBJECT_COLORS: Record<string, string> = {
+  语文: "#2A4D85",
+  数学: "#634F99",
+  英语: "#9C8435",
+  物理: "#3D828C",
+  化学: "#9D5D72",
+  生物: "#3E6545",
+  政治: "#AB5138",
+  历史: "#754C30",
+  地理: "#4C6486",
+};
+
+/** 【其他】扇区颜色：小占比项合并后的中性灰 */
+const OTHER_COLOR = "#9E9E9E";
+
+/** 饼图最多显示 TOP 6 科目，其余小占比项合并为【其他】 */
+const PIE_MAX_SUBJECTS = 6;
 
 /** 表格列定义 */
 const COLUMNS = [
@@ -57,7 +82,7 @@ const COLUMNS = [
   },
 ];
 
-export default function HomeworkStatsPanel() {
+export default function HomeworkStatsPanel({ active }: { active?: boolean }) {
   /** 筛选条件 */
   const [grade, setGrade] = useState<string>("");
   const [semester, setSemester] = useState<string>("");
@@ -70,20 +95,33 @@ export default function HomeworkStatsPanel() {
         ...(grade && { grade }),
         ...(semester && { semester }),
       }),
+    // 面板常驻挂载（隐藏而非卸载），tab 未激活时不发请求，激活时才加载
+    enabled: active,
   });
 
   /**
    * 饼状图数据：预计算显示标签，避免依赖 G2 v5 formatter 回调的参数格式。
    * G2 v5 的 label.text 直接读取数据字段，无需 formatter 即可正确显示。
+   *
+   * 合并逻辑：后端 subject_stats 已按作业数量降序返回，
+   * 科目数超过 PIE_MAX_SUBJECTS 时，取前 TOP 6，其余小占比项合并为【其他】。
    */
   const pieData = useMemo(() => {
     const raw = (data?.subject_stats || []).map((item) => ({
       type: item.subject,
       value: item.count,
     }));
-    const total = raw.reduce((s, d) => s + d.value, 0);
+    // 降序前 TOP N 名 + 其余合并为【其他】（合并后总数量不变）
+    let items = raw;
+    if (raw.length > PIE_MAX_SUBJECTS) {
+      const restCount = raw
+        .slice(PIE_MAX_SUBJECTS)
+        .reduce((s, d) => s + d.value, 0);
+      items = [...raw.slice(0, PIE_MAX_SUBJECTS), { type: "其他", value: restCount }];
+    }
+    const total = items.reduce((s, d) => s + d.value, 0);
     // 预计算每个扇区的百分比和完整标签文本
-    return raw.map((item) => {
+    return items.map((item) => {
       const pct = total > 0 ? ((item.value / total) * 100).toFixed(1) : "0.0";
       return {
         ...item,
@@ -99,9 +137,14 @@ export default function HomeworkStatsPanel() {
   const pieConfig = useMemo(() => {
     if (pieData.length === 0) return undefined;
 
-    // 根据数据动态构建颜色映射，保证每科颜色固定
+    // 占比最大的扇区使用"饱和强化版"突出，其余扇区保持低饱和弱化
+    const maxType = pieData.reduce((a, b) => (b.value > a.value ? b : a), pieData[0]).type;
     const colorDomain = pieData.map((d) => d.type);
-    const colorRange = pieData.map((d) => SUBJECT_COLORS[d.type] || "#888888");
+    const colorRange = pieData.map((d) =>
+      d.type === maxType
+        ? SATURATED_SUBJECT_COLORS[d.type] || OTHER_COLOR
+        : SUBJECT_COLORS[d.type] || OTHER_COLOR
+    );
 
     return {
       data: pieData,
@@ -110,7 +153,7 @@ export default function HomeworkStatsPanel() {
       innerRadius: 0.5,      // 环形图内半径 → coordinate.innerRadius
       radius: 0.8,           // 外半径 → coordinate.outerRadius
 
-      /** 自定义配色：按科目映射固定颜色 */
+      /** 自定义配色：最大扇区饱和强化，其余按科目低饱和固定色 */
       scale: {
         color: {
           domain: colorDomain,
@@ -121,13 +164,14 @@ export default function HomeworkStatsPanel() {
       /**
        * 标签：直接读取预计算的 pieLabel 字段（含科目名 + 百分比）。
        * 不用 formatter，避免 G2 v5 回调参数格式不一致导致 undefinedNaN%。
+       * 文字黑色（#000），白色背景上清晰可读。
        */
       label: {
         text: "pieLabel",
         position: "outside",
         style: {
           fontSize: 11,
-          fill: "#333",
+          fill: "#000",
         },
       },
 

@@ -2,8 +2,8 @@
  * 助教设置页面
  *
  * 功能：
- * - 提供自定义微调区（性格类型/说话风格/评分严格度）
- * - 配置对系统内所有 AI 批改统一生效
+ * - 提供自定义微调区（性格类型/说话风格/语音音色/评分严格度）
+ * - 配置对系统内所有 AI 批改统一生效，音色对助教讲解/英语听力/单词听写的语音播报生效
  * - 保存后实时生效，无需刷新
  */
 
@@ -13,6 +13,7 @@ import {
   personalityService,
   type PersonalityConfig,
 } from "../../services/personalityService";
+import { setVoiceTone, type VoiceTone } from "../../utils/ttsVoice";
 
 const { Title, Text, Paragraph } = Typography;
 
@@ -51,6 +52,10 @@ export default function PersonalityConfigPage() {
       try {
         const updated = await personalityService.update(updates);
         setConfig(updated);
+        // 音色修改后同步更新 TTS 播报侧的缓存，无需刷新即时生效
+        if (field === "voice_tone") {
+          setVoiceTone(value === "male" ? "male" : "female");
+        }
       } catch {
         message.error("更新失败");
       }
@@ -65,10 +70,6 @@ export default function PersonalityConfigPage() {
   return (
     <div style={{ maxWidth: 900, margin: "0 auto", padding: "24px 0" }}>
       <Title level={3}>🤖 AI 助教设置</Title>
-      <Paragraph type="secondary">
-        自定义 AI 助教的性格类型、说话风格和评分严格度，配置对系统内所有 AI 批改生效。配置保存后实时生效。
-      </Paragraph>
-
       <Divider orientation="left">自定义微调</Divider>
 
       {/* 自定义微调区 */}
@@ -101,6 +102,22 @@ export default function PersonalityConfigPage() {
                 { label: "简洁高效", value: "简洁高效" },
               ]}
             />
+          </Col>
+
+          <Col xs={24} sm={12}>
+            <Text strong>语音音色</Text>
+            <Select
+              value={config.voice_tone === "male" ? "male" : "female"}
+              onChange={(v: VoiceTone) => updateField("voice_tone", v)}
+              style={{ width: "100%", marginTop: 8 }}
+              options={[
+                { label: "女声", value: "female" },
+                { label: "男声", value: "male" },
+              ]}
+            />
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              对助教讲解、英语听力、单词听写的语音播报生效
+            </Text>
           </Col>
 
           <Col xs={24} sm={12}>

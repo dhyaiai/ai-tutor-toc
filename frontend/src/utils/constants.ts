@@ -20,6 +20,7 @@ export const ASSIGNMENT_STATUS_MAP: Record<string, { color: string; label: strin
 
 export const QUESTION_STATUS_MAP: Record<string, { color: string; label: string }> = {
   pending: { color: "default", label: "待分析" },
+  processing: { color: "processing", label: "正在分析" },
   completed: { color: "success", label: "已完成" },
   failed: { color: "error", label: "失败" },
   confirmed: { color: "blue", label: "已确认" },

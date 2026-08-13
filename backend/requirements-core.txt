@@ -1,3 +1,8 @@
+# 核心依赖子集：与 requirements.txt 相比移除了以下非核心模块：
+#   - aiohttp（历史遗留，代码中无直接 import）
+#   - edge-tts / websockets（口语测评 TTS + 讯飞评测，非核心流程）
+#   - bcrypt 版本固定为 ==4.2.1（requirements.txt 用范围约束 >=4.0,<5.0）
+# 用途：最小化部署（如 CI 跑测试、纯文本对话场景）时使用。
 # Web Framework
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
@@ -22,16 +27,35 @@ celery[redis]==5.4.0
 # MinIO / S3
 minio==7.2.10
 
-# Vector DB
-qdrant-client==1.12.1
+# AI / LLM（对齐实际运行环境；视觉模型客户端依赖 2.x API）
+openai==2.53.0
 
-# AI / LLM
-openai==1.58.1
+# LangChain 生态（智能出题工作流 question_pipeline/client.py 模块级导入，缺则启动即失败）
+langchain-core==1.4.9
+langchain-openai==1.3.4
+langgraph==1.2.7
+
+# Image processing（image_preprocess.py 模块级导入 cv2/numpy，切图/分析流程必需）
+opencv-python-headless==4.11.0.86  # 对齐实际运行环境
+Pillow==11.0.0
+numpy==1.26.4
+
+# PDF（解析上传试卷 + 报告/订正本 HTML → PDF，首次安装后需执行: playwright install chromium）
+PyMuPDF==1.27.2.3
+python-docx==1.2.0
+playwright>=1.49.0
+
+# WebSocket 客户端（讯飞语音评测 xfyun_ise.py 模块级导入）
+websockets>=12.0
+
+# 语音合成（口语测评评语 TTS，edge-tts 在线合成）
+edge-tts==7.2.8
 
 # HTTP
 httpx==0.28.1
 
 # Utils
+cachetools==7.1.7  # 同类题生成结果 TTL 缓存（questions.py 模块级导入）
 pydantic[email]==2.10.3
 pydantic-settings==2.7.0
 python-dotenv==1.0.1

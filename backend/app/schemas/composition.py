@@ -32,9 +32,11 @@ class CompositionResponse(BaseModel):
     title: str
     total_score: int
     full_score: int
+    word_count: int = 0
     content: str = ""
     grade: str | None = None
     dimension_scores: dict | None = None
+    deductions: dict | None = None
     revision_suggestions: list[dict] | None = None
     overall_comment: str | None = None
     polish_advice: str | None = None
@@ -42,6 +44,9 @@ class CompositionResponse(BaseModel):
     strict_level: int = 3
     essay_type: str | None = None
     pdf_url: str | None = None
+    # 批改状态机：pending(已提交) / correcting(批改中) / completed(完成) / failed(失败)
+    status: str = "pending"
+    error_message: str | None = None
     create_time: str | None = None
 
     model_config = {"from_attributes": True}
@@ -62,10 +67,13 @@ class CompositionListItem(BaseModel):
     title: str
     total_score: int
     full_score: int
+    word_count: int = 0
     strict_level: int = 3
     grade: str | None = None
     essay_type: str | None = None
     pdf_url: str | None = None  # 原始上传文件路径，前端通过 /file-url 接口获取访问URL
+    status: str = "completed"
+    error_message: str | None = None
     create_time: str | None = None
 
     model_config = {"from_attributes": True}

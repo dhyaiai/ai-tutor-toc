@@ -16,11 +16,31 @@ import logging
 from datetime import datetime
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, func, and_
+from sqlalchemy import select, func, and_, update, case
 
 from app.models.knowledge_state import UserKnowledgeState
 
 logger = logging.getLogger(__name__)
+
+
+def parse_feedback_level(feedback_level: str) -> tuple[int, str]:
+    """
+    讲解反馈等级 → 知识状态变化量 + 行为类型（Alt3 共用映射）。
+
+    Agent 工具 record_mastery_feedback 与 /ai-tutor/feedback 直连接口
+    使用同一套语义，避免两处映射漂移：
+    - 完全听懂 +1（行为类型：听懂讲解）
+    - 没听懂   -1（行为类型：作业错误）
+    - 其他（部分听懂/未反馈） 0（行为类型：听懂讲解）
+
+    Returns:
+        (mastery_change, behavior_type)
+    """
+    if feedback_level == "完全听懂":
+        return 1, "听懂讲解"
+    if feedback_level == "没听懂":
+        return -1, "作业错误"
+    return 0, "听懂讲解"
 
 
 class KnowledgeTracker:
@@ -56,6 +76,7 @@ class KnowledgeTracker:
             更新的知识点数量
         """
         updated_count = 0
+        now = datetime.now()
 
         for kp in knowledge_points:
             point_name = kp.get("point_name", "")
@@ -66,41 +87,53 @@ class KnowledgeTracker:
             if not point_name:
                 continue
 
-            # 查找已有记录
+            change_amount = mastery_change * 5
+
+            # 原子更新：使用 UPDATE ... SET mastery_score = mastery_score + ?
+            # 避免 read-modify-write 竞态条件（并发更新同一知识点时数据丢失）
             result = await self.db.execute(
-                select(UserKnowledgeState).where(
+                update(UserKnowledgeState)
+                .where(
                     and_(
                         UserKnowledgeState.user_id == user_id,
                         UserKnowledgeState.subject == subject,
                         UserKnowledgeState.point_name == point_name,
                     )
                 )
+                .values(
+                    mastery_score=func.least(100, func.greatest(0, UserKnowledgeState.mastery_score + change_amount)),
+                    wrong_count=UserKnowledgeState.wrong_count + (1 if mastery_change < 0 else 0),
+                    correct_count=UserKnowledgeState.correct_count + (1 if mastery_change > 0 else 0),
+                    last_practice_time=now,
+                    update_time=now,
+                )
             )
-            record = result.scalar_one_or_none()
 
-            if record:
-                # 更新已有记录
-                new_score = record.mastery_score + mastery_change * 5
-                # 限制在 0-100 范围内
-                new_score = max(0, min(100, new_score))
-
-                record.mastery_score = new_score
-                record.mastery_level = UserKnowledgeState.calc_mastery_level(new_score)
-
-                # 根据变化方向更新错误/正确计数
-                if mastery_change < 0:
-                    record.wrong_count += 1
-                elif mastery_change > 0:
-                    record.correct_count += 1
-
-                record.last_practice_time = datetime.now()
-                record.update_time = datetime.now()
+            if result.rowcount > 0:
+                # 更新成功：重新计算 mastery_level（MySQL 端无法直接引用计算列）
+                await self.db.execute(
+                    update(UserKnowledgeState)
+                    .where(
+                        and_(
+                            UserKnowledgeState.user_id == user_id,
+                            UserKnowledgeState.subject == subject,
+                            UserKnowledgeState.point_name == point_name,
+                        )
+                    )
+                    .values(
+                        mastery_level=case(
+                            (UserKnowledgeState.mastery_score <= 30, "未掌握"),
+                            (UserKnowledgeState.mastery_score <= 60, "初步掌握"),
+                            (UserKnowledgeState.mastery_score <= 85, "熟练掌握"),
+                            else_="精通",
+                        )
+                    )
+                )
+                updated_count += 1
             else:
-                # 创建新记录
-                base_score = 50 + mastery_change * 5
+                # 记录不存在，创建新记录
+                base_score = 50 + change_amount
                 base_score = max(0, min(100, base_score))
-
-                # 判断初始行为类型来设置计数
                 wrong = 1 if mastery_change < 0 else 0
                 correct = 1 if mastery_change > 0 else 0
 
@@ -112,12 +145,11 @@ class KnowledgeTracker:
                     mastery_level=UserKnowledgeState.calc_mastery_level(base_score),
                     wrong_count=wrong,
                     correct_count=correct,
-                    last_practice_time=datetime.now(),
-                    update_time=datetime.now(),
+                    last_practice_time=now,
+                    update_time=now,
                 )
                 self.db.add(record)
-
-            updated_count += 1
+                updated_count += 1
 
         await self.db.flush()
         logger.info(

@@ -10,6 +10,7 @@ export interface AssignmentListItem {
   layout_type: string;
   status: string;
   total_score: number | null;
+  full_total: number | null;
   question_count: number;
   error_count: number;
   created_at: string;
@@ -37,6 +38,8 @@ export interface QuestionItem {
   assignment_id: number;
   question_number: number;
   image_url: string;
+  /** 识别出的题干文本（含 $...$ 包裹的 LaTeX 公式，KaTeX 渲染） */
+  question_text?: string | null;
   student_answer: string | null;
   correct_answer: string | null;
   score: number | null;
@@ -58,7 +61,7 @@ export interface QuestionItem {
   sub_question_index?: number | null;
   /** 大题套小题：子题列表（仅父题有此字段） */
   children?: QuestionItem[];
-  /** 学生答案切割图片URL（上传答案并切割后生成） */
+  /** 标准答案切割图片URL（上传答案解析并切割后生成） */
   answer_image_url?: string | null;
   /** 人工审核备注（重新生成时输入，持久化存储） */
   manual_review_note?: string | null;
@@ -85,6 +88,8 @@ export interface ManualRegion {
   h: number;
   draw_order: number;
   rotation?: number;  // 图片旋转角度：0/90/180/270
+  /** 区域类型：question=普通题目；answer_sheet=客观题识别区（不创建题目，评分时作为 [Answer Sheet] 拼入每道题） */
+  region_type?: 'question' | 'answer_sheet';
 }
 
 export interface PaginatedResponse<T> {
@@ -95,6 +100,14 @@ export interface PaginatedResponse<T> {
 }
 
 export const assignmentService = {
+  /** 编辑器粘贴图片上传（bytemd uploadImages 用），返回可直接用于 <img>/markdown 的访问 URL（dev 为 /api/v1/files/editor/...） */
+  async uploadEditorImage(file: File): Promise<{ file_path: string; url: string }> {
+    const formData = new FormData();
+    formData.append("file", file);
+    const { data } = await api.post("/files/upload", formData, { timeout: 120000 });
+    return data;
+  },
+
   /** Pre-upload file only, returns file_path for later assignment creation */
   async uploadFile(
     file: File,

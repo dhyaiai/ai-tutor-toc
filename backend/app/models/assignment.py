@@ -36,6 +36,9 @@ class Assignment(Base):
         SAEnum(LayoutType), default=LayoutType.A4_SINGLE, nullable=False
     )
     file_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    # 客观题识别区（答题卡）切图：学生将客观题答案誊写在卷首识别区时，
+    # 评分时作为 [Answer Sheet] 第三图源拼入每道题，作为学生作答的优先识别来源
+    answer_sheet_image_url: Mapped[str | None] = mapped_column(String(512), nullable=True)
     ai_summary: Mapped[str | None] = mapped_column(Text, nullable=True)
     total_score: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[AssignmentStatus] = mapped_column(
@@ -48,3 +51,6 @@ class Assignment(Base):
 
     creator = relationship("User", back_populates="assignments")
     questions = relationship("Question", back_populates="assignment", cascade="all, delete-orphan")
+    # 分析任务级联删除：删除作业（或级联删除用户）时一并清掉任务记录，
+    # 避免 analysis_tasks.assignment_id 外键（无 ON DELETE CASCADE）阻止删除
+    analysis_tasks = relationship("AnalysisTask", back_populates="assignment", cascade="all, delete-orphan")

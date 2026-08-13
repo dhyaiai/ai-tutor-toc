@@ -6,6 +6,8 @@ import {
 import { ReloadOutlined, UploadOutlined, CheckOutlined, SaveOutlined } from "@ant-design/icons";
 import type { SimilarBigQuestion, SimilarBigSubQuestion } from "../services/questionService";
 import { aiQuestionService } from "../services/aiQuestionService";
+import MathText from "./MathText";
+import QuestionSvgImage from "./QuestionSvgImage";
 
 const DIFFICULTY_OPTIONS = [
   { value: "easy", label: "基础" },
@@ -118,6 +120,7 @@ export default function SimilarBigQuestionCard({ question, questionId, onReplace
         knowledge_point: sq.knowledge_point,
         difficulty: sq.difficulty,
         options: sq.options || [],
+        image_svg: sq.image_svg,
         selected_options: isChoice ? ans.selectedOptions : undefined,
         answer_text: !isChoice ? ans.textAnswer : undefined,
         answer_image: ans.imageFile || undefined,
@@ -146,6 +149,7 @@ export default function SimilarBigQuestionCard({ question, questionId, onReplace
       const res = await aiQuestionService.saveBigQuestion({
         source_question_id: questionId,
         question_context: question.question_context,
+        context_image_svg: question.context_image_svg,
         difficulty: question.sub_questions[0]?.difficulty || "medium",
         sub_questions: question.sub_questions.map((sq, index) => ({
           ...sq,
@@ -219,7 +223,9 @@ export default function SimilarBigQuestionCard({ question, questionId, onReplace
           <Typography.Text strong style={{ fontSize: 13, display: "block", marginBottom: 4 }}>
             📖 阅读材料
           </Typography.Text>
-          {question.question_context}
+          <MathText content={question.question_context} style={{ fontSize: 13 }} />
+          {/* AI 生成的大题背景配图（SVG） */}
+          {question.context_image_svg && <QuestionSvgImage svg={question.context_image_svg} />}
         </div>
       )}
 
@@ -266,11 +272,13 @@ export default function SimilarBigQuestionCard({ question, questionId, onReplace
             }
           >
             {/* 题目文字 */}
-            <Typography.Paragraph
-              style={{ marginBottom: 12, fontSize: 13, whiteSpace: "pre-wrap" }}
-            >
-              {sq.question_text}
-            </Typography.Paragraph>
+            <MathText
+              content={sq.question_text}
+              style={{ display: "block", marginBottom: 12, fontSize: 13 }}
+            />
+
+            {/* AI 生成的子题配图（SVG） */}
+            {sq.image_svg && <QuestionSvgImage svg={sq.image_svg} />}
 
             {/* 单选题/多选题选项 */}
             {isChoice && options.length > 0 && !ans.result && (
@@ -287,7 +295,8 @@ export default function SimilarBigQuestionCard({ question, questionId, onReplace
                       <Space direction="vertical" size={4}>
                         {options.map((opt) => (
                           <Checkbox key={opt.label} value={opt.label}>
-                            <Typography.Text strong>{opt.label}.</Typography.Text> {opt.text}
+                            <Typography.Text strong>{opt.label}.</Typography.Text>{" "}
+                            <MathText content={opt.text} />
                           </Checkbox>
                         ))}
                       </Space>
@@ -301,7 +310,8 @@ export default function SimilarBigQuestionCard({ question, questionId, onReplace
                     <Space direction="vertical" size={4}>
                       {options.map((opt) => (
                         <Radio key={opt.label} value={opt.label}>
-                          <Typography.Text strong>{opt.label}.</Typography.Text> {opt.text}
+                          <Typography.Text strong>{opt.label}.</Typography.Text>{" "}
+                          <MathText content={opt.text} />
                         </Radio>
                       ))}
                     </Space>
@@ -383,7 +393,7 @@ export default function SimilarBigQuestionCard({ question, questionId, onReplace
                   <Typography.Text strong style={{ fontSize: 12 }}>
                     正确答案：
                   </Typography.Text>
-                  <Typography.Text style={{ fontSize: 12 }}>{sq.answer}</Typography.Text>
+                  <MathText content={sq.answer} style={{ fontSize: 12 }} />
                 </div>
                 {/* 完整解析 */}
                 {sq.analysis && (
@@ -391,9 +401,7 @@ export default function SimilarBigQuestionCard({ question, questionId, onReplace
                     <Typography.Text strong style={{ fontSize: 12, color: "#722ed1" }}>
                       解析：
                     </Typography.Text>
-                    <Typography.Paragraph style={{ fontSize: 12, marginBottom: 0, marginTop: 4, whiteSpace: "pre-wrap" }}>
-                      {sq.analysis}
-                    </Typography.Paragraph>
+                    <MathText content={sq.analysis} style={{ display: "block", fontSize: 12, marginTop: 4 }} />
                   </div>
                 )}
               </div>

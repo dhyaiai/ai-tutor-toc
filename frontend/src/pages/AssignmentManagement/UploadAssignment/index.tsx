@@ -22,9 +22,6 @@ export default function UploadAssignment() {
   return (
     <Card>
       <Typography.Title level={4}>上传作业</Typography.Title>
-      <Typography.Paragraph type="secondary">
-        上传作业文件后，前往详情页手动启动题目切割与AI分析。
-      </Typography.Paragraph>
       <Button
         type="primary"
         icon={<UploadOutlined />}

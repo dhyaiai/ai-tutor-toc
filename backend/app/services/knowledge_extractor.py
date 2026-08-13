@@ -108,9 +108,17 @@ class KnowledgeExtractor:
         return points
 
     async def _llm_extract(self, text: str) -> list[dict]:
-        """调用大模型精细化提取"""
+        """调用大模型精细化提取（带重试 + 容错解析）。
+
+        复用 llm_json.request_llm_json：思考型模型可能把 max_tokens 预算
+        耗在推理上导致正文为空或 JSON 截断，attempts=2（首次 + 1 次重试）
+        可显著提高提取成功率；extract_braces 容忍模型在 JSON 外附加
+        代码块/前后缀文本。最终仍失败时返回 []（不阻塞分析流程，
+        由调用方 knowledge_points 为空时静默接受）。
+        """
         from openai import AsyncOpenAI
         from app.core.config import get_settings
+        from app.services.llm_json import request_llm_json
 
         settings = get_settings()
         client = AsyncOpenAI(
@@ -118,22 +126,24 @@ class KnowledgeExtractor:
             base_url=settings.LLM_API_BASE,
         )
 
-        try:
-            response = await client.chat.completions.create(
-                model=settings.LLM_MODEL,
-                messages=[
-                    {"role": "user", "content": f"{EXTRACTION_PROMPT}\n\n分析文本：{text}"},
-                ],
-                max_tokens=500,
-                temperature=0.1,
-                response_format={"type": "json_object"},
-                timeout=30,
-            )
-            data = json.loads(response.choices[0].message.content or "{}")
-            return data.get("knowledge_points", [])
-        except Exception as e:
-            logger.error("LLM knowledge extraction failed: %s", e)
+        result = await request_llm_json(
+            client,
+            model=settings.LLM_MODEL,
+            messages=[
+                {"role": "user", "content": f"{EXTRACTION_PROMPT}\n\n分析文本：{text}"},
+            ],
+            max_tokens=500,
+            temperature=0.1,
+            timeout=60,          # 原 30s 偏紧，放宽到 60s 配合重试场景
+            attempts=2,          # 空正文 / JSON 截断 / 调用异常均重试一次
+            retry_delay=1.0,
+            response_format={"type": "json_object"},
+            extract_braces=True,  # 容错解析：忽略 JSON 外的多余文本
+        )
+        if result.data is None:
+            logger.error("LLM knowledge extraction failed: %s", result.error)
             return []
+        return result.data.get("knowledge_points", []) or []
 
     def merge(self, existing: list[dict] | None, new_points: list[dict]) -> list[dict]:
         """合并知识点，去重"""

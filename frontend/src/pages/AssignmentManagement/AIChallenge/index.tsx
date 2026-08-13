@@ -15,7 +15,7 @@ export default function AIChallenge() {
   const [page, setPage] = useState(1);
   const [filters, setFilters] = useState({
     grade: "",
-    subject: "",
+    subject: "数学",
     semester: "",
     question_type: "",
     difficulty: "",

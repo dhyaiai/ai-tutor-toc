@@ -100,6 +100,8 @@ export async function exportToExcel(
         rowIndex: number,
       ) => CellStyle
     >;
+    /** 按列 key 的单元格值转换器（如导出题目时对含 LaTeX 的列执行 latexToPlain） */
+    transforms?: Record<string, (value: unknown) => unknown>;
   },
 ): Promise<void> {
   const workbook = new ExcelJS.Workbook();
@@ -128,7 +130,12 @@ export async function exportToExcel(
   for (let rowIdx = 0; rowIdx < data.length; rowIdx++) {
     const rowData = data[rowIdx];
     const rowValues = columns.map((c) => {
-      const val = rowData[c.key];
+      let val = rowData[c.key];
+      // 该列配置了转换器（如 LaTeX→Unicode 可读文本）时先转换再写入
+      const transform = options?.transforms?.[c.key];
+      if (transform && val != null) {
+        val = transform(val);
+      }
       return val != null ? val : "";
     });
     const excelRow = worksheet.addRow(rowValues);

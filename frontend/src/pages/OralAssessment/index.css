@@ -1,0 +1,268 @@
+/**
+ * 听力与口语记录列表专属样式。
+ * 设计语言沿用全局 Soft-UI（frontend/src/styles/soft-ui.css），
+ * 与作业记录卡片格式保持一致。
+ * 所有选择器以 .oral-records 作用域限定，不污染其他页面。
+ */
+
+/* ==========================================================================
+   1. 筛选条：淡冷底容器，字段带前置小标签
+   -------------------------------------------------------------------------- */
+.oral-records .or-filter-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  background: #f5f7fb;
+  border: 1px solid var(--soft-border);
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+}
+
+.oral-records .or-filter-fields {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.oral-records .or-filter-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.oral-records .or-filter-field .ant-select {
+  min-width: 118px;
+}
+
+.oral-records .or-filter-label {
+  font-size: 13px;
+  color: var(--soft-text-secondary);
+  white-space: nowrap;
+}
+
+.oral-records .or-filter-reset {
+  padding-inline: 10px;
+}
+
+/* ==========================================================================
+   2. 卡片列表
+   -------------------------------------------------------------------------- */
+.oral-records .or-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 200px;
+}
+
+/* 单张卡片：白底 + 柔和阴影 + 圆角 14px */
+.oral-records .or-card {
+  display: flex;
+  align-items: stretch;
+  background: #ffffff;
+  border: 1px solid var(--soft-border);
+  border-radius: 14px;
+  box-shadow: var(--soft-shadow);
+  transition: transform 0.25s ease, box-shadow 0.25s ease;
+  overflow: hidden;
+  gap: 0;
+}
+
+/* hover：轻微上浮 + 阴影加深 */
+.oral-records .or-card:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--soft-shadow-hover);
+}
+
+/* ==========================================================================
+   2.1 左侧徽章：左上角得分，右下角总分（保持原有对角布局）
+   -------------------------------------------------------------------------- */
+.oral-records .or-card-badge {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  width: 90px;
+  min-height: 90px;
+  padding: 10px 8px;
+  background: linear-gradient(135deg, #fff7e6, #fff1d6);
+  border: 1px solid rgba(250, 173, 20, 0.25);
+  border-radius: 12px;
+  flex-shrink: 0;
+  align-self: center;
+  margin-left: 14px;
+}
+
+/* 徽章左上角得分 */
+.oral-records .or-badge-score {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  font-size: 26px;
+  font-weight: 700;
+  color: #d48806;
+  line-height: 1.2;
+}
+
+/* 斜杠分隔符：居中显示 */
+.oral-records .or-badge-sep {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 14px;
+  color: #c9a04e;
+  line-height: 1.2;
+}
+
+/* 徽章右下角总分 */
+.oral-records .or-badge-total {
+  position: absolute;
+  bottom: 8px;
+  right: 10px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #bfbfbf;
+  line-height: 1.2;
+}
+
+/* ==========================================================================
+   2.2 卡片信息区
+   -------------------------------------------------------------------------- */
+.oral-records .or-card-body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 1;
+  padding: 14px 20px;
+  min-width: 0;
+}
+
+/* 左侧信息区 */
+.oral-records .or-card-info {
+  min-width: 0;
+}
+
+/* 卡片内部行 */
+.oral-records .or-card-row {
+  display: flex;
+  align-items: center;
+  line-height: 1.5;
+}
+
+/* 第一行：记录名称 */
+.oral-records .or-card-row-title {
+  margin-bottom: 8px;
+}
+
+.oral-records .or-card-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--soft-primary);
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+
+.oral-records .or-card-title:hover {
+  color: var(--soft-primary-hover);
+  text-decoration: underline;
+}
+
+/* 第二行：元信息标签 */
+.oral-records .or-card-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.oral-records .or-card-meta-tag {
+  display: inline-block;
+  font-size: 12px;
+  color: #3d4a5c;
+  background: #f0f4fa;
+  border: 1px solid #e3e8f0;
+  border-radius: 6px;
+  padding: 3px 10px;
+  line-height: 1.4;
+}
+
+/* 第三行：时间 */
+.oral-records .or-card-row-time {
+  font-size: 13px;
+  color: var(--soft-text-secondary);
+}
+
+/* 右侧操作按钮：垂直居中 */
+.oral-records .or-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  margin-left: 16px;
+}
+
+/* ==========================================================================
+   2.3 操作按钮：长方形圆角矩形
+   -------------------------------------------------------------------------- */
+.oral-records .or-action-view {
+  height: 34px !important;
+  padding: 0 24px !important;
+  border-radius: 8px !important;
+  border: 1px solid var(--soft-primary) !important;
+  background: transparent !important;
+  color: var(--soft-primary) !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  transition: all 0.2s ease;
+}
+
+.oral-records .or-action-view:hover {
+  background: rgba(26, 86, 219, 0.08) !important;
+  color: var(--soft-primary-hover) !important;
+  border-color: var(--soft-primary-hover) !important;
+}
+
+.oral-records .or-action-delete {
+  height: 34px !important;
+  padding: 0 24px !important;
+  border-radius: 8px !important;
+  border: 1px solid var(--soft-border) !important;
+  background: transparent !important;
+  color: var(--soft-text-secondary) !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  transition: all 0.2s ease;
+}
+
+.oral-records .or-action-delete:hover {
+  background: #fff1f0 !important;
+  color: #ff4d4f !important;
+  border-color: #ffa39e !important;
+}
+
+/* ==========================================================================
+   2.4 空状态 / 加载
+   -------------------------------------------------------------------------- */
+.oral-records .or-empty,
+.oral-records .or-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  color: var(--soft-text-secondary);
+  font-size: 14px;
+}
+
+/* ==========================================================================
+   3. 分页
+   -------------------------------------------------------------------------- */
+.oral-records .or-pagination {
+  display: flex;
+  justify-content: center;
+  margin-top: 24px;
+}

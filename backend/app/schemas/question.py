@@ -9,6 +9,7 @@ class QuestionResponse(BaseModel):
     question_number: int
     question_type: str | None
     image_url: str
+    question_text: str | None = None  # 识别出的题干文本（含 LaTeX 公式）
     student_answer: str | None
     correct_answer: str | None
     score: float | None

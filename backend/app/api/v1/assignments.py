@@ -15,9 +15,11 @@ from app.schemas.assignment import (
 from app.schemas.question import QuestionResponse
 from app.services.file_upload import StorageService
 from app.core.config import get_settings
+from app.utils.pdf_renderer_utils import _rotate_and_cut, _render_pdf_pages_bgr, _merge_images
 import asyncio
 import json
 import logging
+import time
 from io import BytesIO
 
 logger = logging.getLogger(__name__)
@@ -25,6 +27,11 @@ logger = logging.getLogger(__name__)
 from pydantic import BaseModel
 
 router = APIRouter(prefix="/assignments", tags=["assignments"])
+
+# 僵尸状态自愈节流记录：assignment_id → 上次自愈时间戳
+# 防止前端轮询详情页时反复触发 reconcile + recalc（每次都会 commit 写库）
+_HEAL_THROTTLE_SECONDS = 60
+_last_heal_timestamps: dict[int, float] = {}
 
 
 class ManualSplitRegion(BaseModel):
@@ -36,6 +43,10 @@ class ManualSplitRegion(BaseModel):
     h: float
     draw_order: int = 0  # 绘制顺序，同题多区域时决定合并后的排列先后
     rotation: int = 0     # 图片旋转角度：0/90/180/270，应用到该页面后再裁切
+    # 区域类型：question=普通题目区域；answer_sheet=客观题识别区（答题卡），
+    # 不创建 Question 记录，切图保存到作业级 answer_sheet_image_url，
+    # 评分时作为 [Answer Sheet] 第三图源拼入每道题
+    region_type: str = "question"
 
 
 class ManualSplitRequest(BaseModel):
@@ -58,46 +69,10 @@ class AnswerSplitRequest(BaseModel):
     answer_file_url: str  # 从上一步 answer-pages 返回中获取，用于定位答案文件
 
 
-def _rotate_and_cut(page_img: "np.ndarray", rotation: int,
-                    x: float, y: float, w: float, h: float) -> "np.ndarray | None":
-    """
-    旋转图片后按坐标裁切区域。
-
-    Args:
-        page_img: 原始页面图片 (OpenCV BGR numpy array)
-        rotation: 旋转角度（0/90/180/270）
-        x, y: 裁切区域左上角坐标（基于旋转后的图片）
-        w, h: 裁切区域宽高
-
-    Returns:
-        裁切后的图片 numpy array，无效区域返回 None
-    """
-    import cv2
-    import numpy as np
-
-    img = page_img
-    if rotation:
-        if rotation == 90:
-            img = cv2.rotate(page_img, cv2.ROTATE_90_CLOCKWISE)
-        elif rotation == 180:
-            img = cv2.rotate(page_img, cv2.ROTATE_180)
-        elif rotation == 270:
-            img = cv2.rotate(page_img, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-    ph, pw = img.shape[:2]
-    cx = max(0, int(x))
-    cy = max(0, int(y))
-    cw = min(pw - cx, int(w))
-    ch = min(ph - cy, int(h))
-
-    if cw <= 0 or ch <= 0:
-        return None
-
-    return img[cy:cy + ch, cx:cx + cw]
-
-
 ALLOWED_EXTENSIONS = {".pdf", ".png", ".jpg", ".jpeg", ".webp"}
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
+
+# 上传大小上限统一读取 config.MAX_UPLOAD_SIZE_MB（避免硬编码与配置漂移）
+# 注：原硬编码 MAX_FILE_SIZE = 50MB 已移除，见 _validate_and_read_file
 
 # Image magic bytes
 JPEG_MAGIC = b"\xff\xd8\xff"
@@ -115,7 +90,11 @@ _MAGIC_MAP = {
 
 
 async def _validate_and_read_file(file: UploadFile) -> bytes:
-    """Validate file extension, size and magic bytes. Returns file bytes."""
+    """Validate file extension, size and magic bytes. Returns file bytes.
+
+    分块读取 + 中途截断：避免超大请求先整体 read() 进内存再判大小
+    （恶意并发大文件会把 worker 内存打爆），超限立即抛 413 中止读取。
+    """
     if not file.filename:
         raise HTTPException(status_code=400, detail="未提供文件")
     ext = "." + file.filename.rsplit(".", 1)[-1].lower()
@@ -125,9 +104,19 @@ async def _validate_and_read_file(file: UploadFile) -> bytes:
             detail=f"不支持的文件类型，仅允许：{', '.join(ALLOWED_EXTENSIONS)}",
         )
 
-    file_data = await file.read()
-    if len(file_data) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=413, detail=f"文件过大（最大 {MAX_FILE_SIZE // 1024 // 1024}MB）")
+    max_size = get_settings().MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    max_size_mb = get_settings().MAX_UPLOAD_SIZE_MB
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await file.read(1024 * 1024)  # 每次最多读 1MB
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_size:
+            raise HTTPException(status_code=413, detail=f"文件过大（最大 {max_size_mb}MB）")
+        chunks.append(chunk)
+    file_data = b"".join(chunks)
 
     # Validate magic bytes
     magic = _MAGIC_MAP.get(ext)
@@ -139,6 +128,127 @@ async def _validate_and_read_file(file: UploadFile) -> bytes:
             raise HTTPException(status_code=400, detail=f"无效的 {ext.upper()} 文件")
 
     return file_data
+
+
+def _image_bytes_to_pdf(file_data: bytes) -> bytes:
+    """将图片字节（png/jpg/jpeg/webp）转换为单页 PDF 字节。"""
+    from PIL import Image
+
+    img = Image.open(BytesIO(file_data))
+    if img.mode != "RGB":
+        img = img.convert("RGB")
+    buf = BytesIO()
+    img.save(buf, format="PDF")
+    return buf.getvalue()
+
+
+def _merge_pdf_bytes(file_datas: list[tuple[str, bytes]]) -> bytes:
+    """合并多个文件字节（PDF/图片）为单个 PDF 字节。
+
+    同步 CPU+IO 重活（fitz 逐文件插入 + 重写 PDF），多文件大卷可达秒级，
+    必须在 asyncio.to_thread 中调用。文件字节已由调用方下载完毕，
+    这里只做纯内存合并，不触碰存储。
+
+    Args:
+        file_datas: [(原文件名, 文件字节), ...]，扩展名决定合并方式
+
+    Raises:
+        ValueError: 不支持的扩展名 / 合并结果为空
+    """
+    import fitz
+
+    merged_doc = fitz.open()  # 新建空白 PDF 文档
+    try:
+        for fp, file_data in file_datas:
+            ext = fp.rsplit(".", 1)[-1].lower() if "." in fp else ""
+            if ext == "pdf":
+                # PDF → 打开并插入所有页面
+                src_doc = fitz.open(stream=file_data, filetype="pdf")
+                try:
+                    merged_doc.insert_pdf(src_doc)
+                finally:
+                    src_doc.close()
+            elif ext in ("png", "jpg", "jpeg", "webp"):
+                # 图片 → Pillow 打开 → 转为 PDF → 插入
+                src_doc = fitz.open(stream=_image_bytes_to_pdf(file_data), filetype="pdf")
+                try:
+                    merged_doc.insert_pdf(src_doc)
+                finally:
+                    src_doc.close()
+            else:
+                raise ValueError(f"不支持合并的文件类型：.{ext}")
+
+        if len(merged_doc) == 0:
+            raise ValueError("合并后PDF为空，请检查上传的文件")
+        return merged_doc.tobytes()
+    finally:
+        merged_doc.close()
+
+
+def _assert_owned_storage_path(file_path: str, user_id: int, allowed_prefixes: tuple[str, ...] = ("originals", "answers")) -> None:
+    """校验存储路径归属：只允许读取当前用户目录下自己上传的文件。
+
+    客户端传入的 file_path / file_paths 直接拼接进 storage 读取（get_file_bytes
+    按路径直读本地目录或 MinIO 对象），若不校验可跨用户读取他人文件
+    （含 reports/ 下的学情报告）。同时拒绝 `..` 防止路径穿越。
+
+    注意：Windows 下反斜杠段（如 `..\\`）可绕过按 '/' 切分的 `..` 检查，
+    必须先统一替换为 '/' 再校验（本地存储模式路径会经 pathlib 规范化后读取）。
+    使用 pathlib.Path.resolve() 彻底防御路径穿越（含符号链接攻击）。
+    """
+    from pathlib import Path
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    # 统一路径分隔符
+    normalized = file_path.replace("\\", "/")
+    # 基础检查：拒绝明显的路径穿越尝试
+    if ".." in normalized.split("/"):
+        raise HTTPException(status_code=400, detail=f"非法的文件路径：{file_path}")
+    # 校验前缀归属：必须是当前用户的指定目录
+    prefix_valid = any(normalized.startswith(f"{prefix}/{user_id}/") for prefix in allowed_prefixes)
+    if not prefix_valid:
+        raise HTTPException(
+            status_code=403,
+            detail="无权访问该文件：只能使用自己上传的文件",
+        )
+    # 深度防御：本地存储模式下，resolve 后确认仍在存储根目录内
+    if settings.DEV_MODE:
+        storage_root = Path(settings.LOCAL_STORAGE_DIR).resolve()
+        target_path = (storage_root / normalized).resolve()
+        if not target_path.is_relative_to(storage_root):
+            raise HTTPException(status_code=400, detail=f"路径穿越攻击被拦截：{file_path}")
+
+
+async def _ensure_pdf(
+    file_path: str,
+    storage: StorageService,
+    user_id: int,
+) -> str:
+    """
+    确保原卷以 PDF 格式存储：已是 PDF 直接返回原路径；
+    图片文件则转换为单页 PDF 存入 storage，返回新的 file_url。
+    """
+    # 归属校验：file_path 由客户端传入，防止跨用户读取他人文件
+    _assert_owned_storage_path(file_path, user_id)
+    ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+    if ext == "pdf":
+        return file_path
+
+    file_data = await storage.get_file_bytes(file_path)
+    if not file_data:
+        raise HTTPException(
+            status_code=400,
+            detail=f"文件读取失败：{file_path}，请重新上传",
+        )
+
+    # Pillow 转 PDF 是同步 CPU 重活，线程池执行避免阻塞事件循环
+    pdf_bytes = await asyncio.to_thread(_image_bytes_to_pdf, file_data)
+    base_name = file_path.rsplit("/", 1)[-1] if "/" in file_path else file_path
+    pdf_name = (base_name.rsplit(".", 1)[0] if "." in base_name else base_name) + ".pdf"
+    file_url = await storage.save_original(pdf_bytes, pdf_name, user_id)
+    logger.info(f"Converted {file_path} to PDF: {file_url}")
+    return file_url
 
 
 async def _merge_files_to_pdf(
@@ -154,12 +264,11 @@ async def _merge_files_to_pdf(
     - 图片文件（png/jpg/jpeg/webp）：先用 Pillow 转为 PDF 再插入
     - 文件顺序由 file_paths 数组顺序决定（前端保证 = 用户排列的顺序）
     """
-    import fitz
-    from PIL import Image
-
-    merged_doc = fitz.open()  # 新建空白 PDF 文档
-
+    # 归属校验 + 下载（异步 IO 保持在事件循环）
+    file_datas: list[tuple[str, bytes]] = []
     for fp in file_paths:
+        # 归属校验：file_paths 由客户端传入，防止跨用户读取他人文件
+        _assert_owned_storage_path(fp, user_id)
         # 从 storage 读取文件内容（支持 MinIO 和本地存储）
         file_data = await storage.get_file_bytes(fp)
         if not file_data:
@@ -167,39 +276,13 @@ async def _merge_files_to_pdf(
                 status_code=400,
                 detail=f"文件读取失败：{fp}，请重新上传",
             )
+        file_datas.append((fp, file_data))
 
-        ext = fp.rsplit(".", 1)[-1].lower() if "." in fp else ""
-
-        if ext == "pdf":
-            # PDF → 打开并插入所有页面
-            src_doc = fitz.open(stream=file_data, filetype="pdf")
-            merged_doc.insert_pdf(src_doc)
-            src_doc.close()
-
-        elif ext in ("png", "jpg", "jpeg", "webp"):
-            # 图片 → Pillow 打开 → 转为 PDF → 插入
-            img = Image.open(BytesIO(file_data))
-            if img.mode != "RGB":
-                img = img.convert("RGB")
-            img_pdf_bytes = BytesIO()
-            img.save(img_pdf_bytes, format="PDF")
-            img_pdf_bytes.seek(0)
-            src_doc = fitz.open(stream=img_pdf_bytes.read(), filetype="pdf")
-            merged_doc.insert_pdf(src_doc)
-            src_doc.close()
-
-        else:
-            raise HTTPException(
-                status_code=400,
-                detail=f"不支持合并的文件类型：.{ext}",
-            )
-
-    if len(merged_doc) == 0:
-        raise HTTPException(status_code=400, detail="合并后PDF为空，请检查上传的文件")
-
-    # 保存合并后的 PDF 到 storage
-    merged_bytes = merged_doc.tobytes()
-    merged_doc.close()
+    # fitz 逐页插入 + 重写 PDF 是同步 CPU 重活，线程池执行避免阻塞事件循环
+    try:
+        merged_bytes = await asyncio.to_thread(_merge_pdf_bytes, file_datas)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # 合并后的文件名：基于第一个文件名，确保以 .pdf 结尾
     base_name = file_paths[0].rsplit("/", 1)[-1] if "/" in file_paths[0] else file_paths[0]
@@ -251,15 +334,19 @@ async def upload_assignment(
         # 多文件合并模式：按前端排列的顺序合并为单个 PDF
         file_url = await _merge_files_to_pdf(parsed_paths, storage, current_user.id)
     elif len(parsed_paths) == 1:
-        # 单文件路径，直接用
-        file_url = parsed_paths[0]
+        # 单文件路径：统一转为 PDF 存储（图片 → 单页 PDF）
+        file_url = await _ensure_pdf(parsed_paths[0], storage, current_user.id)
     elif file_path:
-        # 旧版单文件预上传模式
-        file_url = file_path
+        # 旧版单文件预上传模式：统一转为 PDF 存储
+        file_url = await _ensure_pdf(file_path, storage, current_user.id)
     elif file:
-        # 直接上传单文件模式
+        # 直接上传单文件模式：图片先转为单页 PDF 再存储
         file_data = await _validate_and_read_file(file)
-        file_url = await storage.save_original(file_data, file.filename, current_user.id)
+        filename = file.filename or "upload"
+        if not filename.lower().endswith(".pdf"):
+            file_data = _image_bytes_to_pdf(file_data)
+            filename = (filename.rsplit(".", 1)[0] if "." in filename else filename) + ".pdf"
+        file_url = await storage.save_original(file_data, filename, current_user.id)
     else:
         raise HTTPException(status_code=400, detail="No file or file_path provided")
 
@@ -344,13 +431,14 @@ async def list_assignments(
             func.count(Question.id).label("question_count"),
             func.sum(case((Question.score < Question.full_score, 1), else_=0)).label("error_count"),
             func.coalesce(func.sum(Question.score), 0).label("total_score"),
+            func.coalesce(func.sum(Question.full_score), 0).label("full_total"),
         )
         .group_by(Question.assignment_id)
         .subquery()
     )
 
     query = (
-        select(Assignment, func.coalesce(q_stats.c.question_count, 0), func.coalesce(q_stats.c.error_count, 0), func.coalesce(q_stats.c.total_score, 0))
+        select(Assignment, func.coalesce(q_stats.c.question_count, 0), func.coalesce(q_stats.c.error_count, 0), func.coalesce(q_stats.c.total_score, 0), func.coalesce(q_stats.c.full_total, 0))
         .outerjoin(q_stats, Assignment.id == q_stats.c.assignment_id)
         .where(Assignment.creator_id == current_user.id)
     )
@@ -367,7 +455,7 @@ async def list_assignments(
     rows = result.all()
 
     items = []
-    for a, question_count, error_count, total_score in rows:
+    for a, question_count, error_count, total_score, full_total in rows:
         items.append(
             {
                 "id": a.id,
@@ -379,6 +467,7 @@ async def list_assignments(
                 "layout_type": a.layout_type,
                 "status": a.status,
                 "total_score": float(total_score),
+                "full_total": float(full_total),
                 "question_count": question_count,
                 "error_count": error_count,
                 "created_at": a.created_at,
@@ -417,6 +506,56 @@ async def get_assignment(
     )
     all_questions = q_result.scalars().all()
 
+    # ── 僵尸状态自愈 ──
+    # dev 模式下分析任务与 API 同进程运行，服务重启会丢失后台任务，
+    # 导致作业永远停留在"正在分析"。若检测到状态为分析中但当前进程
+    # 并没有该作业的任务在跑，则自动收敛（规则见 reconcile_stuck_assignment：
+    # 全失败 → 作业标记失败；残留非终态题目先标记失败再收敛，避免卡死无法重分析）。
+    settings = get_settings()
+    _ANALYZING_STATES = (
+        AssignmentStatus.SPLITTING,
+        AssignmentStatus.GRADING,
+        AssignmentStatus.PROCESSING,
+    )
+    # 僵尸状态自愈的触发条件（A3-5 扩展）：
+    # - 作业级状态仍卡在分析中（整卷分析被打断）
+    # - 或作业已到终态但存在非终态题目（单题重分析被打断，题目卡在
+    #   PROCESSING/PENDING，无法再次重分析）
+    # 单题重分析进行中会登记进 is_analysis_running 的内存注册表，
+    # 自愈逻辑据此跳过，不会误杀在飞任务。
+    # 题目残留触发自愈仅适用于"已进入过分析生命周期"的作业：
+    # 单题重分析被打断时作业已是终态（COMPLETED/FAILED），题目卡在
+    # PENDING/PROCESSING；而作业仍停在 PENDING/SPLITTING/SPLITTED 时，
+    # 题目 PENDING 是合法的（用户还没点"开始分析"），不能当作崩溃残留
+    # 误标失败。此防护与启动扫描 reconcile_all_stuck_assignments 第二类一致。
+    has_stale_question = (
+        assignment.status in (AssignmentStatus.COMPLETED, AssignmentStatus.FAILED)
+        and any(
+            q.status in (QuestionStatus.PENDING, QuestionStatus.PROCESSING)
+            for q in all_questions
+        )
+    )
+    if (
+        settings.DEV_MODE
+        and all_questions
+        and (assignment.status in _ANALYZING_STATES or has_stale_question)
+    ):
+        from app.tasks.analysis_tasks import (
+            is_analysis_running,
+            reconcile_stuck_assignment,
+            recalc_assignment_total,
+        )
+        # 节流：60 秒内不重复自愈同一作业（前端轮询详情页时避免反复写库）
+        now = time.time()
+        last_heal = _last_heal_timestamps.get(assignment_id, 0)
+        if not is_analysis_running(assignment_id) and (now - last_heal) > _HEAL_THROTTLE_SECONDS:
+            healed = await reconcile_stuck_assignment(db, assignment, all_questions)
+            if healed:
+                _last_heal_timestamps[assignment_id] = now
+                # 重算总分（内部会自行 commit）并刷新内存中的 assignment
+                await recalc_assignment_total(assignment_id, db)
+                await db.refresh(assignment)
+
     # Generate presigned URLs (graceful fallback on storage errors)
     storage = StorageService()
 
@@ -427,12 +566,11 @@ async def get_assignment(
         file_url = ""
 
     # 辅助函数：将 Question ORM 对象转为 dict
-    async def _question_to_dict(q: Question) -> dict:
-        try:
-            image_url = await storage.get_presigned_url(q.image_url)
-        except Exception:
-            logger.warning("Failed to get presigned URL for question %d image_url", q.id)
-            image_url = ""
+    # 批量预生成所有题目的预签名 URL（单次批量调用替代 N 次单独调用）
+    def _question_to_dict(q: Question, presigned_cache: dict[str, str]) -> dict:
+        # 从缓存获取预签名 URL（已在外部批量生成）
+        image_url = presigned_cache.get(q.image_url, "")
+        answer_image_url = presigned_cache.get(q.answer_image_url, "") if q.answer_image_url else None
         return {
             "id": q.id,
             "assignment_id": q.assignment_id,
@@ -456,17 +594,44 @@ async def get_assignment(
             "created_at": q.created_at,
             "parent_id": q.parent_id,
             "sub_question_index": q.sub_question_index,
-            "answer_image_url": (await storage.get_presigned_url(q.answer_image_url)) if q.answer_image_url else None,
+            "answer_image_url": answer_image_url,
             "manual_review_note": q.manual_review_note,
             "children": [],  # 占位，后续填充
         }
+
+    # 批量预生成所有题目的预签名 URL（避免 N+1 查询）
+    # 收集所有需要生成 URL 的路径（去重），然后批量生成
+    all_image_urls: set[str] = set()
+    for q in all_questions:
+        if q.image_url:
+            all_image_urls.add(q.image_url)
+        if q.answer_image_url:
+            all_image_urls.add(q.answer_image_url)
+    # 批量生成预签名 URL（storage 内部可并发，但对外是单次调用入口）
+    presigned_cache: dict[str, str] = {}
+    if all_image_urls:
+        try:
+            # 批量生成：用 asyncio.gather 并发请求所有 URL
+            import asyncio as _asyncio
+            url_list = list(all_image_urls)
+            results = await _asyncio.gather(
+                *[storage.get_presigned_url(url) for url in url_list],
+                return_exceptions=True,
+            )
+            for url, result in zip(url_list, results):
+                if isinstance(result, Exception):
+                    presigned_cache[url] = ""
+                else:
+                    presigned_cache[url] = result
+        except Exception:
+            logger.warning("批量生成预签名 URL 失败")
 
     # 构建嵌套结构：父题 + 子题（支持多级嵌套）
     children_by_parent: dict[int, list[dict]] = {}
     top_level: list[dict] = []
     all_dicts: list[dict] = []
     for q in all_questions:
-        qd = await _question_to_dict(q)
+        qd = _question_to_dict(q, presigned_cache)
         all_dicts.append(qd)
         if q.parent_id is not None:
             # 子题 → 归入对应父题
@@ -672,6 +837,16 @@ async def cancel_analysis(
 
     assignment.status = AssignmentStatus.FAILED
     assignment.ai_summary = "用户手动终止"
+    # 同步清理"正在分析"的题目，避免终止后前端残留转圈状态
+    q_result = await db.execute(
+        select(Question).where(
+            Question.assignment_id == assignment_id,
+            Question.status == QuestionStatus.PROCESSING,
+        )
+    )
+    for q in q_result.scalars().all():
+        q.status = QuestionStatus.FAILED
+        q.analysis_detail = "分析已终止，请重新分析该题"
     await db.commit()
 
     return {"assignment_id": assignment_id, "status": "failed", "message": "Analysis cancelled."}
@@ -704,54 +879,16 @@ async def re_summarize(
         raise HTTPException(status_code=400, detail="仅已完成分析的作业可以重新汇总")
 
     # 2. 重新计算总分
-    from app.tasks.analysis_tasks import recalc_assignment_total
+    from app.tasks.analysis_tasks import recalc_assignment_total, refresh_assignment_summary
     await recalc_assignment_total(assignment_id, db, user_id=current_user.id)
 
     # 3. 刷新 assignment 数据（recalc 内部已 commit，需要重新加载）
     await db.refresh(assignment)
 
-    # 4. 获取叶子题目，重新生成AI评语
-    from app.tasks.analysis_tasks import _generate_assignment_summary
-    from app.models.question import Question
+    # 4. 基于最新题目数据重新生成AI评语（内置 LLM 失败回退）
+    await refresh_assignment_summary(assignment_id, db)
 
-    q_result = await db.execute(
-        select(Question)
-        .where(Question.assignment_id == assignment_id)
-        .order_by(Question.question_number, Question.sub_question_index)
-    )
-    all_qs = q_result.scalars().all()
-    parent_ids = {q.parent_id for q in all_qs if q.parent_id is not None}
-    leaf_records = [(q, None) for q in all_qs if q.id not in parent_ids]
-
-    error_count = sum(
-        1 for q, _ in leaf_records
-        if q.score is not None and q.full_score is not None and q.score < q.full_score
-    )
-
-    try:
-        ai_summary = await _generate_assignment_summary(
-            question_records=leaf_records,
-            total_score=assignment.total_score or 0,
-            q_count=len(leaf_records),
-            error_count=error_count,
-        )
-        assignment.ai_summary = ai_summary
-    except Exception as e:
-        logger.warning("重新汇总: LLM评语生成失败，使用基础评语: %s", e)
-        kp_set: set[str] = set()
-        for q, _ in leaf_records:
-            if q.knowledge_points:
-                for kp in (q.knowledge_points if isinstance(q.knowledge_points, list) else []):
-                    name = kp if isinstance(kp, str) else kp.get("name", str(kp)) if isinstance(kp, dict) else str(kp)
-                    kp_set.add(name)
-        kp_list = ", ".join(kp_set) if kp_set else "暂无"
-        assignment.ai_summary = (
-            f"本作业共 {len(leaf_records)} 题，总分 {assignment.total_score or 0} 分。"
-            f"错题 {error_count} 题。"
-            f"涉及知识点：{kp_list}。"
-        )
-
-    await db.commit()
+    await db.refresh(assignment)
 
     return {
         "assignment_id": assignment_id,
@@ -789,23 +926,14 @@ async def get_source_pages(
     if not file_bytes:
         raise HTTPException(status_code=404, detail="源文件不存在")
 
-    # 渲染页面图片
+    # 渲染页面图片（fitz 栅格化是同步 CPU 重活，线程池执行避免阻塞事件循环）
     import numpy as np
+    import cv2
     if file_bytes.startswith(b"%PDF"):
-        # PDF → 逐页渲染
-        import fitz, cv2
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
+        # PDF → 逐页渲染（to_thread 中独立打开/关闭 Document，线程安全）
+        rendered_pages = await asyncio.to_thread(_render_pdf_pages_bgr, file_bytes)
         pages = []
-        for page_idx, page in enumerate(doc):
-            mat = fitz.Matrix(2.0, 2.0)
-            pix = page.get_pixmap(matrix=mat)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            if img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-            elif img.shape[2] == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            else:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        for page_idx, img in rendered_pages.items():
             _, img_bytes = cv2.imencode(".png", img)
             # 保存临时页面图片
             page_path = await storage.save_question_image(
@@ -816,16 +944,15 @@ async def get_source_pages(
             except Exception:
                 logger.warning("Failed to get presigned URL for page %d", page_idx)
                 page_url = ""
+            h, w = img.shape[:2]
             pages.append({
                 "page_index": page_idx,
                 "image_url": page_url,
-                "width": pix.width,
-                "height": pix.height,
+                "width": w,
+                "height": h,
             })
-        doc.close()
     else:
-        # 单张图片
-        import cv2
+        # 单张图片（解码毫秒级，保持原位执行）
         img_array = np.frombuffer(file_bytes, dtype=np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
         if img is None:
@@ -874,6 +1001,12 @@ async def manual_split(
     if not data.regions:
         raise HTTPException(status_code=400, detail="至少需要一个题目区域")
 
+    # 拆分普通题目区域与客观题识别区区域
+    question_regions = [r for r in data.regions if r.region_type != "answer_sheet"]
+    sheet_regions = [r for r in data.regions if r.region_type == "answer_sheet"]
+    if not question_regions:
+        raise HTTPException(status_code=400, detail="至少需要一个题目区域（识别区不能单独切割）")
+
     storage = StorageService()
 
     # 下载原始文件
@@ -885,23 +1018,11 @@ async def manual_split(
 
     import numpy as np, cv2
 
-    # 渲染所有页面
+    # 渲染所有页面（fitz 栅格化是同步 CPU 重活，线程池执行避免阻塞事件循环）
     page_images: dict[int, np.ndarray] = {}
     if file_bytes.startswith(b"%PDF"):
-        import fitz
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        for page_idx, page in enumerate(doc):
-            mat = fitz.Matrix(2.0, 2.0)
-            pix = page.get_pixmap(matrix=mat)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            if img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-            elif img.shape[2] == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            else:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            page_images[page_idx] = img
-        doc.close()
+        rendered_pages = await asyncio.to_thread(_render_pdf_pages_bgr, file_bytes)
+        page_images = dict(rendered_pages)
     else:
         img_array = np.frombuffer(file_bytes, dtype=np.uint8)
         img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -932,10 +1053,18 @@ async def manual_split(
             await db.delete(q)
     await db.flush()
 
+    # 删除旧的客观题识别区切图（重新切割时替换，未标记则清空）
+    if assignment.answer_sheet_image_url:
+        try:
+            await storage.delete_object(assignment.answer_sheet_image_url)
+        except Exception:
+            pass
+        assignment.answer_sheet_image_url = None
+
     # 按题号分组（前端已按 question_number→draw_order 排序，这里用 dict 保持首次出现顺序）
     groups: dict[int, list[ManualSplitRegion]] = {}
     group_order: list[int] = []
-    for region in data.regions:
+    for region in question_regions:
         if region.question_number not in groups:
             groups[region.question_number] = []
             group_order.append(region.question_number)
@@ -998,6 +1127,29 @@ async def manual_split(
         )
         db.add(question)
 
+    # 切割客观题识别区（多个区域垂直合并），保存到作业级字段
+    if sheet_regions:
+        sheet_cuts: list[np.ndarray] = []
+        for region in sheet_regions:
+            page_img = page_images.get(region.page_index)
+            if page_img is None:
+                logger.warning("Page %d not found for answer sheet region, skipping", region.page_index)
+                continue
+            cut = _rotate_and_cut(page_img, region.rotation, region.x, region.y, region.w, region.h)
+            if cut is None:
+                logger.warning("Invalid answer sheet region: x=%.0f y=%.0f w=%.0f h=%.0f rot=%d",
+                               region.x, region.y, region.w, region.h, region.rotation)
+                continue
+            sheet_cuts.append(cut)
+        if sheet_cuts:
+            sheet_img = sheet_cuts[0] if len(sheet_cuts) == 1 else _merge_images(sheet_cuts)
+            _, sheet_bytes = cv2.imencode(".png", sheet_img)
+            assignment.answer_sheet_image_url = await storage.save_question_image(
+                sheet_bytes.tobytes(), current_user.id, assignment_id, suffix="_answer_sheet"
+            )
+            logger.info("[manual-split] 作业 %d 已保存客观题识别区切图（%d 个区域）",
+                        assignment_id, len(sheet_cuts))
+
     # 更新状态为已切割
     assignment.status = AssignmentStatus.SPLITTED
     await db.commit()
@@ -1006,6 +1158,7 @@ async def manual_split(
         "assignment_id": assignment_id,
         "status": assignment.status.value,
         "question_count": len(group_order),
+        "has_answer_sheet": assignment.answer_sheet_image_url is not None,
         "message": "Manual split completed.",
     }
 
@@ -1017,7 +1170,7 @@ async def upload_answer_pages(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """上传学生答案文件，渲染所有页面为图片供前端 canvas 展示切割区域。"""
+    """上传标准答案（答案解析）文件，渲染所有页面为图片供前端 canvas 展示切割区域。"""
     # 1. 校验所有权
     result = await db.execute(
         select(Assignment).where(
@@ -1032,56 +1185,28 @@ async def upload_answer_pages(
     # 2. 校验文件
     file_bytes = await _validate_and_read_file(file)
 
-    # 3. 将答案文件保存到作业记录（后续切割时使用）
+    # 3. 将答案文件保存到作业记录（使用 StorageService 统一存储）
     import uuid as _uuid
-    settings = get_settings()
     storage = StorageService()
 
-    # 保存原始答案文件
-    ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else "png"
+    # 安全提取扩展名（使用已校验的文件名，限制为白名单内类型）
+    _ALLOWED_EXT = {"png", "jpg", "jpeg", "webp", "pdf"}
+    ext = "png"  # 默认扩展名
+    if file.filename and "." in file.filename:
+        candidate = file.filename.rsplit(".", 1)[-1].lower()
+        if candidate in _ALLOWED_EXT:
+            ext = candidate
     answer_file_url = f"answers/{current_user.id}/{assignment_id}/answer_{_uuid.uuid4().hex}.{ext}"
-    if settings.DEV_MODE:
-        from pathlib import Path
-        full_path = Path(settings.LOCAL_STORAGE_DIR) / answer_file_url
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_bytes(file_bytes)
-    else:
-        import io
-        from minio import Minio
-        client = Minio(
-            settings.MINIO_ENDPOINT,
-            access_key=settings.MINIO_ACCESS_KEY,
-            secret_key=settings.MINIO_SECRET_KEY,
-            secure=settings.MINIO_SECURE,
-        )
-        bucket = settings.MINIO_BUCKET
-        if not client.bucket_exists(bucket):
-            client.make_bucket(bucket)
-        client.put_object(
-            bucket, answer_file_url,
-            io.BytesIO(file_bytes), len(file_bytes),
-            content_type="application/octet-stream",
-        )
+    await storage.save_file(answer_file_url, file_bytes)
 
-    # 4. 渲染所有页面为PNG
+    # 4. 渲染所有页面为PNG（fitz 栅格化是同步 CPU 重活，线程池执行避免阻塞事件循环）
     pages: list[dict] = []
     import numpy as np
     import cv2
 
     if file_bytes.startswith(b"%PDF"):
-        import fitz
-        doc = fitz.open(stream=file_bytes, filetype="pdf")
-        mat = fitz.Matrix(2.0, 2.0)
-        for i in range(len(doc)):
-            page = doc[i]
-            pix = page.get_pixmap(matrix=mat)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            if img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-            elif img.shape[2] == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            else:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        rendered_pages = await asyncio.to_thread(_render_pdf_pages_bgr, file_bytes)
+        for i, img in rendered_pages.items():
             h, w = img.shape[:2]
             # 保存页面图片
             _, page_bytes = cv2.imencode(".png", img)
@@ -1096,7 +1221,6 @@ async def upload_answer_pages(
                 "width": w,
                 "height": h,
             })
-        doc.close()
     else:
         img_array = np.frombuffer(file_bytes, dtype=np.uint8)
         page_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -1134,7 +1258,7 @@ async def answer_split(
     current_user: User = Depends(get_current_user),
 ):
     """
-    按题目切割答案图片区域，保存到对应 Question 的 answer_image_url。
+    按题目切割标准答案图片区域，保存到对应 Question 的 answer_image_url。
 
     与 manual-split 不同，这里不创建新题目，而是匹配已有题目并更新其 answer_image_url。
     """
@@ -1164,7 +1288,10 @@ async def answer_split(
         if q.parent_id is None:
             question_by_number[q.question_number] = q
 
-    # 2. 下载答案文件并渲染页面
+    # 2. 校验答案文件归属（防止跨用户读取任意存储文件）
+    _assert_owned_storage_path(data.answer_file_url, current_user.id, allowed_prefixes=("answers",))
+
+    # 3. 下载答案文件并渲染页面
     settings = get_settings()
     storage = StorageService()
 
@@ -1176,27 +1303,16 @@ async def answer_split(
     import numpy as np
     import cv2
 
-    # 渲染所有页面为 numpy 数组
+    # 渲染所有页面为 numpy 数组（fitz 栅格化是同步 CPU 重活，线程池执行避免阻塞事件循环）
     page_images: dict[int, np.ndarray] = {}
     all_pages_data: dict[int, tuple[int, int]] = {}  # page_index -> (width, height)
 
     if answer_bytes.startswith(b"%PDF"):
-        import fitz
-        doc = fitz.open(stream=answer_bytes, filetype="pdf")
-        mat = fitz.Matrix(2.0, 2.0)
-        for i in range(len(doc)):
-            page = doc[i]
-            pix = page.get_pixmap(matrix=mat)
-            img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width, pix.n)
-            if img.shape[2] == 4:
-                img = cv2.cvtColor(img, cv2.COLOR_RGBA2BGR)
-            elif img.shape[2] == 3:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            else:
-                img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-            page_images[i] = img
-            all_pages_data[i] = (img.shape[1], img.shape[0])
-        doc.close()
+        rendered_pages = await asyncio.to_thread(_render_pdf_pages_bgr, answer_bytes)
+        page_images = dict(rendered_pages)
+        all_pages_data = {
+            i: (img.shape[1], img.shape[0]) for i, img in rendered_pages.items()
+        }
     else:
         img_array = np.frombuffer(answer_bytes, dtype=np.uint8)
         page_img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
@@ -1205,7 +1321,7 @@ async def answer_split(
         page_images[0] = page_img
         all_pages_data[0] = (page_img.shape[1], page_img.shape[0])
 
-    # 3. 按 question_number 分组
+    # 4. 按 question_number 分组
     groups: dict[int, list[AnswerSplitRegion]] = {}
     group_order: list[int] = []
     for region in data.regions:
@@ -1216,7 +1332,7 @@ async def answer_split(
 
     updated_count = 0
 
-    # 4. 逐题切割答案图片
+    # 5. 逐题切割答案图片
     for qn in group_order:
         group = groups[qn]
         # 按 draw_order 排序（AnswerSplitRegion 也可以加 draw_order...我们暂时用列表顺序）
@@ -1273,25 +1389,4 @@ async def answer_split(
     }
 
 
-def _merge_images(images: list):
-    """将多张图像垂直拼接为一张，宽度统一为最大值。"""
-    import numpy as np
-    import cv2
 
-    max_w = max(img.shape[1] for img in images)
-    resized = []
-    for img in images:
-        h, w = img.shape[:2]
-        if w != max_w:
-            new_h = int(h * max_w / w)
-            img = cv2.resize(img, (max_w, new_h), interpolation=cv2.INTER_CUBIC)
-        resized.append(img)
-
-    SEP = 4
-    sep_line = np.full((SEP, max_w, 3), 255, dtype=np.uint8)
-    parts = []
-    for i, img in enumerate(resized):
-        if i > 0:
-            parts.append(sep_line)
-        parts.append(img)
-    return np.vstack(parts)

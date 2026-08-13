@@ -1,0 +1,347 @@
+/**
+ * 作业记录页专属样式。
+ * 设计语言沿用全局 Soft-UI（frontend/src/styles/soft-ui.css）：
+ * 深蓝主色、淡冷底 #f5f7fb、柔和浅阴影、圆角。
+ * 所有选择器以 .assignment-records 作用域限定，不污染其他页面。
+ */
+
+/* ==========================================================================
+   1. 页面头部：标题 + 副标题 + 右侧总数胶囊
+   -------------------------------------------------------------------------- */
+.assignment-records .ar-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+
+.assignment-records .ar-header-left {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+
+.assignment-records .ar-header-left h4 {
+  margin-bottom: 0 !important;
+}
+
+/* 副标题：弱化说明文字 */
+.assignment-records .ar-header-desc {
+  font-size: 13px;
+  color: var(--soft-text-secondary);
+}
+
+/* 右侧总数：长方形圆角矩形，淡冷底 + 主色数字 */
+.assignment-records .ar-header-count {
+  font-size: 13px;
+  color: var(--soft-text-secondary);
+  background: #f5f7fb;
+  border: 1px solid var(--soft-border);
+  border-radius: 8px;
+  padding: 6px 16px;
+  white-space: nowrap;
+}
+
+.assignment-records .ar-header-count b {
+  color: var(--soft-primary);
+  font-weight: 600;
+  font-size: 14px;
+}
+
+/* ==========================================================================
+   2. 筛选条：淡冷底容器，字段带前置小标签
+   -------------------------------------------------------------------------- */
+.assignment-records .ar-filter-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  background: #f5f7fb;
+  border: 1px solid var(--soft-border);
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin-bottom: 16px;
+}
+
+.assignment-records .ar-filter-fields {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+/* 单个筛选字段：小标签 + 选择器 */
+.assignment-records .ar-filter-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.assignment-records .ar-filter-field .ant-select {
+  min-width: 118px;
+}
+
+.assignment-records .ar-filter-label {
+  font-size: 13px;
+  color: var(--soft-text-secondary);
+  white-space: nowrap;
+}
+
+/* 重置按钮：与筛选字段同排，仅在有筛选条件时出现 */
+.assignment-records .ar-filter-reset {
+  padding-inline: 10px;
+}
+
+/* ==========================================================================
+   3. 卡片列表
+   -------------------------------------------------------------------------- */
+.assignment-records .ar-card-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 200px;
+}
+
+/* 单张卡片：白底 + 柔和阴影 + 圆角 14px */
+.assignment-records .ar-card {
+  display: flex;
+  align-items: stretch;
+  background: #ffffff;
+  border: 1px solid var(--soft-border);
+  border-radius: 14px;
+  box-shadow: var(--soft-shadow);
+  transition: transform 0.25s ease, box-shadow 0.25s ease;
+  overflow: hidden;
+  gap: 0;
+}
+
+/* hover：轻微上浮 + 阴影加深 */
+.assignment-records .ar-card:hover {
+  transform: translateY(-3px);
+  box-shadow: var(--soft-shadow-hover);
+}
+
+/* ==========================================================================
+   3.1 左侧正方形分值圆角矩形
+   -------------------------------------------------------------------------- */
+.assignment-records .ar-card-badge {
+  position: relative;
+  width: 76px;
+  height: 76px;
+  background: linear-gradient(135deg, #fff7e6, #fff1d6);
+  border: 1px solid rgba(250, 173, 20, 0.25);
+  border-radius: 12px;
+  flex-shrink: 0;
+  align-self: center;
+  margin-left: 14px;
+}
+
+.assignment-records .ar-card-badge-score {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  font-size: 22px;
+  font-weight: 700;
+  color: #d48806;
+  line-height: 1.2;
+}
+
+.assignment-records .ar-card-badge-total {
+  position: absolute;
+  bottom: 8px;
+  right: 10px;
+  font-size: 14px;
+  font-weight: 500;
+  color: #8c8c8c;
+  line-height: 1.2;
+}
+
+.assignment-records .ar-card-badge-sep {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  font-size: 14px;
+  color: #c9a04e;
+  line-height: 1.2;
+}
+
+/* ==========================================================================
+   3.2 右侧信息区
+   -------------------------------------------------------------------------- */
+.assignment-records .ar-card-body {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex: 1;
+  padding: 14px 20px;
+  min-width: 0;
+}
+
+/* 左侧信息区 */
+.assignment-records .ar-card-info {
+  min-width: 0;
+}
+
+/* 卡片内部行 */
+.assignment-records .ar-card-row {
+  display: flex;
+  align-items: center;
+  line-height: 1.5;
+}
+
+/* 第一行：作业名称 */
+.assignment-records .ar-card-row-title {
+  margin-bottom: 8px;
+}
+
+.assignment-records .ar-card-title {
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--soft-primary);
+  cursor: pointer;
+  transition: color 0.2s ease;
+}
+
+.assignment-records .ar-card-title:hover {
+  color: var(--soft-primary-hover);
+  text-decoration: underline;
+}
+
+/* 第二行：元信息标签 */
+.assignment-records .ar-card-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.assignment-records .ar-card-meta-tag {
+  display: inline-block;
+  font-size: 12px;
+  color: #3d4a5c;
+  background: #f0f4fa;
+  border: 1px solid #e3e8f0;
+  border-radius: 6px;
+  padding: 3px 10px;
+  line-height: 1.4;
+}
+
+
+
+/* 右侧操作按钮：垂直居中 */
+.assignment-records .ar-card-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
+  margin-left: 16px;
+}
+
+/* ==========================================================================
+   3.3 状态列：圆点 + 文字
+   -------------------------------------------------------------------------- */
+.assignment-records .ar-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 13px;
+  color: var(--soft-text-primary);
+}
+
+.assignment-records .ar-status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+/* 与 ASSIGNMENT_STATUS_MAP 的 color 字段一一对应 */
+.ar-status-dot-default {
+  background: #8c8c8c;
+}
+
+.ar-status-dot-processing {
+  background: var(--soft-primary);
+  box-shadow: 0 0 0 3px rgba(26, 86, 219, 0.14);
+}
+
+.ar-status-dot-cyan {
+  background: #08979c;
+}
+
+.ar-status-dot-success {
+  background: #52c41a;
+}
+
+.ar-status-dot-error {
+  background: #ff4d4f;
+}
+
+.ar-status-dot-blue {
+  background: var(--soft-primary);
+}
+
+/* ==========================================================================
+   3.4 操作按钮：长方形圆角矩形
+   -------------------------------------------------------------------------- */
+.assignment-records .ar-action-view {
+  height: 34px !important;
+  padding: 0 24px !important;
+  border-radius: 8px !important;
+  border: 1px solid var(--soft-primary) !important;
+  background: transparent !important;
+  color: var(--soft-primary) !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  transition: all 0.2s ease;
+}
+
+.assignment-records .ar-action-view:hover {
+  background: rgba(26, 86, 219, 0.08) !important;
+  color: var(--soft-primary-hover) !important;
+  border-color: var(--soft-primary-hover) !important;
+}
+
+.assignment-records .ar-action-more {
+  height: 34px !important;
+  padding: 0 24px !important;
+  border-radius: 8px !important;
+  border: 1px solid var(--soft-border) !important;
+  background: transparent !important;
+  color: var(--soft-text-secondary) !important;
+  font-size: 13px !important;
+  font-weight: 500 !important;
+  transition: all 0.2s ease;
+}
+
+.assignment-records .ar-action-more:hover {
+  background: #f5f7fb !important;
+  color: var(--soft-text-primary) !important;
+  border-color: #c4cdd9 !important;
+}
+
+/* ==========================================================================
+   3.5 空状态 / 加载
+   -------------------------------------------------------------------------- */
+.assignment-records .ar-empty,
+.assignment-records .ar-loading {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 200px;
+  color: var(--soft-text-secondary);
+  font-size: 14px;
+}
+
+/* ==========================================================================
+   4. 分页
+   -------------------------------------------------------------------------- */
+.assignment-records .ar-pagination {
+  display: flex;
+  justify-content: center;
+  margin-top: 24px;
+}

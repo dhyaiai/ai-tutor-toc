@@ -15,9 +15,11 @@ import logging
 logger = logging.getLogger(__name__)
 
 # 默认配置（用户未保存过配置时使用）
+# voice_tone 仅影响 TTS 播报音色（male/female），不参与批改指令生成
 DEFAULT_PERSONALITY: dict = {
     "personality_type": "严谨专业型",
     "speaking_style": "书面化正式",
+    "voice_tone": "female",
     "strict_level": 3,
 }
 

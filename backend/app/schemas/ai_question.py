@@ -18,6 +18,7 @@ class SaveAIQuestionRequest(BaseModel):
     knowledge_point: str | None = None
     difficulty: str | None = None
     options: list[OptionItem] | None = None
+    image_svg: str | None = None
 
 
 class AnswerItem(BaseModel):
@@ -43,6 +44,8 @@ class AIQuestionResponse(BaseModel):
     knowledge_point: str | None = None
     difficulty: str | None = None
     options: list[OptionItem] | None = None
+    image_svg: str | None = None
+    context_image_svg: str | None = None
     user_answers: list[AnswerItem] | None = None
     created_at: datetime
 
@@ -58,6 +61,8 @@ class AISubQuestionResponse(BaseModel):
     knowledge_point: str | None = None
     difficulty: str | None = None
     options: list[OptionItem] | None = None
+    image_svg: str | None = None
+    image_url: str | None = None  # 上传转录的自有试题原图（预签名后可直接访问）
     user_answers: list[AnswerItem] | None = None
     created_at: datetime | None = None
 
@@ -74,6 +79,8 @@ class AIQuestionListItem(BaseModel):
     knowledge_point: str | None = None
     difficulty: str | None = None
     options: list[OptionItem] | None = None
+    image_svg: str | None = None
+    image_url: str | None = None  # 上传转录的自有试题原图（预签名后可直接访问）
     user_answers: list[AnswerItem] | None = None
     created_at: datetime | None = None
 
@@ -81,9 +88,13 @@ class AIQuestionListItem(BaseModel):
     is_big_question: bool = False
     group_id: str | None = None
     question_context: str | None = None
+    context_image_svg: str | None = None
     children: list[AISubQuestionResponse] | None = None
     total_count: int | None = None
     score_rate: float | None = None
+
+    # --- 收藏状态（供收藏按钮初始状态回显；大题以组内第一子题锚点判断） ---
+    is_favorited: bool = False
 
     class Config:
         from_attributes = True

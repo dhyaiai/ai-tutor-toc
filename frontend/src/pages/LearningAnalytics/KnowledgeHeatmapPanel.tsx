@@ -54,7 +54,7 @@ function getTextColor(rate: number): string {
   return rate < 0.5 ? "#ffffff" : "#333333";
 }
 
-export default function KnowledgeHeatmapPanel() {
+export default function KnowledgeHeatmapPanel({ active }: { active?: boolean }) {
   /** 筛选条件（科目默认选中数学） */
   const [grade, setGrade] = useState<string>("");
   const [subject, setSubject] = useState<string>("数学");
@@ -83,6 +83,8 @@ export default function KnowledgeHeatmapPanel() {
         .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
       return items;
     },
+    // 面板常驻挂载（隐藏而非卸载），tab 未激活时不发请求，激活时才加载
+    enabled: active,
   });
 
   /** 获取热力图数据 */
@@ -98,6 +100,7 @@ export default function KnowledgeHeatmapPanel() {
         ...(subject && { subject }),
         ...(selectedIds.length > 0 && { assignment_ids: selectedIds }),
       }),
+    enabled: active,
   });
 
   const items = data?.items || [];

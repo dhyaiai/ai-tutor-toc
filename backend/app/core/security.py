@@ -17,12 +17,18 @@ def hash_password(password: str) -> str:
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    # try/except 防御：数据库里存了畸形 bcrypt 哈希时（如历史脏数据），
+    # passlib 会抛异常而不是返回 False，若不拦截会导致登录接口 500。
+    try:
+        return pwd_context.verify(plain_password, hashed_password)
+    except (ValueError, TypeError):
+        return False
 
 
 def create_access_token(
     user_id: int,
     settings: Settings | None = None,
+    token_version: int = 0,
 ) -> str:
     if settings is None:
         settings = get_settings()
@@ -32,14 +38,19 @@ def create_access_token(
         "exp": expire,
         "iat": datetime.now(timezone.utc),
         "type": "access",
+        # 登录版本号：校验时与 users.token_version 比对，版本号落后 → 401（已被新设备踢下线）
+        "version": token_version,
     }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    _sk = settings.SECRET_KEY
+    assert _sk, "SECRET_KEY must be configured before creating tokens"
+    return jwt.encode(payload, _sk, algorithm=settings.ALGORITHM)
 
 
 def create_refresh_token(
     user_id: int,
     jti: str,
     settings: Settings | None = None,
+    token_version: int = 0,
 ) -> str:
     if settings is None:
         settings = get_settings()
@@ -50,14 +61,19 @@ def create_refresh_token(
         "iat": datetime.now(timezone.utc),
         "type": "refresh",
         "jti": jti,
+        "version": token_version,
     }
-    return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
+    _sk = settings.SECRET_KEY
+    assert _sk, "SECRET_KEY must be configured before creating tokens"
+    return jwt.encode(payload, _sk, algorithm=settings.ALGORITHM)
 
 
 def decode_token(token: str, settings: Settings | None = None) -> dict:
     if settings is None:
         settings = get_settings()
-    return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
+    _sk = settings.SECRET_KEY
+    assert _sk, "SECRET_KEY must be configured before decoding tokens"
+    return jwt.decode(token, _sk, algorithms=[settings.ALGORITHM])
 
 
 async def get_current_user(
@@ -80,8 +96,38 @@ async def get_current_user(
     if user_id is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
 
-    user = await db.get(User, int(user_id))
+    # 防御：sub 非数字时 int() 会抛 ValueError → 500，这里统一收敛为 401
+    try:
+        user_id_int = int(user_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    user = await db.get(User, user_id_int)
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
+    # 单设备登录校验（可用 settings.SINGLE_DEVICE_LOGIN=false 关闭，允许多设备共存）：
+    # token 里的版本号必须等于当前登录版本号。版本号落后（新设备登录后旧设备）→ 401，
+    # 前端自动刷新失败后踢回登录页。兼容老 token（签发时无 version 字段，读默认 0）。
+    if settings.SINGLE_DEVICE_LOGIN:
+        token_version = payload.get("version", 0)
+        if token_version != user.token_version:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="账号已在其他设备登录，请重新登录",
+            )
+
     return user
+
+
+async def get_current_admin(current_user=Depends(get_current_user)):
+    """管理员权限校验依赖：仅 role=admin（超级管理员）可访问，否则返回 403。
+
+    复用 get_current_user 的查库结果（完整 ORM 对象，.role 实时读库），
+    角色变更无需重新签发 token 即生效。
+    """
+    from app.models.user import UserRole
+
+    if current_user.role != UserRole.ADMIN:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅管理员可执行此操作")
+    return current_user

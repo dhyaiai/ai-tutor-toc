@@ -8,6 +8,7 @@ import enum
 
 class QuestionStatus(str, enum.Enum):
     PENDING = "pending"
+    PROCESSING = "processing"  # 正在 AI 评分（当前批次）
     COMPLETED = "completed"
     FAILED = "failed"
     CONFIRMED = "confirmed"  # 保留以兼容历史数据，新流程不再使用
@@ -31,9 +32,10 @@ class Question(Base):
     __tablename__ = "assignment_questions"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    assignment_id: Mapped[int] = mapped_column(Integer, ForeignKey("assignments.id"), nullable=False)
+    assignment_id: Mapped[int] = mapped_column(Integer, ForeignKey("assignments.id"), nullable=False, index=True)
     question_number: Mapped[int] = mapped_column(Integer, nullable=False)
     image_url: Mapped[str] = mapped_column(String(512), nullable=False)
+    question_text: Mapped[str | None] = mapped_column(Text, nullable=True)  # 识别出的题干文本（含 $...$ 包裹的 LaTeX 公式）
     student_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     correct_answer: Mapped[str | None] = mapped_column(Text, nullable=True)
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -80,8 +82,8 @@ class AnalysisTask(Base):
     __tablename__ = "analysis_tasks"
 
     id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    assignment_id: Mapped[int] = mapped_column(Integer, ForeignKey("assignments.id"), nullable=False)
-    question_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("assignment_questions.id"), nullable=True)
+    assignment_id: Mapped[int] = mapped_column(Integer, ForeignKey("assignments.id"), nullable=False, index=True)
+    question_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("assignment_questions.id"), nullable=True, index=True)
     type: Mapped[AnalysisTaskType] = mapped_column(SAEnum(AnalysisTaskType), nullable=False)
     status: Mapped[AnalysisTaskStatus] = mapped_column(
         SAEnum(AnalysisTaskStatus), default=AnalysisTaskStatus.PENDING, nullable=False
@@ -92,5 +94,5 @@ class AnalysisTask(Base):
         DateTime, default=datetime.now, nullable=False
     )
 
-    assignment = relationship("Assignment")
+    assignment = relationship("Assignment", back_populates="analysis_tasks")
     question = relationship("Question")

@@ -1,18 +1,92 @@
-import { Card, Tag, Button, Space, Typography, Popconfirm, Popover, Image, Descriptions, Input, message, Spin, Collapse } from "antd";
-import { ReloadOutlined, DeleteOutlined, ExpandOutlined } from "@ant-design/icons";
+import { Card, Tag, Button, Space, Typography, Popconfirm, Popover, Image, Descriptions, Input, message, Spin, Collapse, Tooltip } from "antd";
+import { ReloadOutlined, DeleteOutlined, ExpandOutlined, SyncOutlined, PlusOutlined } from "@ant-design/icons";
 import { useState } from "react";
 import { useReanalysis } from "../hooks/useReanalysis";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { questionService } from "../services/questionService";
 import { QUESTION_STATUS_MAP } from "../utils/constants";
+import { AI_EXPLAIN_SUBJECTS } from "../utils/filterConfig";
 import { getScoreRate } from "../utils/helpers";
 import ManualSplitModal from "./ManualSplitModal";
+import ExplainCard from "./ExplainCard";
+import MathText from "./MathText";
 import type { QuestionItem } from "../services/assignmentService";
 
 interface Props {
   question: QuestionItem;
   assignmentId: number;
   assignmentStatus: string;
+  /** 作业科目：仅无公式科目（语文/英语/生物/政治/历史/地理）显示 助教讲解入口 */
+  subject?: string;
+}
+
+/** 提取知识点名称列表（兼容数组/对象两种存储格式） */
+function kpNames(q: QuestionItem): string[] {
+  if (!q.knowledge_points) return [];
+  const list = Array.isArray(q.knowledge_points)
+    ? q.knowledge_points
+    : Object.values(q.knowledge_points);
+  return list.map((kp: unknown) =>
+    typeof kp === "string" ? kp : (kp as { name?: string })?.name || String(kp)
+  );
+}
+
+/**
+ * 拼接题目上下文文本供 AI 讲解。
+ * 题干优先用识别出的 question_text（含公式）；老数据无题干文本时
+ * 回退到用批改结果字段组合出讲解上下文；大题套小题时逐小题拼接。
+ */
+function buildExplainContent(q: QuestionItem): string {
+  const one = (item: QuestionItem, label: string): string => {
+    const kps = kpNames(item);
+    return [
+      `${label}${item.question_type ? `（${item.question_type}）` : ""}`,
+      item.question_text ? `题目：${item.question_text}` : "",
+      item.correct_answer ? `正确答案：${item.correct_answer}` : "",
+      item.student_answer ? `学生答案：${item.student_answer}` : "",
+      item.analysis_detail ? `题目解析：${item.analysis_detail}` : "",
+      kps.length ? `涉及知识点：${kps.join("、")}` : "",
+    ].filter(Boolean).join("\n");
+  };
+
+  if (q.children && q.children.length > 0) {
+    const sorted = [...q.children].sort(
+      (a, b) => (a.sub_question_index ?? 0) - (b.sub_question_index ?? 0)
+    );
+    return [
+      `第 ${q.question_number} 题${q.question_type ? `（${q.question_type}）` : ""}，共 ${sorted.length} 小题：`,
+      ...sorted.map((c, i) => one(c, `小题 ${i + 1}`)),
+    ].join("\n\n");
+  }
+  return one(q, `第 ${q.question_number} 题`);
+}
+
+/**
+ * 渲染题目状态 Tag：
+ * 后端将当前批次题目标记为 processing，此时显示蓝色"正在分析"+ 转圈动画；
+ * 尚未轮到的题目保持灰色"待分析"
+ */
+function QuestionStatusTag({
+  status,
+  small,
+}: {
+  status: string;
+  small?: boolean;
+}) {
+  const fontSize = small ? 11 : undefined;
+  if (status === "processing") {
+    return (
+      <Tag icon={<SyncOutlined spin />} color="processing" style={{ fontSize }}>
+        正在分析
+      </Tag>
+    );
+  }
+  const statusCfg = QUESTION_STATUS_MAP[status] || { color: "default", label: status };
+  return (
+    <Tag color={statusCfg.color} style={{ fontSize }}>
+      {statusCfg.label}
+    </Tag>
+  );
 }
 
 /**
@@ -24,7 +98,6 @@ function SubQuestionCard({
 }: {
   question: QuestionItem;
 }) {
-  const statusCfg = QUESTION_STATUS_MAP[question.status] || { color: "default", label: question.status };
   const subIndex = question.sub_question_index != null ? question.sub_question_index + 1 : "?";
 
   return (
@@ -39,9 +112,12 @@ function SubQuestionCard({
           {question.question_type && (
             <Tag color="purple" style={{ fontSize: 11 }}>{question.question_type}</Tag>
           )}
-          <Tag color={statusCfg.color} style={{ fontSize: 11 }}>{statusCfg.label}</Tag>
-          {question.confidence_score != null && question.confidence_score < 0.7 && (
-            <Tag color="orange" style={{ fontSize: 11 }}>低置信度</Tag>
+          <QuestionStatusTag status={question.status} small />
+          {/* 失败题已有红色状态标签，置信度是失败兜底值，不另显低置信度 */}
+          {question.status !== "failed" && question.confidence_score != null && question.confidence_score < 0.7 && (
+            <Tooltip title="AI 对识别结果把握不足。可点击卡片右上角「重新生成」，在备注中写明如「学生答案选D；正确答案是B」进行人工纠正。">
+              <Tag color="orange" style={{ fontSize: 11 }}>低置信度</Tag>
+            </Tooltip>
           )}
         </Space>
       }
@@ -54,10 +130,10 @@ function SubQuestionCard({
           {getScoreRate(question.score, question.full_score)}
         </Descriptions.Item>
         <Descriptions.Item label="学生答案">
-          {question.student_answer || "-"}
+          {question.student_answer ? <MathText content={question.student_answer} /> : "-"}
         </Descriptions.Item>
         <Descriptions.Item label="正确答案">
-          {question.correct_answer || "-"}
+          {question.correct_answer ? <MathText content={question.correct_answer} /> : "-"}
         </Descriptions.Item>
       </Descriptions>
       {question.knowledge_points && (
@@ -70,7 +146,7 @@ function SubQuestionCard({
             const name = typeof kp === "string" ? kp : (kp as { name?: string })?.name || String(kp);
             return (
               <Tag key={`${name}-${i}`} color="blue" style={{ fontSize: 11, marginTop: 2 }}>
-                {name}
+                <MathText content={name} />
               </Tag>
             );
           })}
@@ -80,7 +156,7 @@ function SubQuestionCard({
         <div style={{ marginTop: 4 }}>
           <Typography.Text type="secondary" style={{ fontSize: 11 }}>常见错误：</Typography.Text>
           {(question.common_mistakes as string[]).map((m: string, i: number) => (
-            <Tag key={i} color="orange" style={{ fontSize: 11, marginTop: 2 }}>{m}</Tag>
+            <Tag key={i} color="orange" style={{ fontSize: 11, marginTop: 2 }}><MathText content={m} /></Tag>
           ))}
         </div>
       )}
@@ -90,7 +166,7 @@ function SubQuestionCard({
           style={{ marginTop: 8, fontSize: 12 }}
           ellipsis={{ rows: 2, expandable: true }}
         >
-          {question.analysis_detail}
+          <MathText content={question.analysis_detail} />
         </Typography.Paragraph>
       )}
     </Card>
@@ -103,11 +179,11 @@ function SubQuestionCard({
  * 2. 无 children 且 无 parent_id → 普通独立题
  * 3. 有 parent_id → 子题（正常不应独立出现，兜底显示）
  */
-export default function QuestionCard({ question, assignmentId, assignmentStatus }: Props) {
+export default function QuestionCard({ question, assignmentId, assignmentStatus, subject }: Props) {
   const { reanalyze, reanalyzing } = useReanalysis(assignmentId);
   const queryClient = useQueryClient();
-  const statusCfg = QUESTION_STATUS_MAP[question.status] || { color: "default", label: question.status };
   const [adjustVisible, setAdjustVisible] = useState(false);
+  const [insertVisible, setInsertVisible] = useState(false);
   const [remarkOpen, setRemarkOpen] = useState(false);
   const [remark, setRemark] = useState("");
 
@@ -133,6 +209,11 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
 
   const hasChildren = question.children && question.children.length > 0;
   const isChild = question.parent_id != null;
+  // 助教讲解：仅无公式科目且题目已完成分析时显示（公式科目 TTS 读不准，暂不开放）
+  const showExplain =
+    !!subject &&
+    AI_EXPLAIN_SUBJECTS.includes(subject) &&
+    question.status === "completed";
 
   // ── 模式3：子题（正常不应独立出现，兜底显示紧凑版）──
   if (isChild && !hasChildren) {
@@ -170,13 +251,21 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
               {totalFullScore > 0 && (
                 <Tag color="gold">得分：{totalScore} / {totalFullScore} 分</Tag>
               )}
-              <Tag color={statusCfg.color}>{statusCfg.label}</Tag>
+              <QuestionStatusTag status={question.status} />
             </Space>
           }
           extra={
             <Space>
               {showEditTools && (
                 <>
+                  <Button
+                    size="small"
+                    icon={<PlusOutlined />}
+                    onClick={() => setInsertVisible(true)}
+                    title="在当前题下方插入一道新题（补切漏切题目）"
+                  >
+                    下方插题
+                  </Button>
                   {hasBbox && (
                     <Button
                       size="small"
@@ -256,6 +345,12 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
         >
           {/* 父题拼接图 */}
           <div style={{ marginBottom: 16 }}>
+            {question.question_text && (
+              <MathText
+                content={question.question_text}
+                style={{ display: "block", marginBottom: 8, fontSize: 13 }}
+              />
+            )}
             {question.image_url && (
               <Image
                 src={question.image_url}
@@ -277,7 +372,7 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
                   const name = typeof kp === "string" ? kp : (kp as { name?: string })?.name || String(kp);
                   return (
                     <Tag key={`${name}-${i}`} color="blue" style={{ marginTop: 2 }}>
-                      {name}
+                      <MathText content={name} />
                     </Tag>
                   );
                 })}
@@ -294,6 +389,16 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
               <SubQuestionCard key={child.id} question={child} />
             ))}
           </div>
+
+          {/* 助教讲解（含语音播报，仅无公式科目开放） */}
+          {showExplain && (
+            <ExplainCard
+              exerciseContent={buildExplainContent(question)}
+              subject={subject}
+              questionId={question.id}
+              visible
+            />
+          )}
         </Card>
 
         {hasBbox && (
@@ -302,6 +407,7 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
             visible={adjustVisible}
             prefillRegion={{
               question_id: question.id,
+              question_number: question.question_number,
               page_index: question.page_index ?? 0,
               x: question.bbox_x!,
               y: question.bbox_y!,
@@ -315,6 +421,22 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
             onCancel={() => setAdjustVisible(false)}
           />
         )}
+
+        <ManualSplitModal
+          assignmentId={assignmentId}
+          visible={insertVisible}
+          insertAfter={{
+            question_id: question.id,
+            question_number: question.question_number,
+            page_index: question.page_index ?? 0,
+          }}
+          onSuccess={() => {
+            setInsertVisible(false);
+            queryClient.invalidateQueries({ queryKey: ["assignment"] });
+            queryClient.invalidateQueries({ queryKey: ["assignments"] });
+          }}
+          onCancel={() => setInsertVisible(false)}
+        />
       </>
     );
   }
@@ -330,9 +452,12 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
             {question.question_type && (
               <Tag color="purple">{question.question_type}</Tag>
             )}
-            <Tag color={statusCfg.color}>{statusCfg.label}</Tag>
-            {question.confidence_score != null && question.confidence_score < 0.7 && (
-              <Tag color="orange">低置信度</Tag>
+            <QuestionStatusTag status={question.status} />
+            {/* 失败题已有红色状态标签，置信度是失败兜底值，不另显低置信度 */}
+            {question.status !== "failed" && question.confidence_score != null && question.confidence_score < 0.7 && (
+              <Tooltip title="AI 对识别结果把握不足。可点击卡片右上角「重新生成」，在备注中写明如「学生答案选D；正确答案是B」进行人工纠正。">
+                <Tag color="orange">低置信度</Tag>
+              </Tooltip>
             )}
           </Space>
         }
@@ -340,6 +465,14 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
           <Space>
             {showEditTools && (
               <>
+                <Button
+                  size="small"
+                  icon={<PlusOutlined />}
+                  onClick={() => setInsertVisible(true)}
+                  title="在当前题下方插入一道新题（补切漏切题目）"
+                >
+                  下方插题
+                </Button>
                 {hasBbox && (
                   <Button
                     size="small"
@@ -418,6 +551,12 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
         }
       >
         <div style={{ display: "flex", gap: 16 }}>
+          {question.question_text && (
+            <MathText
+              content={question.question_text}
+              style={{ display: "block", maxWidth: 360, fontSize: 13 }}
+            />
+          )}
           {question.image_url && (
             <Image
               src={question.image_url}
@@ -436,10 +575,10 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
                 {getScoreRate(question.score, question.full_score)}
               </Descriptions.Item>
               <Descriptions.Item label="学生答案">
-                {question.student_answer || "-"}
+                {question.student_answer ? <MathText content={question.student_answer} /> : "-"}
               </Descriptions.Item>
               <Descriptions.Item label="正确答案">
-                {question.correct_answer || "-"}
+                {question.correct_answer ? <MathText content={question.correct_answer} /> : "-"}
               </Descriptions.Item>
             </Descriptions>
             {question.knowledge_points && (
@@ -454,7 +593,7 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
                   const name = typeof kp === "string" ? kp : (kp as { name?: string })?.name || String(kp);
                   return (
                     <Tag key={`${name}-${i}`} color="blue" style={{ marginTop: 4 }}>
-                      {name}
+                      <MathText content={name} />
                     </Tag>
                   );
                 })}
@@ -467,7 +606,7 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
                 </Typography.Text>
                 {(question.common_mistakes as string[]).map((m: string, i: number) => (
                   <Tag key={i} color="orange" style={{ marginTop: 4 }}>
-                    {m}
+                    <MathText content={m} />
                   </Tag>
                 ))}
               </div>
@@ -478,11 +617,21 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
                 style={{ marginTop: 8, fontSize: 13 }}
                 ellipsis={{ rows: 2, expandable: true }}
               >
-                {question.analysis_detail}
+                <MathText content={question.analysis_detail} />
               </Typography.Paragraph>
             )}
           </div>
         </div>
+
+        {/* 助教讲解（含语音播报，仅无公式科目开放） */}
+        {showExplain && (
+          <ExplainCard
+            exerciseContent={buildExplainContent(question)}
+            subject={subject}
+            questionId={question.id}
+            visible
+          />
+        )}
       </Card>
 
       {hasBbox && (
@@ -491,6 +640,7 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
           visible={adjustVisible}
           prefillRegion={{
             question_id: question.id,
+            question_number: question.question_number,
             page_index: question.page_index ?? 0,
             x: question.bbox_x!,
             y: question.bbox_y!,
@@ -504,6 +654,22 @@ export default function QuestionCard({ question, assignmentId, assignmentStatus 
           onCancel={() => setAdjustVisible(false)}
         />
       )}
+
+      <ManualSplitModal
+        assignmentId={assignmentId}
+        visible={insertVisible}
+        insertAfter={{
+          question_id: question.id,
+          question_number: question.question_number,
+          page_index: question.page_index ?? 0,
+        }}
+        onSuccess={() => {
+          setInsertVisible(false);
+          queryClient.invalidateQueries({ queryKey: ["assignment"] });
+          queryClient.invalidateQueries({ queryKey: ["assignments"] });
+        }}
+        onCancel={() => setInsertVisible(false)}
+      />
     </>
   );
 }

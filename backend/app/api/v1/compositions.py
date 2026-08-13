@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, File, Form, UploadFile
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
 
+from app.core.config import get_settings
 from app.core.deps import get_db
 from app.core.security import get_current_user
 from app.models.user import User
@@ -31,9 +32,7 @@ from app.schemas.composition import (
     CompositionResponse,
     CompositionListItem,
 )
-from app.services.composition_service import CompositionService
 from app.services.file_upload import StorageService
-from app.services.knowledge_tracker import KnowledgeTracker
 
 router = APIRouter(prefix="/compositions", tags=["compositions"])
 
@@ -129,19 +128,44 @@ async def upload_composition_file(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_user),
 ):
-    """预上传作文文件，返回 file_path 和文件名"""
-    ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else ""
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(status_code=400, detail=f"不支持的文件格式：{ext}，支持：{', '.join(ALLOWED_EXTENSIONS)}")
+    """预上传作文文件，返回 file_path 和文件名（含完整文件校验：扩展名/大小/魔数）。"""
+    # 复用 assignments 的统一文件校验（扩展名白名单 + 50MB 限制 + 魔数校验）
+    from app.api.v1.assignments import _validate_and_read_file
+    file_data = await _validate_and_read_file(file)
 
     storage = StorageService()
-    file_data = await file.read()
     file_path = await storage.save_original(file_data, file.filename, current_user.id)
     return {
         "file_path": file_path,
         "filename": file.filename,
         "size": len(file_data),
     }
+
+
+async def _validate_and_read_composition_file(file: UploadFile) -> bytes:
+    """
+    校验作文上传文件并读取内容。
+
+    作文支持 txt/docx（assignments 的统一校验只允许 PDF/图片，会误拒文本格式），
+    因此文本格式单独处理：校验大小 + 直接读取；PDF/图片仍走 assignments 的
+    统一校验（扩展名白名单 + 魔数校验，防止伪装扩展名的恶意文件）。
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="未提供文件")
+    ext = "." + file.filename.rsplit(".", 1)[-1].lower()
+
+    if ext in (".txt", ".doc", ".docx"):
+        max_size = get_settings().MAX_UPLOAD_SIZE_MB * 1024 * 1024
+        data = await file.read()
+        if len(data) > max_size:
+            raise HTTPException(
+                status_code=413,
+                detail=f"文件过大（最大 {get_settings().MAX_UPLOAD_SIZE_MB}MB）",
+            )
+        return data
+
+    from app.api.v1.assignments import _validate_and_read_file
+    return await _validate_and_read_file(file)
 
 
 async def _merge_upload_files_to_pdf(
@@ -166,7 +190,8 @@ async def _merge_upload_files_to_pdf(
     merged_doc = fitz.open()
 
     for f in files:
-        file_data = await f.read()
+        from app.api.v1.assignments import _validate_and_read_file
+        file_data = await _validate_and_read_file(f)
         ext = f.filename.rsplit(".", 1)[-1].lower() if f.filename and "." in f.filename else ""
 
         if ext == "pdf":
@@ -219,7 +244,10 @@ async def correct_composition(
     current_user: User = Depends(get_current_user),
 ):
     """
-    上传作文文件并获取AI批改结果。
+    上传作文文件并触发AI批改（异步：立即返回 pending 记录，批改在后台任务执行）。
+
+    请求内只做"快操作"（校验/合并/存文件 + 建记录），LLM 批改放后台任务
+    （composition_tasks._do_correct_composition），上传通道不阻塞，可连续上传。
 
     支持两种模式：
     - 单文件模式（file）：上传一个文件直接批改，兼容旧版
@@ -235,6 +263,8 @@ async def correct_composition(
     title: 作文题目
     essay_type: 英语作文类型，用于确定默认满分（读后续写=25分，其他=15分）
     """
+    from app.services.composition_service import _get_default_full_score
+
     storage = StorageService()
 
     # 校验 subject
@@ -244,128 +274,40 @@ async def correct_composition(
     # 判断是否多文件合并模式
     is_multi_file = files and len(files) > 0
 
+    # ---- 请求内只存文件（快操作），PDF→base64 渲染与 LLM 调用放后台任务 ----
     if is_multi_file:
-        # ---- 多文件合并模式：合并为 PDF → 多模态批改 ----
-        file_url, merged_data = await _merge_upload_files_to_pdf(files, storage, current_user.id)
-        file_path = file_url
-        images = _file_to_base64_images(merged_data, "merged.pdf")
+        file_path, _ = await _merge_upload_files_to_pdf(files, storage, current_user.id)
     elif file:
-        # ---- 单文件模式（兼容旧版）----
-        ext = file.filename.rsplit(".", 1)[-1].lower() if file.filename and "." in file.filename else ""
-        if ext not in ALLOWED_EXTENSIONS:
-            raise HTTPException(status_code=400, detail=f"不支持的文件格式：{ext}")
-
-        file_data = await file.read()
+        file_data = await _validate_and_read_composition_file(file)
         file_path = await storage.save_original(file_data, file.filename, current_user.id)
-
-        # 仅多模态路径需要提前准备 images
-        images = None
-        if ext in VISION_FORMATS:
-            images = _file_to_base64_images(file_data, file.filename)
     else:
         raise HTTPException(status_code=400, detail="请上传作文文件")
 
-    # 根据文件格式选择处理路径
-    service = CompositionService()
-    content = ""  # 作文文本，多模态模式下后续从批改结果中补充
-
-    # 加载用户的助教个性化配置（性格/说话风格/评分严格度），对所有批改生效
-    from app.services.personality_service import load_personality, build_grading_directive
-    personality = await load_personality(db, current_user.id)
-    strict_level = personality["strict_level"]
-    personality_directive = build_grading_directive(personality)
-
-    try:
-        if is_multi_file:
-            # 多文件合并后统一走多模态视觉 LLM 批改
-            result = await service.correct_multimodal(
-                images=images,
-                subject=subject,
-                grade=grade,
-                title=title,
-                essay_type=essay_type,
-                strict_level=strict_level,
-                personality_directive=personality_directive,
-            )
-            content = result.get("content", "")
-        elif ext in VISION_FORMATS:
-            # PDF/图片 → 多模态视觉 LLM 识别+批改
-            result = await service.correct_multimodal(
-                images=images,
-                subject=subject,
-                grade=grade,
-                title=title,
-                essay_type=essay_type,
-                strict_level=strict_level,
-                personality_directive=personality_directive,
-            )
-            # 多模态模式下作文文本由模型识别返回，存入 MySQL
-            content = result.get("content", "")
-        else:
-            # txt/docx → 提取文本 → 文本 LLM 批改
-            content = _extract_text_from_bytes(file_data, file.filename)
-            if not content.strip():
-                raise HTTPException(status_code=400, detail="未能从文件中提取到文字内容，请检查文件")
-            result = await service.correct(
-                content=content,
-                subject=subject,
-                grade=grade,
-                title=title,
-                essay_type=essay_type,
-                strict_level=strict_level,
-                personality_directive=personality_directive,
-            )
-    except ValueError as e:
-        # JSON 解析失败等——LLM 返回格式异常，属于服务端可恢复错误
-        raise HTTPException(
-            status_code=502,
-            detail=f"AI批改服务返回数据异常，请稍后重试。错误详情：{str(e)[:200]}"
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=502,
-            detail=f"AI批改请求失败，请稍后重试"
-        )
-
-    # 保存记录
+    # 立即创建记录（status=pending），满分为默认值，批改结果由后台任务写回
     correction = CompositionCorrection(
         user_id=current_user.id,
         subject=subject,
         title=title,
-        total_score=result["total_score"],
-        full_score=result["full_score"],
-        content=content,
+        total_score=0,
+        full_score=_get_default_full_score(subject, essay_type),
+        content="",
         grade=grade,
         essay_type=essay_type,
-        dimension_scores=result["dimension_scores"],
-        revision_suggestions=result["revision_suggestions"],
-        overall_comment=result["overall_comment"],
-        polish_advice=result["polish_advice"],
-        sample_essay=result["sample_essay"],
-        strict_level=strict_level,
         pdf_url=file_path,
+        status="pending",
     )
     db.add(correction)
     await db.flush()
     await db.refresh(correction)
 
-    # 同步更新知识状态
-    try:
-        tracker = KnowledgeTracker(db)
-        await tracker.update(
-            user_id=current_user.id,
-            knowledge_points=[{
-                "point_name": f"{subject}写作能力",
-                "subject": subject,
-                "mastery_change": 1 if result["total_score"] / result["full_score"] > 0.7 else -1,
-                "behavior_type": "作文提升点" if result["total_score"] / result["full_score"] > 0.7 else "作文扣分点",
-            }],
-            update_source="作文批改",
-        )
-    except Exception:
-        pass
+    # 触发后台批改任务（dev: 进程内后台协程；生产: Celery worker）
+    settings = get_settings()
+    if settings.DEV_MODE:
+        from app.tasks.composition_tasks import correct_composition_dev
+        correct_composition_dev(correction.id)
+    else:
+        from app.tasks.composition_tasks import correct_composition
+        correct_composition.delay(correction.id)
 
     return CompositionResponse(
         id=correction.id,
@@ -373,16 +315,20 @@ async def correct_composition(
         title=correction.title,
         total_score=correction.total_score,
         full_score=correction.full_score,
+        word_count=correction.word_count,
         content=correction.content,
         grade=correction.grade,
         essay_type=correction.essay_type,
         dimension_scores=correction.dimension_scores,
+        deductions=correction.deductions,
         revision_suggestions=correction.revision_suggestions,
         overall_comment=correction.overall_comment,
         polish_advice=correction.polish_advice,
         sample_essay=correction.sample_essay,
         strict_level=correction.strict_level,
         pdf_url=correction.pdf_url,
+        status=correction.status,
+        error_message=correction.error_message,
         create_time=correction.create_time.isoformat() if correction.create_time else None,
     )
 
@@ -417,10 +363,13 @@ async def list_compositions(
                 "title": r.title,
                 "total_score": r.total_score,
                 "full_score": r.full_score,
+                "word_count": r.word_count,
                 "strict_level": r.strict_level,
                 "grade": r.grade,
                 "essay_type": r.essay_type,
                 "pdf_url": r.pdf_url,
+                "status": r.status,
+                "error_message": r.error_message,
                 "create_time": r.create_time.isoformat() if r.create_time else None,
             }
             for r in records
@@ -637,7 +586,7 @@ async def re_correct_composition(
     current_user: User = Depends(get_current_user),
 ):
     """
-    重新批改已存在的作文记录。
+    重新批改已存在的作文记录（异步：立即返回 pending，批改在后台任务执行）。
 
     使用原记录的原始文件和参数重新调用 AI 批改，覆写批改结果。
     - PDF/图片：重新走多模态视觉 LLM 识别+批改
@@ -654,70 +603,34 @@ async def re_correct_composition(
         raise HTTPException(status_code=404, detail="批改记录不存在")
     if not record.pdf_url:
         raise HTTPException(status_code=400, detail="原始文件不存在，无法重新批改")
+    # 仅 correcting（任务真在跑）拒绝重复触发；
+    # pending 可能是崩溃残留（任务未启动），允许重触发以自愈
+    if record.status == "correcting":
+        raise HTTPException(status_code=400, detail="该记录正在批改中，请稍后再试")
 
-    storage = StorageService()
-    file_data = await storage.get_file_bytes(record.pdf_url)
-    if not file_data:
-        raise HTTPException(status_code=400, detail="原始文件数据读取失败，可能已被删除")
-
-    # 从 pdf_url 路径中提取文件扩展名
-    filename = record.pdf_url.rsplit("/", 1)[-1] if "/" in record.pdf_url else record.pdf_url
-    ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-
-    service = CompositionService()
-
-    if ext in VISION_FORMATS:
-        # PDF/图片 → 多模态视觉 LLM 重新识别+批改
-        images = _file_to_base64_images(file_data, filename)
-        result_data = await service.correct_multimodal(
-            images=images,
-            subject=record.subject,
-            grade=record.grade,
-            title=record.title,
-            essay_type=record.essay_type,
-        )
-        content = result_data.get("content", record.content)
-    elif ext in ("docx", "doc", "txt"):
-        # 文本格式 → 提取文本 → 文本 LLM 批改
-        try:
-            content = _extract_text_from_bytes(file_data, filename)
-        except HTTPException:
-            content = record.content
-        if not content.strip():
-            content = record.content
-        if not content.strip():
-            raise HTTPException(status_code=400, detail="未能从文件中提取到文字内容")
-        result_data = await service.correct(
-            content=content,
-            subject=record.subject,
-            grade=record.grade,
-            title=record.title,
-            essay_type=record.essay_type,
-        )
-    else:
-        # 其他格式 → 用已存储的文本重新批改
-        content = record.content
-        if not content.strip():
-            raise HTTPException(status_code=400, detail="作文文本为空，无法重新批改")
-        result_data = await service.correct(
-            content=content,
-            subject=record.subject,
-            grade=record.grade,
-            title=record.title,
-            essay_type=record.essay_type,
-        )
-
-    # 更新数据库记录
-    record.total_score = result_data["total_score"]
-    record.full_score = result_data["full_score"]
-    record.content = content
-    record.dimension_scores = result_data["dimension_scores"]
-    record.revision_suggestions = result_data["revision_suggestions"]
-    record.overall_comment = result_data["overall_comment"]
-    record.polish_advice = result_data["polish_advice"]
-    record.sample_essay = result_data["sample_essay"]
+    # 重置结果字段并置 pending，批改结果由后台任务写回
+    record.status = "pending"
+    record.error_message = None
+    record.total_score = 0
+    record.word_count = 0
+    record.content = ""
+    record.dimension_scores = None
+    record.deductions = None
+    record.revision_suggestions = None
+    record.overall_comment = None
+    record.polish_advice = None
+    record.sample_essay = None
     await db.flush()
     await db.refresh(record)
+
+    # 触发后台批改任务（dev: 进程内后台协程；生产: Celery worker）
+    settings = get_settings()
+    if settings.DEV_MODE:
+        from app.tasks.composition_tasks import correct_composition_dev
+        correct_composition_dev(record.id)
+    else:
+        from app.tasks.composition_tasks import correct_composition
+        correct_composition.delay(record.id)
 
     return CompositionResponse(
         id=record.id,
@@ -725,15 +638,19 @@ async def re_correct_composition(
         title=record.title,
         total_score=record.total_score,
         full_score=record.full_score,
+        word_count=record.word_count,
         content=record.content,
         grade=record.grade,
         essay_type=record.essay_type,
         dimension_scores=record.dimension_scores,
+        deductions=record.deductions,
         revision_suggestions=record.revision_suggestions,
         overall_comment=record.overall_comment,
         polish_advice=record.polish_advice,
         sample_essay=record.sample_essay,
         strict_level=record.strict_level,
         pdf_url=record.pdf_url,
+        status=record.status,
+        error_message=record.error_message,
         create_time=record.create_time.isoformat() if record.create_time else None,
     )

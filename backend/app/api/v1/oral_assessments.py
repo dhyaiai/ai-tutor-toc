@@ -6,8 +6,10 @@
 - POST /oral/listening/submit   — 提交听力答案
 - POST /oral/dictation/generate — 生成听写任务
 - POST /oral/dictation/submit   — 提交听写结果
-- POST /oral/mandarin/evaluate  — 普通话测评
-- GET  /oral/tts                — 文本转语音（Edge TTS，返回 MP3 流）
+- POST /oral/mandarin/generate-text — 生成普通话朗读文本
+- POST /oral/mandarin/evaluate  — 普通话朗读测评（讯飞流式语音评测）
+- GET  /oral/tts                — 文本转语音（Edge TTS，返回 MP3 流，短文本）
+- POST /oral/tts                — 文本转语音（长文本走请求体，避免 URL 过长）
 """
 
 import base64
@@ -70,6 +72,11 @@ async def _create_oral_record(
         name=name,
         score=score,
         grade_level=grade_level or None,
+        # 冗余高频筛选字段到独立列，支持 SQL 层筛选
+        detail_question_type=detail.get("question_type") if detail else None,
+        detail_word_scope=detail.get("word_scope") if detail else None,
+        detail_direction=detail.get("direction") if detail else None,
+        detail_difficulty=detail.get("difficulty") if detail else None,
         detail=json.dumps(detail, ensure_ascii=False) if detail else None,
     )
     db.add(record)
@@ -120,34 +127,51 @@ class SubmitDictationRequest(BaseModel):
     word_scope: str = ""
 
 
-class MandarinEvaluateRequest(BaseModel):
-    test_level: str = Field(default="二级甲等")
-    test_part: str | None = None
-    text_content: str = ""
-    strict_level: int = Field(default=3)
-    evaluation_mode: str = Field(default="text", description="评测模式：ai_generated / free_speech / text")
-
-
 class GenerateMandarinTextRequest(BaseModel):
     topic: str = Field(default="", description="话题，留空则随机")
     difficulty: str = Field(default="中等", description="难度：简单/中等/困难")
     length: str = Field(default="短", description="文本长度：短/中/长")
 
 
-def _save_audio_file(audio_bytes: bytes, filename: str, user_id: int) -> str:
-    """保存音频文件到本地存储，返回相对路径。"""
-    settings = get_settings()
+# 口语录音最大大小（20MB），防止超大音频整块读入内存/撑爆磁盘
+_MAX_AUDIO_SIZE = 20 * 1024 * 1024
+
+
+async def _save_audio_file(audio_bytes: bytes, filename: str, user_id: int) -> str:
+    """保存音频文件（dev 本地 / 生产 MinIO），返回存储标识（相对路径 / object_name）。
+
+    生产模式不写本地磁盘：本地路径在生产无法通过 /api/v1/files/ 访问（生产 404），
+    Docker 多实例部署下音频也会只落在单个容器导致其他实例读不到。
+    """
     ext = filename.rsplit(".", 1)[-1].lower() if "." in filename else "webm"
     if ext not in ("webm", "wav", "mp3", "ogg", "m4a", "aac"):
         ext = "webm"
-    user_dir = Path(settings.LOCAL_STORAGE_DIR) / "oral_audio" / str(user_id)
-    user_dir.mkdir(parents=True, exist_ok=True)
     import uuid
     rel_path = f"oral_audio/{user_id}/{uuid.uuid4()}.{ext}"
-    full_path = Path(settings.LOCAL_STORAGE_DIR) / rel_path
-    full_path.write_bytes(audio_bytes)
+    from app.services.file_upload import StorageService
+    storage = StorageService()
+    await storage.save_file(rel_path, audio_bytes)
     logger.info("音频文件已保存: %s (%d bytes)", rel_path, len(audio_bytes))
     return rel_path
+
+
+async def _build_audio_url(audio_url: str | None) -> str | None:
+    """把音频存储标识转成前端可直接播放的 URL。
+
+    dev 模式：返回相对路径（前端拼 /api/v1/files/{path}）；
+    生产模式：返回 MinIO 预签名 URL（响应时实时生成，避免入库时生成导致过期失效）。
+    """
+    if not audio_url:
+        return audio_url
+    if get_settings().DEV_MODE:
+        return audio_url
+    try:
+        from app.services.file_upload import StorageService
+        storage = StorageService()
+        return await storage.get_presigned_url(audio_url)
+    except Exception as exc:
+        logger.warning("生成音频预签名 URL 失败: %s", exc)
+        return audio_url
 
 
 # ============ 英语听力 ============
@@ -345,56 +369,62 @@ async def generate_mandarin_text(
 @router.post("/mandarin/evaluate")
 async def evaluate_mandarin(
     test_level: str = Form(default="二级甲等"),
-    test_part: str | None = Form(default=None),
     text_content: str = Form(default=""),
-    strict_level: int = Form(default=3),
-    evaluation_mode: str = Form(default="text"),
-    audio: UploadFile | None = File(default=None),
+    audio: UploadFile = File(...),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """普通话水平测试评分。
+    """普通话朗读测评（讯飞流式语音评测）。
 
-    支持两种模式：
-    - 音频评测（evaluation_mode=ai_generated 或 free_speech）：上传录音文件，LLM 进行语音识别+评测
-    - 纯文本评测（evaluation_mode=text，旧版兼容）：仅根据文本内容评测
-
-    音频评测返回：transcribed_text（转写文本）、ai_comment（AI评语）、各维度得分
+    用户朗读 AI 生成的参考文本，上传 16k/16bit/单声道 WAV 录音，
+    由讯飞 ISE 引擎评测发音，返回百分制四维度得分（声韵/声调/流畅度/完整度）、
+    普通话等级、朗读有误字词，以及 LLM 基于评测数据生成的评语与建议。
     """
-    audio_base64 = ""
-    audio_format = "webm"
-    audio_path = ""
+    if not text_content.strip():
+        raise HTTPException(status_code=400, detail="缺少朗读参考文本，请先生成朗读文本")
+    # 分块读取 + 大小限制，避免超大音频整块读入内存
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = await audio.read(1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > _MAX_AUDIO_SIZE:
+            raise HTTPException(status_code=413, detail="音频文件过大（最大 20MB）")
+        chunks.append(chunk)
+    audio_bytes = b"".join(chunks)
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="上传的录音为空")
 
-    # 处理音频上传
-    if audio is not None:
-        audio_bytes = await audio.read()
-        if len(audio_bytes) > 0:
-            # 保存音频文件
-            audio_path = _save_audio_file(
-                audio_bytes,
-                audio.filename or "recording.webm",
-                current_user.id,
-            )
-            # 编码为 base64 发送给 LLM
-            audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-            audio_format = (audio.filename or "webm").rsplit(".", 1)[-1].lower()
+    # 保存音频文件（供作业记录回放）
+    audio_path = await _save_audio_file(
+        audio_bytes,
+        audio.filename or "recording.wav",
+        current_user.id,
+    )
+    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+    audio_format = (audio.filename or "wav").rsplit(".", 1)[-1].lower()
 
-    # 读取用户的助教个性化配置，评分严格度以全局配置为准（覆盖前端传入值）
+    # 读取用户的助教个性化配置（对评语风格生效）
     from app.services.personality_service import load_personality, build_grading_directive
     personality = await load_personality(db, current_user.id)
     personality_directive = build_grading_directive(personality)
 
-    # 调用评测服务
-    result = await service.evaluate_mandarin(
-        test_level=test_level,
-        test_part=test_part,
-        text_content=text_content,
-        strict_level=personality["strict_level"],
-        audio_base64=audio_base64,
-        audio_format=audio_format,
-        evaluation_mode=evaluation_mode,
-        personality_directive=personality_directive,
-    )
+    # 调用讯飞评测（失败直接报错，不创建无效记录）
+    try:
+        result = await service.evaluate_mandarin(
+            test_level=test_level,
+            text_content=text_content,
+            audio_base64=audio_base64,
+            audio_format=audio_format,
+            personality_directive=personality_directive,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.exception("讯飞语音评测失败")
+        raise HTTPException(status_code=502, detail=f"语音评测失败：{str(e)[:200]}")
 
     # 更新知识状态
     try:
@@ -412,78 +442,33 @@ async def evaluate_mandarin(
     except Exception:
         pass
 
-    # 生成作业记录（保存完整信息：等级、音频、转写文本、AI评语）
+    # 生成作业记录（保存完整信息：等级、音频、参考文本、评测明细、AI评语）
     try:
+        # score 摘要列统一 "得分/满分" 格式（Alt8）：与听力（"X/Y"）一致，
+        # 前端 parseOralScore 按 split('/') 解析。满分按评测引擎判定
+        # （讯飞 100 分制 / LLM 25 分制），与详情页维度满分展示逻辑一致；
+        # 旧记录 "X分" 格式仍被 parseOralScore 容错解析，无需迁移。
+        mandarin_full = result.get("dimension_full_score") or (
+            100 if result.get("engine") == "xfyun_ise" else 25
+        )
         record = await _create_oral_record(
             db, current_user.id, "普通话测评",
-            score=f"{result.get('total_score', 0)}分",
+            score=f"{result.get('total_score', 0)}/{mandarin_full}",
             detail={
                 "test_level": test_level,
-                "evaluation_mode": evaluation_mode,
+                "evaluation_mode": "ai_generated",
+                "engine": result.get("engine", "xfyun_ise"),
                 "audio_url": audio_path,
                 "transcribed_text": result.get("transcribed_text", ""),
                 "ai_comment": result.get("ai_comment", ""),
                 "dimension_scores": result.get("dimension_scores", {}),
+                "dimension_full_score": result.get("dimension_full_score", 100),
+                "error_chars": result.get("error_chars", []),
+                "is_rejected": result.get("is_rejected", False),
                 "suggestions": result.get("suggestions", []),
                 "total_score": result.get("total_score", 0),
                 "level": result.get("level", test_level),
-                "reference_text": text_content if evaluation_mode == "ai_generated" else "",
-            },
-        )
-        result["record"] = record
-    except Exception:
-        logger.exception("创建普通话测评作业记录失败")
-
-    return result
-
-
-@router.post("/mandarin/evaluate-json")
-async def evaluate_mandarin_json(
-    req: MandarinEvaluateRequest,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    """普通话水平测试评分（JSON请求体，纯文本模式，兼容旧版前端调用）。"""
-    # 读取用户的助教个性化配置，评分严格度以全局配置为准（覆盖前端传入值）
-    from app.services.personality_service import load_personality, build_grading_directive
-    personality = await load_personality(db, current_user.id)
-    result = await service.evaluate_mandarin(
-        test_level=req.test_level,
-        test_part=req.test_part,
-        text_content=req.text_content,
-        strict_level=personality["strict_level"],
-        evaluation_mode="text",
-        personality_directive=build_grading_directive(personality),
-    )
-
-    try:
-        tracker = KnowledgeTracker(db)
-        await tracker.update(
-            user_id=current_user.id,
-            knowledge_points=[{
-                "point_name": "普通话发音",
-                "subject": "语文",
-                "mastery_change": 1 if result.get("total_score", 0) >= 70 else -1,
-                "behavior_type": "口语正确" if result.get("total_score", 0) >= 70 else "口语错误",
-            }],
-            update_source="口语测评",
-        )
-    except Exception:
-        pass
-
-    try:
-        record = await _create_oral_record(
-            db, current_user.id, "普通话测评",
-            score=f"{result.get('total_score', 0)}分",
-            detail={
-                "test_level": req.test_level,
-                "evaluation_mode": "text",
-                "transcribed_text": req.text_content,
-                "ai_comment": result.get("suggestions", ""),
-                "dimension_scores": result.get("dimension_scores", {}),
-                "suggestions": result.get("suggestions", []),
-                "total_score": result.get("total_score", 0),
-                "level": result.get("level", req.test_level),
+                "reference_text": text_content,
             },
         )
         result["record"] = record
@@ -495,33 +480,27 @@ async def evaluate_mandarin_json(
 
 # ============ TTS 语音合成 ============
 
-# 可用的英语语音列表（Edge TTS 免费提供）
+# 可用的语音列表（Edge TTS 免费提供）
+# 英语类：default/male/british/british_male；中英混读类：mixed/mixed_male
+# 助教设置的音色选项（男声/女声）由前端映射为对应的 voice 参数传入
 _EDGE_VOICES = {
     "default": "en-US-JennyNeural",       # 美式女声
     "male": "en-US-GuyNeural",            # 美式男声
     "british": "en-GB-SoniaNeural",       # 英式女声
     "british_male": "en-GB-RyanNeural",   # 英式男声
-    "mixed": "zh-CN-XiaoxiaoNeural",      # 中文女声（可同时朗读中英混合文本，用于单词听写播报）
+    "mixed": "zh-CN-XiaoxiaoNeural",      # 中文女声（可同时朗读中英混合文本，用于单词听写/讲解播报）
+    "mixed_male": "zh-CN-YunyangNeural",  # 中文男声（可同时朗读中英混合文本，用于单词听写/讲解播报）
 }
 
 
-@router.get("/tts")
-async def text_to_speech(
-    text: str = Query(..., min_length=1, max_length=3000, description="要合成的文本"),
-    voice: str = Query(default="default", description="语音名称：default/male/british/british_male"),
-    rate: str = Query(default="+0%", description="语速，如 '+0%'、'-20%'、'+30%'"),
-):
-    """使用 Microsoft Edge TTS 将文本合成为 MP3 音频流。
+async def _synthesize_tts(text: str, voice: str, rate: str) -> StreamingResponse:
+    """Edge TTS 合成共用逻辑：合成 MP3 并以音频流返回（GET/POST 两个入口共用）。
 
     edge_tts 的 stream() 直接输出 MP3 帧（已编码），无需再转换。
     相比浏览器内置 SpeechSynthesis：
     - 不依赖系统语音引擎（Windows 中文系统无需额外装英文语音包）
     - 神经网络语音，发音自然
     - 通用于所有操作系统
-
-    前端用法：
-        const audio = new Audio(`/api/v1/oral/tts?text=${encodeURIComponent(text)}`);
-        await audio.play();
     """
     import edge_tts
 
@@ -546,15 +525,61 @@ async def text_to_speech(
                 "Cache-Control": "public, max-age=86400",
             },
         )
-    except Exception as e:
+    except Exception:
+        # 不把内部异常细节透传给前端（Alt6），完整堆栈已由 logger.exception 记录
         logger.exception("Edge TTS 合成失败")
-        raise HTTPException(status_code=500, detail=f"语音合成失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="语音合成失败，请稍后重试")
+
+
+@router.get("/tts")
+async def text_to_speech(
+    text: str = Query(..., min_length=1, max_length=3000, description="要合成的文本"),
+    voice: str = Query(default="default", description="语音名称：default/male/british/british_male/mixed/mixed_male"),
+    rate: str = Query(default="+0%", description="语速，如 '+0%'、'-20%'、'+30%'"),
+    current_user: User = Depends(get_current_user),
+):
+    """使用 Microsoft Edge TTS 将短文本合成为 MP3 音频流（GET 查询参数传文本）。
+
+    注意：中文文本 URL 编码后体积约膨胀 9 倍，过长会超出 HTTP 请求行上限；
+    长文本（如 AI 讲解播报）请改用 POST /oral/tts。
+
+    前端用法：
+        const audio = new Audio(`/api/v1/oral/tts?text=${encodeURIComponent(text)}`);
+        await audio.play();
+    """
+    return await _synthesize_tts(text, voice, rate)
+
+
+class TTSRequest(BaseModel):
+    """POST /oral/tts 请求体（长文本合成，不受 URL 长度限制）"""
+    text: str = Field(..., min_length=1, max_length=3000, description="要合成的文本")
+    voice: str = Field(default="default", description="语音名称：default/male/british/british_male/mixed/mixed_male")
+    rate: str = Field(default="+0%", description="语速，如 '+0%'、'-20%'、'+30%'")
+
+
+@router.post("/tts")
+async def text_to_speech_post(
+    req: TTSRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """长文本 TTS：文本走请求体，避免 GET 查询参数超出请求行长度上限。
+
+    前端用法：
+        const resp = await fetch("/api/v1/oral/tts", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({text, voice: "mixed"}),
+        });
+        const blobUrl = URL.createObjectURL(await resp.blob());
+    """
+    return await _synthesize_tts(req.text, req.voice, req.rate)
 
 
 @router.get("/tts-dialogue")
 async def text_to_speech_dialogue(
     text: str = Query(..., min_length=1, max_length=5000, description="含 M:/W: 标签的对话文本"),
     rate: str = Query(default="+0%", description="语速，如 '+0%'、'-20%'、'+30%'"),
+    current_user: User = Depends(get_current_user),
 ):
     """将带 M:/W: 标签的对话文本合成为 MP3 音频流。
 
@@ -616,9 +641,10 @@ async def text_to_speech_dialogue(
                 "Cache-Control": "public, max-age=86400",
             },
         )
-    except Exception as e:
+    except Exception:
+        # 不把内部异常细节透传给前端（Alt6），完整堆栈已由 logger.exception 记录
         logger.exception("对话 TTS 合成失败")
-        raise HTTPException(status_code=500, detail=f"对话语音合成失败: {str(e)}")
+        raise HTTPException(status_code=500, detail="对话语音合成失败，请稍后重试")
 
 
 # ============ 作业记录 ============
@@ -635,51 +661,66 @@ async def list_oral_records(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """查询当前用户的口语测评作业记录（可按类别、学段、题型、词库范围、测试方向、难度过滤）"""
+    """查询当前用户的口语测评作业记录（可按类别、学段、题型、词库范围、测试方向、难度过滤）。
+
+    筛选在 SQL 层完成（通过 OralRecord 的冗余列 detail_question_type 等），
+    避免先 LIMIT 后 Python 过滤导致结果数量不确定。
+    """
     stmt = select(OralRecord).where(OralRecord.user_id == current_user.id)
     if category:
         stmt = stmt.where(OralRecord.category == category)
     if grade_level:
         stmt = stmt.where(OralRecord.grade_level == grade_level)
+    # SQL 层筛选（走冗余列索引，不再在 Python 层过滤）
+    if question_type:
+        stmt = stmt.where(OralRecord.detail_question_type == question_type)
+    if word_scope:
+        stmt = stmt.where(OralRecord.detail_word_scope == word_scope)
+    if direction:
+        stmt = stmt.where(OralRecord.detail_direction == direction)
+    if difficulty:
+        stmt = stmt.where(OralRecord.detail_difficulty == difficulty)
     stmt = stmt.order_by(OralRecord.create_time.desc()).limit(limit)
     rows = (await db.execute(stmt)).scalars().all()
 
-    # 从 detail JSON 中提取题型/词库范围/测试方向/难度
     records = []
     for r in rows:
-        q_type = ""
-        w_scope = ""
-        w_direction = ""
-        w_difficulty = ""
+        full_score = None
+        # 冗余筛选列兜底：冗余列上线前创建的旧记录冗余列为 NULL，
+        # 但 detail JSON 中已存有题型/难度/学段等字段，读取时回退取值，
+        # 避免列表卡片标签缺失（配合启动迁移的回填，双保险）。
+        question_type = r.detail_question_type or ""
+        word_scope = r.detail_word_scope or ""
+        direction = r.detail_direction or ""
+        difficulty = r.detail_difficulty or ""
+        grade_level = r.grade_level or ""
         try:
             detail = json.loads(r.detail) if r.detail else {}
-            q_type = detail.get("question_type", "")
-            w_scope = detail.get("word_scope", "")
-            w_direction = detail.get("direction", "")
-            w_difficulty = detail.get("difficulty", "")
+            full_score = detail.get("full_score")
+            if not question_type:
+                question_type = detail.get("question_type") or ""
+            if not word_scope:
+                word_scope = detail.get("word_scope") or ""
+            if not direction:
+                direction = detail.get("direction") or ""
+            if not difficulty:
+                difficulty = detail.get("difficulty") or ""
+            if not grade_level:
+                grade_level = detail.get("grade_level") or ""
         except Exception:
             pass
-
-        # 题型/词库范围/测试方向/难度筛选（从 detail JSON 提取，需在 Python 层面过滤）
-        if question_type and q_type != question_type:
-            continue
-        if word_scope and w_scope != word_scope:
-            continue
-        if direction and w_direction != direction:
-            continue
-        if difficulty and w_difficulty != difficulty:
-            continue
 
         records.append({
             "id": r.id,
             "category": r.category,
             "name": r.name,
             "score": r.score,
-            "grade_level": r.grade_level,
-            "question_type": q_type,
-            "word_scope": w_scope,
-            "direction": w_direction,
-            "difficulty": w_difficulty,
+            "full_score": full_score,
+            "grade_level": grade_level,
+            "question_type": question_type,
+            "word_scope": word_scope,
+            "direction": direction,
+            "difficulty": difficulty,
             "created_at": r.create_time.isoformat(),
         })
     return records
@@ -703,6 +744,9 @@ async def get_oral_record_detail(
         detail = json.loads(record.detail) if record.detail else {}
     except Exception:
         detail = {}
+    # 生产模式把音频存储标识实时转为预签名 URL（dev 模式保持相对路径）
+    if "audio_url" in detail:
+        detail["audio_url"] = await _build_audio_url(detail.get("audio_url"))
     return {
         "id": record.id,
         "category": record.category,
@@ -711,6 +755,39 @@ async def get_oral_record_detail(
         "grade_level": record.grade_level,
         "created_at": record.create_time.isoformat(),
         "detail": detail,
+    }
+
+
+class OralRecordRename(BaseModel):
+    """修改作业名称的请求体"""
+    name: str = Field(..., min_length=1, max_length=128, description="新的作业名称")
+
+
+@router.put("/records/{record_id}")
+async def rename_oral_record(
+    record_id: int,
+    body: OralRecordRename,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """修改口语测评作业记录的名称（仅允许修改自己的记录）"""
+    stmt = select(OralRecord).where(
+        OralRecord.id == record_id,
+        OralRecord.user_id == current_user.id,
+    )
+    record = (await db.execute(stmt)).scalar_one_or_none()
+    if record is None:
+        raise HTTPException(status_code=404, detail="记录不存在或无权操作")
+    name = body.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="名称不能为空")
+    record.name = name
+    await db.commit()
+    await db.refresh(record)
+    return {
+        "message": "已修改",
+        "record_id": record.id,
+        "name": record.name,
     }
 
 

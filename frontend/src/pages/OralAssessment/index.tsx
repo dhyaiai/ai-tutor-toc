@@ -1,7 +1,7 @@
 /**
  * 听力与口语页面
  *
- * 3 个子模块标签页：
+ * 3 个子模块（大号分段切换器切换，与作文批改的语文/英语切换一致）：
  * - 英语听力：AI 生成听力试卷 → 在线作答 → 自动批改
  * - 单词听写：选择词库范围 → 播放听写 → 提交批改
  * - 普通话测评：输入/朗读文段 → AI 评分反馈
@@ -9,14 +9,15 @@
 
 import { useState, useCallback, useEffect, useRef } from "react";
 import {
-  Tabs, Card, Form, Select, InputNumber, Button, Input, Typography,
+  Segmented, Card, Form, Select, InputNumber, Button, Input, Typography,
   List, Tag, Spin, message, Result, Empty, Radio, Divider, Space, Progress, Modal, Alert,
-  Popconfirm, Table, Upload,
+  Popconfirm, Upload, Pagination, Dropdown,
 } from "antd";
 import {
   SoundOutlined, EditOutlined, CustomerServiceOutlined,
   PlayCircleOutlined, CheckCircleOutlined, CloseCircleOutlined, PauseCircleOutlined,
   CaretRightOutlined, LoadingOutlined, InboxOutlined, DeleteOutlined,
+  EyeOutlined, MoreOutlined, ReloadOutlined,
 } from "@ant-design/icons";
 import {
   oralService,
@@ -29,12 +30,25 @@ import {
   type MandarinResult,
   type OralRecord,
   type OralRecordDetail,
-  type MandarinMode,
 } from "../../services/oralService";
-import { formatDate } from "../../utils/helpers";
+import { formatDate, parseOralScore } from "../../utils/helpers";
+import { getTtsVoice } from "../../utils/ttsVoice";
+import { authedFetch } from "../../utils/authedFetch";
+import PlaybackRateControl, { usePlaybackRate } from "../../components/PlaybackRateControl";
+import AuthedAudio from "../../components/AuthedAudio";
+import "./index.css";
 
 const { Title, Text, Paragraph } = Typography;
 const { TextArea } = Input;
+
+/**
+ * 带登录凭证的 TTS 请求（/oral/tts 等端点要求登录）。
+ * 语音播放必须先 fetch 成 Blob 再交给 Audio 元素，无法让 Audio 直接带
+ * Authorization 头；authedFetch 统一附加 Bearer token 并处理 401 自动刷新。
+ */
+function ttsFetch(url: string, signal?: AbortSignal): Promise<Response> {
+  return authedFetch(url, { signal });
+}
 
 /** 清理听力原文：去除说话人标签，按句子拆分 */
 function cleanTranscript(text: string): string[] {
@@ -46,36 +60,6 @@ function cleanTranscript(text: string): string[] {
   if (!cleaned.trim()) return [];
   const sentences = cleaned.split(/(?<=[.!?])\s+/).filter((s) => s.trim().length > 0);
   return sentences.length > 0 ? sentences : [cleaned];
-}
-
-/** 播放速度持久化 localStorage key 前缀（听力/听写各自记忆） */
-const SPEED_STORAGE_PREFIX = "oral_playback_rate_";
-
-/** 读取已保存的播放速度（无效或未保存时返回默认值） */
-function loadStoredRate(storageKey: string, fallback: number): number {
-  try {
-    const raw = localStorage.getItem(SPEED_STORAGE_PREFIX + storageKey);
-    const v = raw == null ? NaN : parseFloat(raw);
-    if (isFinite(v) && v >= 0.75 && v <= 1.5) return v;
-  } catch { /* ignore */ }
-  return fallback;
-}
-
-/** 播放速度输入框（0.75–1.5，步长 0.05，与题数筛选项同为 InputNumber 风格；播放中调整即时生效） */
-function SpeedSelect({
-  value, onChange, size = "middle",
-}: { value: number; onChange: (v: number) => void; size?: "small" | "middle" }) {
-  return (
-    <InputNumber
-      size={size}
-      min={0.75}
-      max={1.5}
-      step={0.05}
-      value={value}
-      onChange={(v) => { if (typeof v === "number") onChange(Math.round(v * 100) / 100); }}
-      title="播放速度"
-    />
-  );
 }
 
 /**
@@ -91,24 +75,21 @@ function SpeedSelect({
  * @param defaultRate 未保存过时的默认播放速度（听力 1.0，单词听写 0.8），可在 0.75-1.5 间调整
  */
 function useTranscriptPlayer(storageKey: string, defaultRate = 1) {
-  const initialRate = loadStoredRate(storageKey, defaultRate);
   const [playState, setPlayState] = useState<"idle" | "loading" | "playing" | "paused">("idle");
   const [progress, setProgress] = useState(0);
-  const [playbackRate, setPlaybackRateState] = useState(initialRate);
+  // 速度状态/持久化由共享 hook 管理，播放器在此只补充 audio 元素联动
+  const { playbackRate, setPlaybackRate: persistRate, playbackRateRef } = usePlaybackRate(storageKey, defaultRate);
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const blobUrlRef = useRef<string | null>(null);
   const stoppedRef = useRef(false);
-  const playbackRateRef = useRef(initialRate);
   const timerRef = useRef<number | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
   /** 调整播放速度（播放中即时生效，并持久化保存，后续播放沿用） */
   const setPlaybackRate = (rate: number) => {
-    playbackRateRef.current = rate;
-    setPlaybackRateState(rate);
+    persistRate(rate);
     if (audioRef.current) audioRef.current.playbackRate = rate;
-    try { localStorage.setItem(SPEED_STORAGE_PREFIX + storageKey, String(rate)); } catch { /* ignore */ }
   };
 
   /* 组件卸载时清理 audio 元素和 blob URL */
@@ -142,7 +123,8 @@ function useTranscriptPlayer(storageKey: string, defaultRate = 1) {
   };
 
   /** 从头播放文本（使用后端 Edge TTS → fetch Blob → Audio 播放）
-   *  voice 可选：default(英语女声)/mixed(中文女声，可读中英混合的单词听写播报)
+   *  voice 可选：default(英语)/mixed(中文，可读中英混合的单词听写播报)，
+   *  实际男声/女声按助教设置的音色偏好解析（getTtsVoice）
    *  播放速度由 playbackRate 控制（Audio.playbackRate，客户端变速） */
   const speak = (text: string, voice = "default") => {
     // 停止之前的播放（先移除事件回调，防止清理时触发 error 弹窗）
@@ -169,12 +151,17 @@ function useTranscriptPlayer(storageKey: string, defaultRate = 1) {
     setPlayState("loading");
 
     // 服务端按原速合成，变速统一由客户端 playbackRate 完成（避免叠加变速）
-    const fetchUrl = `/api/v1/oral/tts?text=${encodeURIComponent(cleaned)}&rate=${encodeURIComponent("+0%")}&voice=${encodeURIComponent(voice)}`;
     const controller = new AbortController();
     abortRef.current = controller;
 
-    // 用 fetch 下载音频 Blob（可检测 HTTP 错误、支持 AbortController）
-    fetch(fetchUrl, { signal: controller.signal })
+    // 先按助教设置的音色偏好解析语音（男声/女声），再用 fetch 下载音频 Blob（可检测 HTTP 错误、支持 AbortController）
+    getTtsVoice(voice)
+      .then((resolvedVoice) => {
+        // 用户已停止则中断，避免泄漏 Blob URL
+        if (stoppedRef.current) throw new Error("stopped");
+        const fetchUrl = `/api/v1/oral/tts?text=${encodeURIComponent(cleaned)}&rate=${encodeURIComponent("+0%")}&voice=${encodeURIComponent(resolvedVoice)}`;
+        return ttsFetch(fetchUrl, controller.signal);
+      })
       .then(async (response) => {
         if (!response.ok) throw new Error(`服务端错误 (${response.status})`);
         const blob = await response.blob();
@@ -213,6 +200,7 @@ function useTranscriptPlayer(storageKey: string, defaultRate = 1) {
       .catch((err) => {
         if (stoppedRef.current) return;
         if (err.name === "AbortError") return; // 用户主动停止
+        if (err.message === "stopped") return; // 用户快速停止，中断 promise 链
         console.warn("[TTS] 后端 TTS 不可用 (%s)，回退浏览器 TTS", err.message);
         message.warning("语音服务暂不可用，请确认后端服务已重启。正在尝试浏览器语音...");
         // 后端 TTS 失败 → 回退浏览器 SpeechSynthesis（状态由回退控制，不闪 idle）
@@ -289,7 +277,7 @@ function useTranscriptPlayer(storageKey: string, defaultRate = 1) {
     const controller = new AbortController();
     abortRef.current = controller;
 
-    fetch(fetchUrl, { signal: controller.signal })
+    ttsFetch(fetchUrl, controller.signal)
       .then(async (response) => {
         if (!response.ok) throw new Error(`服务端错误 (${response.status})`);
         const blob = await response.blob();
@@ -468,6 +456,58 @@ function speakWord(text: string, rate: number) {
 }
 
 /**
+ * 将录音 Blob 转为讯飞语音评测要求的 16k/16bit/单声道 WAV。
+ *
+ * 通过 WebAudio 解码浏览器录音格式（webm/opus、mp4 等），
+ * 再用 OfflineAudioContext 重采样到 16000Hz 单声道，最后写入 WAV 头。
+ */
+async function blobToWav16k(blob: Blob): Promise<Blob> {
+  const arrayBuffer = await blob.arrayBuffer();
+  const ctx = new AudioContext();
+  let decoded: AudioBuffer;
+  try {
+    decoded = await ctx.decodeAudioData(arrayBuffer);
+  } finally {
+    void ctx.close();
+  }
+  const targetRate = 16000;
+  const length = Math.max(1, Math.ceil(decoded.duration * targetRate));
+  const offline = new OfflineAudioContext(1, length, targetRate);
+  const source = offline.createBufferSource();
+  source.buffer = decoded;
+  source.connect(offline.destination);
+  source.start();
+  const rendered = await offline.startRendering();
+  const samples = rendered.getChannelData(0);
+
+  // 写 WAV 头（44 字节）+ 16bit PCM 数据
+  const buffer = new ArrayBuffer(44 + samples.length * 2);
+  const view = new DataView(buffer);
+  const writeStr = (offset: number, s: string) => {
+    for (let i = 0; i < s.length; i++) view.setUint8(offset + i, s.charCodeAt(i));
+  };
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + samples.length * 2, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);          // fmt 块长度
+  view.setUint16(20, 1, true);           // PCM 编码
+  view.setUint16(22, 1, true);           // 单声道
+  view.setUint32(24, targetRate, true);  // 采样率
+  view.setUint32(28, targetRate * 2, true);  // 字节率
+  view.setUint16(32, 2, true);           // 块对齐
+  view.setUint16(34, 16, true);          // 位深
+  writeStr(36, "data");
+  view.setUint32(40, samples.length * 2, true);
+  let offset = 44;
+  for (let i = 0; i < samples.length; i++, offset += 2) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+/**
  * 音频录制 Hook
  *
  * 使用浏览器 MediaRecorder API 录制音频，返回 Blob 和播放 URL。
@@ -480,6 +520,8 @@ function useAudioRecorder() {
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
   const timerRef = useRef<number | null>(null);
+  // 追踪最新的 audioUrl，避免卸载时闭包捕获旧值导致 Blob URL 泄漏
+  const audioUrlRef = useRef<string | null>(null);
 
   // 清理定时器
   const clearTimer = useCallback(() => {
@@ -507,9 +549,11 @@ function useAudioRecorder() {
         const ext = mimeType.includes("webm") ? "webm" : mimeType.includes("mp4") ? "m4a" : "webm";
         const blob = new Blob(chunksRef.current, { type: mimeType });
         setAudioBlob(blob);
-        // 清理旧 URL
-        if (audioUrl) URL.revokeObjectURL(audioUrl);
-        setAudioUrl(URL.createObjectURL(blob));
+        // 清理旧 URL（使用 ref 追踪最新值，避免闭包捕获旧值导致泄漏）
+        if (audioUrlRef.current) URL.revokeObjectURL(audioUrlRef.current);
+        const newUrl = URL.createObjectURL(blob);
+        audioUrlRef.current = newUrl;
+        setAudioUrl(newUrl);
         // 停止所有音轨
         stream.getTracks().forEach((t) => t.stop());
         clearTimer();
@@ -545,18 +589,19 @@ function useAudioRecorder() {
     }
     setRecording(false);
     setRecordingTime(0);
-    if (audioUrl) { URL.revokeObjectURL(audioUrl); setAudioUrl(null); }
+    if (audioUrlRef.current) { URL.revokeObjectURL(audioUrlRef.current); audioUrlRef.current = null; }
+    setAudioUrl(null);
     setAudioBlob(null);
-  }, [audioUrl, clearTimer]);
+  }, [clearTimer]);
 
-  // 组件卸载时清理
+  // 组件卸载时清理（使用 ref 确保拿到最新值）
   useEffect(() => {
     return () => {
       clearTimer();
       if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
         mediaRecorderRef.current.stop();
       }
-      if (audioUrl) URL.revokeObjectURL(audioUrl);
+      if (audioUrlRef.current) { URL.revokeObjectURL(audioUrlRef.current); audioUrlRef.current = null; }
     };
   }, []);
 
@@ -644,16 +689,27 @@ function RecordDetailModal({
   const [loading, setLoading] = useState(false);
   const [record, setRecord] = useState<OralRecordDetail | null>(null);
   const player = useTranscriptPlayer("listening");
+  // 请求代次：快速切换记录时，旧请求晚返回会覆盖新记录（D8 竞态）
+  const requestSeqRef = useRef(0);
 
   useEffect(() => {
     if (!open || recordId == null) return;
     player.stop();
+    const seq = ++requestSeqRef.current;
     setLoading(true);
     setRecord(null);
     oralService.getRecordDetail(recordId)
-      .then(setRecord)
-      .catch(() => message.error("加载记录详情失败"))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        // 期间已切换到其他记录，丢弃本次过期响应
+        if (seq !== requestSeqRef.current) return;
+        setRecord(data);
+      })
+      .catch(() => {
+        if (seq === requestSeqRef.current) message.error("加载记录详情失败");
+      })
+      .finally(() => {
+        if (seq === requestSeqRef.current) setLoading(false);
+      });
   }, [open, recordId]);
 
   const detail = record?.detail;
@@ -689,7 +745,7 @@ function RecordDetailModal({
                 <Button size="small" icon={<PlayCircleOutlined />} onClick={() => player.speak(transcript)}>
                   播放原文
                 </Button>
-                <SpeedSelect value={player.playbackRate} onChange={player.setPlaybackRate} size="small" />
+                <PlaybackRateControl value={player.playbackRate} onChange={player.setPlaybackRate} width={90} />
                 {player.playState === "loading" && (
                   <Button size="small" disabled icon={<PauseCircleOutlined />}>生成语音中...</Button>
                 )}
@@ -743,16 +799,27 @@ function DictationRecordDetailModal({
   const [loading, setLoading] = useState(false);
   const [record, setRecord] = useState<OralRecordDetail | null>(null);
   const player = useTranscriptPlayer("dictation", 0.8);
+  // 请求代次：快速切换记录时，旧请求晚返回会覆盖新记录（D8 竞态）
+  const requestSeqRef = useRef(0);
 
   useEffect(() => {
     if (!open || recordId == null) return;
     player.stop();
+    const seq = ++requestSeqRef.current;
     setLoading(true);
     setRecord(null);
     oralService.getRecordDetail(recordId)
-      .then(setRecord)
-      .catch(() => message.error("加载记录详情失败"))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        // 期间已切换到其他记录，丢弃本次过期响应
+        if (seq !== requestSeqRef.current) return;
+        setRecord(data);
+      })
+      .catch(() => {
+        if (seq === requestSeqRef.current) message.error("加载记录详情失败");
+      })
+      .finally(() => {
+        if (seq === requestSeqRef.current) setLoading(false);
+      });
   }, [open, recordId]);
 
   const detail = record?.detail;
@@ -794,7 +861,7 @@ function DictationRecordDetailModal({
                 <Button size="small" icon={<PlayCircleOutlined />} onClick={() => player.speak(broadcastText, "mixed")}>
                   播放原文
                 </Button>
-                <SpeedSelect value={player.playbackRate} onChange={player.setPlaybackRate} size="small" />
+                <PlaybackRateControl value={player.playbackRate} onChange={player.setPlaybackRate} width={90} />
                 {player.playState === "loading" && (
                   <Button size="small" disabled icon={<PauseCircleOutlined />}>生成语音中...</Button>
                 )}
@@ -858,14 +925,14 @@ function DictationRecordDetailModal({
 
 /** 作业记录列表（展示在每个面板下方，refreshKey 变化时重新拉取）
  *
- * 英语听力记录(showFilters=true)：表头模式，含学段/题型筛选，点击名称或「查看详情」可查看听力原文/题目/作答/对错。
- * 单词听写记录(showDictationFilters=true)：表头模式，含测试方向/词库范围筛选，点击名称或「查看详情」可查看听力原文/题目与作答。
- * 普通话测评记录(showMandarinDetail=true)：可点击查看测评等级、音频、转写文本、AI评语。
- * 其他类别：简单 List 模式。
- * 每条记录末尾有删除按钮。
+ * 统一采用卡片格式（与作业记录一致）：
+ * - 英语听力记录：含学段/题型筛选，点击名称或「查看详情」可查看听力原文/题目/作答/对错
+ * - 单词听写记录：含测试方向/词库范围/难度筛选，点击名称或「查看详情」可查看听力原文/题目与作答
+ * - 普通话测评记录：可点击查看测评等级、音频、转写文本、AI评语
+ * 每条记录末尾有删除按钮，底部统一分页。
  */
 function OralRecordsList({
-  category, refreshKey, title, showMandarinDetail, showFilters, showDictationFilters, onDelete,
+  category, refreshKey, title, showMandarinDetail, showFilters, showDictationFilters, onDelete, active,
 }: {
   category: string; refreshKey: number;
   title?: string;
@@ -873,12 +940,21 @@ function OralRecordsList({
   showFilters?: boolean;
   showDictationFilters?: boolean;
   onDelete?: (id: number) => Promise<void>;
+  /** 所在子板块是否激活：面板常驻挂载（隐藏而非卸载），未激活时不发列表请求 */
+  active?: boolean;
 }) {
   const [records, setRecords] = useState<OralRecord[]>([]);
   const [activeId, setActiveId] = useState<number | null>(null);
   const [activeMandarinId, setActiveMandarinId] = useState<number | null>(null);
   const [activeDictationId, setActiveDictationId] = useState<number | null>(null);
   const [deleting, setDeleting] = useState<number | null>(null);
+  /** 编辑（重命名）弹窗状态 */
+  const [editingId, setEditingId] = useState<number | null>(null);
+  const [editModalOpen, setEditModalOpen] = useState(false);
+  const [editName, setEditName] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [page, setPage] = useState(1);
+  const pageSize = 10;
   /** 筛选状态（仅 showFilters 模式使用） */
   const [filterGrade, setFilterGrade] = useState<string | undefined>(undefined);
   const [filterType, setFilterType] = useState<string | undefined>(undefined);
@@ -908,11 +984,35 @@ function OralRecordsList({
     }
   }, [category, showFilters, filterGrade, filterType, showDictationFilters, filterDirection, filterScope, filterDifficulty]);
 
-  useEffect(() => { load(); }, [load, refreshKey]);
+  // 仅在所在子板块激活时加载；首次切换到该板块时自动拉取，之后由 refreshKey 驱动刷新
+  useEffect(() => {
+    if (active) load();
+  }, [load, refreshKey, active]);
+
+  /** 筛选变化时回到第一页 */
+  const updateFilter = (setter: (v: string | undefined) => void) => (v: string | undefined) => {
+    setter(v);
+    setPage(1);
+  };
+
+  /** 当前是否有筛选条件（决定是否显示"重置"按钮） */
+  const hasFilter = !!(
+    (showFilters && (filterGrade || filterType)) ||
+    (showDictationFilters && (filterDirection || filterScope || filterDifficulty))
+  );
+
+  /** 一键清空全部筛选并回到第一页 */
+  const resetFilters = () => {
+    setFilterGrade(undefined);
+    setFilterType(undefined);
+    setFilterDirection(undefined);
+    setFilterScope(undefined);
+    setFilterDifficulty(undefined);
+    setPage(1);
+  };
 
   /** 处理删除：调用父组件回调，成功后刷新列表 */
-  const handleDelete = async (id: number, e: React.MouseEvent) => {
-    e.stopPropagation();
+  const handleDelete = async (id: number) => {
     setDeleting(id);
     try {
       if (onDelete) {
@@ -927,289 +1027,244 @@ function OralRecordsList({
     }
   };
 
-  /** Table 列定义（英语听力表头模式） */
-  const columns = [
-    {
-      title: "听力名称",
-      dataIndex: "name",
-      key: "name",
-      width: 220,
-      ellipsis: true,
-      render: (_: string, r: OralRecord) => (
-        <a onClick={() => setActiveId(r.id)}>{r.name}</a>
-      ),
-    },
-    {
-      title: "学段",
-      dataIndex: "grade_level",
-      key: "grade_level",
-      width: 80,
-      render: (v: string | null) => v ? <Tag color="purple">{v}</Tag> : "-",
-    },
-    {
-      title: "题型",
-      dataIndex: "question_type",
-      key: "question_type",
-      width: 100,
-      render: (v: string) => v ? <Tag color="cyan">{v}</Tag> : "-",
-    },
-    {
-      title: "分值",
-      dataIndex: "score",
-      key: "score",
-      width: 90,
-      render: (v: string | null) => v ? <Tag color="blue">{v}</Tag> : "-",
-    },
-    {
-      title: "创建时间",
-      dataIndex: "created_at",
-      key: "created_at",
-      width: 130,
-      render: (v: string) => <Text type="secondary">{formatDate(v)}</Text>,
-    },
-    {
-      title: "操作",
-      key: "actions",
-      width: 190,
-      render: (_: unknown, r: OralRecord) => (
-        <div
-          style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <a onClick={() => setActiveId(r.id)}>查看详情</a>
-          <Popconfirm
-            title="确定删除该记录？"
-            description="删除后不可恢复"
-            onConfirm={(e) => handleDelete(r.id, e as unknown as React.MouseEvent)}
-            okText="确定"
-            cancelText="取消"
-          >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />} loading={deleting === r.id} onClick={(e) => e.stopPropagation()} />
-          </Popconfirm>
-        </div>
-      ),
-    },
-  ];
+  /** 处理重命名：调用接口，成功后更新列表中的名称并关闭弹窗 */
+  const handleRename = async () => {
+    if (editingId == null) return;
+    const trimmed = editName.trim();
+    if (!trimmed) {
+      message.warning("名称不能为空");
+      return;
+    }
+    setRenaming(true);
+    try {
+      await oralService.renameRecord(editingId, trimmed);
+      message.success("已修改");
+      setEditModalOpen(false);
+      setEditingId(null);
+      setRecords((prev) => prev.map((r) => (r.id === editingId ? { ...r, name: trimmed } : r)));
+    } catch {
+      message.error("修改失败");
+    } finally {
+      setRenaming(false);
+    }
+  };
 
-  /** Table 列定义（单词听写表头模式） */
-  const dictationColumns = [
-    {
-      title: "作业名称",
-      dataIndex: "name",
-      key: "name",
-      width: 200,
-      ellipsis: true,
-      render: (_: string, r: OralRecord) => (
-        <a onClick={() => setActiveDictationId(r.id)}>{r.name}</a>
-      ),
-    },
-    {
-      title: "分值（得分/总分）",
-      dataIndex: "score",
-      key: "score",
-      width: 120,
-      render: (v: string | null) => v ? <Tag color="blue">{v}</Tag> : "-",
-    },
-    {
-      title: "词库范围",
-      dataIndex: "word_scope",
-      key: "word_scope",
-      width: 130,
-      render: (v: string) => v ? <Tag color="geekblue">{v}</Tag> : "-",
-    },
-    {
-      title: "测试方向",
-      dataIndex: "direction",
-      key: "direction",
-      width: 110,
-      render: (v: string) => v ? <Tag color="orange">{v}</Tag> : "-",
-    },
-    {
-      title: "难度",
-      dataIndex: "difficulty",
-      key: "difficulty",
-      width: 90,
-      render: (v: string) => {
-        if (!v) return "-";
-        const color = v === "困难" ? "red" : v === "简单" ? "green" : "gold";
-        return <Tag color={color}>{v}</Tag>;
+  /** 构建"更多"下拉菜单（编辑 / 删除），供三种卡片复用 */
+  const buildMoreMenu = (r: OralRecord) => ({
+    items: [
+      {
+        key: "edit",
+        label: "编辑",
+        icon: <EditOutlined />,
+        onClick: () => {
+          setEditingId(r.id);
+          setEditName(r.name);
+          setEditModalOpen(true);
+        },
       },
-    },
-    {
-      title: "听写时间",
-      dataIndex: "created_at",
-      key: "created_at",
-      width: 130,
-      render: (v: string) => <Text type="secondary">{formatDate(v)}</Text>,
-    },
-    {
-      title: "查看详情",
-      key: "actions",
-      width: 160,
-      render: (_: unknown, r: OralRecord) => (
-        <div
-          style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <a onClick={() => setActiveDictationId(r.id)}>查看详情</a>
-          <Popconfirm
-            title="确定删除该记录？"
-            description="删除后不可恢复"
-            onConfirm={(e) => handleDelete(r.id, e as unknown as React.MouseEvent)}
-            okText="确定"
-            cancelText="取消"
-          >
-            <Button size="small" type="link" danger icon={<DeleteOutlined />} loading={deleting === r.id} onClick={(e) => e.stopPropagation()} />
-          </Popconfirm>
+      {
+        key: "delete",
+        label: "删除",
+        danger: true,
+        icon: <DeleteOutlined />,
+        onClick: () => {
+          Modal.confirm({
+            title: "确定删除该记录？",
+            content: "删除后不可恢复",
+            okText: "确认删除",
+            okType: "danger",
+            cancelText: "取消",
+            onOk: () => handleDelete(r.id),
+          });
+        },
+      },
+    ],
+  });
+
+  /** 分页数据：删除/筛选后 records 变短，page 可能越界（slice 返回空列表且分页器页码异常），
+   *  钳制到有效页范围（[1, 总页数]，无数据时固定第 1 页） */
+  const safePage = Math.min(page, Math.max(1, Math.ceil(records.length / pageSize)));
+  const pagedRecords = records.slice((safePage - 1) * pageSize, safePage * pageSize);
+
+  /** 打开详情 */
+  const openDetail = (r: OralRecord) => {
+    if (clickable) setActiveId(r.id);
+    if (mandarinClickable) setActiveMandarinId(r.id);
+    if (dictationClickable) setActiveDictationId(r.id);
+  };
+
+  /** 渲染测评记录卡片（英语听力/单词听写/普通话测评共用一套卡片结构，仅 meta 标签组合不同）。
+   *  三种卡片的差异只存在于标签区，合并后以字段存在与否自然区分，避免三份重复 JSX */
+  const renderRecordCard = (r: OralRecord) => {
+    const [scoreNum, scoreDen] = parseOralScore(r.score);
+    return (
+    <div className="or-card" key={r.id}>
+      <div className="or-card-badge">
+        <span className="or-badge-score">{scoreNum ?? "—"}</span>
+        <span className="or-badge-sep">/</span>
+        <span className="or-badge-total">{scoreDen ?? r.full_score ?? "—"}</span>
+      </div>
+      <div className="or-card-body">
+        <div className="or-card-info">
+          <div className="or-card-row or-card-row-title">
+            <span className="or-card-title" onClick={() => openDetail(r)}>{r.name}</span>
+          </div>
+          <div className="or-card-row or-card-row-meta">
+            {r.grade_level && <span className="or-card-meta-tag">{r.grade_level}</span>}
+            {r.question_type && <span className="or-card-meta-tag">{r.question_type}</span>}
+            {r.word_scope && <span className="or-card-meta-tag">{r.word_scope}</span>}
+            {r.direction && <span className="or-card-meta-tag">{r.direction}</span>}
+            {r.difficulty && (
+              <span className="or-card-meta-tag">
+                {r.difficulty === "困难" ? "🔴 " : r.difficulty === "简单" ? "🟢 " : "🟡 "}
+                {r.difficulty}
+              </span>
+            )}
+          </div>
+          <div className="or-card-row or-card-row-time">
+            {formatDate(r.created_at)}
+          </div>
         </div>
-      ),
-    },
-  ];
+        <div className="or-card-actions">
+          <Button className="or-action-view" icon={<EyeOutlined />} onClick={() => openDetail(r)}>
+            查看
+          </Button>
+          <Dropdown
+            menu={buildMoreMenu(r)}
+            trigger={["click"]}
+          >
+            <Button className="or-action-delete">
+              更多
+            </Button>
+          </Dropdown>
+        </div>
+      </div>
+    </div>
+    );
+  };
+
+  /** 根据类别选择渲染函数（三种卡片已合并，仅保留入口） */
+  const renderCard = renderRecordCard;
 
   return (
-    <Card style={{ marginTop: 16 }} title={title || "📄 作业记录"}>
-      {/* 筛选栏（仅英语听力模式） */}
+    <Card className="oral-records" style={{ marginTop: 16 }} title={title || "📄 作业记录"}>
+      {/* 筛选栏（英语听力模式） */}
       {showFilters && (
-        <Space style={{ marginBottom: 16 }} wrap>
-          <Select
-            allowClear
-            placeholder="学段"
-            style={{ width: 120 }}
-            value={filterGrade}
-            onChange={(v) => setFilterGrade(v)}
-            options={[
-              { label: "小学", value: "小学" },
-              { label: "初中", value: "初中" },
-              { label: "高中", value: "高中" },
-            ]}
-          />
-          <Select
-            allowClear
-            placeholder="题型"
-            style={{ width: 140 }}
-            value={filterType}
-            onChange={(v) => setFilterType(v)}
-            options={[
-              { label: "短对话", value: "短对话" },
-              { label: "长对话", value: "长对话" },
-              { label: "短文理解", value: "短文理解" },
-            ]}
-          />
-        </Space>
+        <div className="or-filter-bar">
+          <div className="or-filter-fields">
+            <div className="or-filter-field">
+              <span className="or-filter-label">学段</span>
+              <Select
+                allowClear
+                placeholder="全部"
+                value={filterGrade}
+                onChange={updateFilter(setFilterGrade)}
+                options={[
+                  { label: "小学", value: "小学" },
+                  { label: "初中", value: "初中" },
+                  { label: "高中", value: "高中" },
+                ]}
+              />
+            </div>
+            <div className="or-filter-field">
+              <span className="or-filter-label">题型</span>
+              <Select
+                allowClear
+                placeholder="全部"
+                value={filterType}
+                onChange={updateFilter(setFilterType)}
+                options={[
+                  { label: "短对话", value: "短对话" },
+                  { label: "长对话", value: "长对话" },
+                  { label: "短文理解", value: "短文理解" },
+                ]}
+              />
+            </div>
+            {hasFilter && (
+              <Button type="text" className="or-filter-reset" icon={<ReloadOutlined />} onClick={resetFilters}>
+                重置筛选
+              </Button>
+            )}
+          </div>
+        </div>
       )}
-      {/* 筛选栏（仅单词听写模式） */}
+      {/* 筛选栏（单词听写模式） */}
       {showDictationFilters && (
-        <Space style={{ marginBottom: 16 }} wrap>
-          <Select
-            allowClear
-            placeholder="测试方向"
-            style={{ width: 130 }}
-            value={filterDirection}
-            onChange={(v) => setFilterDirection(v)}
-            options={[
-              { label: "汉译英", value: "汉译英" },
-              { label: "英译汉", value: "英译汉" },
-              { label: "默写单词", value: "默写单词" },
-              { label: "中英混合", value: "中英混合" },
-            ]}
-          />
-          <Select
-            allowClear
-            placeholder="难度"
-            style={{ width: 110 }}
-            value={filterDifficulty}
-            onChange={(v) => setFilterDifficulty(v)}
-            options={[
-              { label: "简单", value: "简单" },
-              { label: "中等", value: "中等" },
-              { label: "困难", value: "困难" },
-            ]}
-          />
-          <Select
-            allowClear
-            placeholder="词库范围"
-            style={{ width: 150 }}
-            value={filterScope}
-            onChange={(v) => setFilterScope(v)}
-            options={[
-              { label: "小学必备词汇", value: "小学必备词汇" },
-              { label: "初中必备词汇", value: "初中必备词汇" },
-              { label: "高中必备词汇", value: "高中必备词汇" },
-              { label: "四级词汇", value: "四级词汇" },
-            ]}
-          />
-        </Space>
+        <div className="or-filter-bar">
+          <div className="or-filter-fields">
+            <div className="or-filter-field">
+              <span className="or-filter-label">测试方向</span>
+              <Select
+                allowClear
+                placeholder="全部"
+                value={filterDirection}
+                onChange={updateFilter(setFilterDirection)}
+                options={[
+                  { label: "汉译英", value: "汉译英" },
+                  { label: "英译汉", value: "英译汉" },
+                  { label: "默写单词", value: "默写单词" },
+                  { label: "中英混合", value: "中英混合" },
+                ]}
+              />
+            </div>
+            <div className="or-filter-field">
+              <span className="or-filter-label">难度</span>
+              <Select
+                allowClear
+                placeholder="全部"
+                value={filterDifficulty}
+                onChange={updateFilter(setFilterDifficulty)}
+                options={[
+                  { label: "简单", value: "简单" },
+                  { label: "中等", value: "中等" },
+                  { label: "困难", value: "困难" },
+                ]}
+              />
+            </div>
+            <div className="or-filter-field">
+              <span className="or-filter-label">词库范围</span>
+              <Select
+                allowClear
+                placeholder="全部"
+                value={filterScope}
+                onChange={updateFilter(setFilterScope)}
+                options={[
+                  { label: "小学必备词汇", value: "小学必备词汇" },
+                  { label: "初中必备词汇", value: "初中必备词汇" },
+                  { label: "高中必备词汇", value: "高中必备词汇" },
+                  { label: "四级词汇", value: "四级词汇" },
+                ]}
+              />
+            </div>
+            {hasFilter && (
+              <Button type="text" className="or-filter-reset" icon={<ReloadOutlined />} onClick={resetFilters}>
+                重置筛选
+              </Button>
+            )}
+          </div>
+        </div>
       )}
-      {records.length === 0 ? (
-        <Empty description="暂无记录" image={Empty.PRESENTED_IMAGE_SIMPLE} />
-      ) : showFilters ? (
-        /* 英语听力：Table 表头模式（仅名称/查看详情可打开详情） */
-        <Table
-          columns={columns}
-          dataSource={records}
-          rowKey="id"
-          size="middle"
-          pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (t) => `共 ${t} 条` }}
-        />
-      ) : showDictationFilters ? (
-        /* 单词听写：Table 表头模式（仅名称/查看详情可打开详情） */
-        <Table
-          columns={dictationColumns}
-          dataSource={records}
-          rowKey="id"
-          size="middle"
-          pagination={{ pageSize: 20, showSizeChanger: false, showTotal: (t) => `共 ${t} 条` }}
-        />
-      ) : (
-        /* 其他类别：简单 List 模式 */
-        <List
-          dataSource={records}
-          renderItem={(r) => (
-            <List.Item
-              style={clickable || mandarinClickable ? { cursor: "pointer" } : undefined}
-              onClick={() => {
-                if (clickable) setActiveId(r.id);
-                if (mandarinClickable) setActiveMandarinId(r.id);
-              }}
-              actions={[
-                (clickable || mandarinClickable) ? (
-                  <a key="view" onClick={(e) => {
-                    e.stopPropagation();
-                    if (clickable) setActiveId(r.id);
-                    if (mandarinClickable) setActiveMandarinId(r.id);
-                  }}>
-                    查看详情
-                  </a>
-                ) : null,
-                <Popconfirm
-                  key="delete"
-                  title="确定删除该记录？"
-                  description="删除后不可恢复"
-                  onConfirm={(e) => handleDelete(r.id, e as unknown as React.MouseEvent)}
-                  okText="确定"
-                  cancelText="取消"
-                >
-                  <Button
-                    size="small"
-                    type="link"
-                    danger
-                    icon={<DeleteOutlined />}
-                    loading={deleting === r.id}
-                    onClick={(e) => e.stopPropagation()}
-                  />
-                </Popconfirm>,
-              ].filter(Boolean)}
-            >
-              <Space wrap>
-                <Text strong>{r.name}</Text>
-                {r.grade_level && <Tag color="purple">{r.grade_level}</Tag>}
-                {r.score && <Tag color="blue">{r.score}</Tag>}
-                <Text type="secondary">{formatDate(r.created_at)}</Text>
-              </Space>
-            </List.Item>
-          )}
-        />
+      {/* 卡片列表 */}
+      <div className="or-card-list">
+        {records.length === 0 ? (
+          <div className="or-empty">暂无记录</div>
+        ) : (
+          pagedRecords.map(renderCard)
+        )}
+      </div>
+      {/* 分页 */}
+      {records.length > pageSize && (
+        <div className="or-pagination">
+          <Pagination
+            current={safePage}
+            pageSize={pageSize}
+            total={records.length}
+            onChange={setPage}
+            showTotal={(total) => `共 ${total} 条`}
+          />
+        </div>
       )}
+      {/* 详情弹窗 */}
       {clickable && (
         <RecordDetailModal
           recordId={activeId}
@@ -1231,7 +1286,65 @@ function OralRecordsList({
           onClose={() => setActiveDictationId(null)}
         />
       )}
+      {/* 重命名（编辑）弹窗 */}
+      <Modal
+        title="修改作业名称"
+        open={editModalOpen}
+        onCancel={() => setEditModalOpen(false)}
+        onOk={handleRename}
+        confirmLoading={renaming}
+        okText="保存"
+        cancelText="取消"
+        destroyOnClose
+      >
+        <div style={{ marginTop: 16 }}>
+          <Text type="secondary">请输入新的作业名称：</Text>
+          <Input
+            value={editName}
+            onChange={(e) => setEditName(e.target.value)}
+            maxLength={128}
+            placeholder="请输入作业名称"
+            style={{ marginTop: 8 }}
+            onPressEnter={handleRename}
+          />
+        </div>
+      </Modal>
     </Card>
+  );
+}
+
+/** 维度得分展示块（普通话评测详情 / 评测结果共用，避免两处重复渲染逻辑） */
+function DimensionScoreBlock({
+  scores,
+  fullScore,
+  nameMap,
+  dividerText,
+}: {
+  scores: Record<string, unknown>;
+  fullScore: number;
+  nameMap: Record<string, string>;
+  dividerText?: string;
+}) {
+  return (
+    <>
+      <Divider orientation="left">{dividerText || "📊 维度得分"}</Divider>
+      {Object.entries(scores).map(([k, v]) => {
+        const percent = Math.round((Number(v) / fullScore) * 100);
+        return (
+          <div key={k} style={{ marginBottom: 12 }}>
+            <Space>
+              <Text>{nameMap[k] || k}</Text>
+              <Text strong>{String(v)}/{fullScore}</Text>
+            </Space>
+            <Progress
+              percent={percent}
+              size="small"
+              status={percent >= 72 ? "success" : percent >= 48 ? "normal" : "exception"}
+            />
+          </div>
+        );
+      })}
+    </>
   );
 }
 
@@ -1241,25 +1354,45 @@ function MandarinRecordDetailModal({
 }: { recordId: number | null; open: boolean; onClose: () => void }) {
   const [loading, setLoading] = useState(false);
   const [record, setRecord] = useState<OralRecordDetail | null>(null);
+  // 请求代次：快速切换记录时，旧请求晚返回会覆盖新记录（D8 竞态）
+  const requestSeqRef = useRef(0);
 
   useEffect(() => {
     if (!open || recordId == null) return;
+    const seq = ++requestSeqRef.current;
     setLoading(true);
     setRecord(null);
     oralService.getRecordDetail(recordId)
-      .then(setRecord)
-      .catch(() => message.error("加载记录详情失败"))
-      .finally(() => setLoading(false));
+      .then((data) => {
+        // 期间已切换到其他记录，丢弃本次过期响应
+        if (seq !== requestSeqRef.current) return;
+        setRecord(data);
+      })
+      .catch(() => {
+        if (seq === requestSeqRef.current) message.error("加载记录详情失败");
+      })
+      .finally(() => {
+        if (seq === requestSeqRef.current) setLoading(false);
+      });
   }, [open, recordId]);
 
   const detail = record?.detail || {};
   const dimNameMap: Record<string, string> = {
-    pronunciation: "语音标准度",
+    pronunciation: "声韵准确度",
+    tone: "声调准确度",
     grammar: "词汇语法规范度",
     fluency: "流畅度",
-    completeness: "内容完整度",
+    completeness: "完整度",
     intonation: "语调自然度",
   };
+  // 各维度满分：讯飞评测为 100 分制，LLM 评测为 25 分制。
+  // dimension_full_score 字段只在新讯飞记录中返回；旧 LLM 评测记录无此字段，
+  // 若一律 fallback 100，会把 22/25 的旧记录渲染成 22/100（得分率错 4 倍）。
+  // 故按评测引擎区分：讯飞 → 100（新记录以字段值为准），其他（LLM 评测）→ 25
+  const dimFull = detail.engine === "xfyun_ise"
+    ? (Number(detail.dimension_full_score) || 100)
+    : 25;
+  const errorChars = Array.isArray(detail.error_chars) ? (detail.error_chars as string[]) : [];
 
   return (
     <Modal
@@ -1281,25 +1414,25 @@ function MandarinRecordDetailModal({
               <Tag>{detail.evaluation_mode === "ai_generated" ? "AI生成文本" : detail.evaluation_mode === "free_speech" ? "自行发挥" : String(detail.evaluation_mode)}</Tag>
             ) : null}
             {detail.total_score != null ? <Tag color="orange">总分：{String(detail.total_score)}</Tag> : null}
+            {detail.engine === "xfyun_ise" ? <Tag color="cyan">讯飞语音评测</Tag> : null}
           </Space>
 
           {/* 维度得分 */}
           {detail.dimension_scores && typeof detail.dimension_scores === "object" && Object.keys(detail.dimension_scores).length > 0 && (
+            <DimensionScoreBlock
+              scores={detail.dimension_scores as Record<string, unknown>}
+              fullScore={dimFull}
+              nameMap={dimNameMap}
+            />
+          )}
+
+          {/* 朗读有误的字词（讯飞评测） */}
+          {errorChars.length > 0 && (
             <>
-              <Divider orientation="left">📊 维度得分</Divider>
-              {Object.entries(detail.dimension_scores as Record<string, unknown>).map(([k, v]) => (
-                <div key={k} style={{ marginBottom: 8 }}>
-                  <Space>
-                    <Text>{dimNameMap[k] || k}</Text>
-                    <Text strong>{String(v)}/25</Text>
-                  </Space>
-                  <Progress
-                    percent={Math.round((Number(v) / 25) * 100)}
-                    size="small"
-                    status={Number(v) >= 18 ? "success" : Number(v) >= 12 ? "normal" : "exception"}
-                  />
-                </div>
-              ))}
+              <Divider orientation="left">❌ 朗读有误的字词</Divider>
+              <Space wrap>
+                {errorChars.map((c, i) => <Tag key={i} color="red">{c}</Tag>)}
+              </Space>
             </>
           )}
 
@@ -1323,15 +1456,12 @@ function MandarinRecordDetailModal({
             </>
           ) : null}
 
-          {/* 音频回放 */}
+          {/* 音频回放：oral_audio/ 为私有目录，强制鉴权，
+              原生 <audio> 无法带 Authorization 头，用 AuthedAudio 下载后播放 */}
           {detail.audio_url ? (
             <>
               <Divider orientation="left">🔊 录音回放</Divider>
-              <audio
-                controls
-                src={`/api/v1/files/${String(detail.audio_url)}`}
-                style={{ width: "100%" }}
-              />
+              <AuthedAudio src={`/api/v1/files/${String(detail.audio_url)}`} />
             </>
           ) : null}
 
@@ -1369,7 +1499,7 @@ function MandarinRecordDetailModal({
  * 新流程：选好题型/难度/题数 → AI 生成一段完整对话并从中提取题目。
  * 答题阶段不显示原文（只能播放整段对话音频）；批改后才展示听力原文与逐题对错。
  */
-function ListeningPanel() {
+function ListeningPanel({ active }: { active?: boolean }) {
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -1413,7 +1543,7 @@ function ListeningPanel() {
       if (!q.dialogue || audioCacheRef.current.has(i)) return;
       try {
         const fetchUrl = `/api/v1/oral/tts-dialogue?text=${encodeURIComponent(q.dialogue)}&rate=${encodeURIComponent(rateParam)}`;
-        const response = await fetch(fetchUrl);
+        const response = await ttsFetch(fetchUrl);
         // 如果在此期间生成了新题目，丢弃旧结果
         if (gen !== generationRef.current) return;
         if (response.ok) {
@@ -1560,7 +1690,7 @@ function ListeningPanel() {
             </Button>
           </Form.Item>
           <Form.Item label="播放速度" style={{ marginBottom: 0 }}>
-            <SpeedSelect value={player.playbackRate} onChange={player.setPlaybackRate} />
+            <PlaybackRateControl value={player.playbackRate} onChange={player.setPlaybackRate} />
           </Form.Item>
         </Form>
       </Card>
@@ -1726,7 +1856,7 @@ function ListeningPanel() {
         </Card>
       )}
 
-      <OralRecordsList category="英语听力" refreshKey={refreshKey} title="📄 听力记录" showFilters onDelete={handleDelete} />
+      <OralRecordsList category="英语听力" refreshKey={refreshKey} title="📄 听力记录" showFilters active={active} onDelete={handleDelete} />
     </div>
   );
 }
@@ -1739,7 +1869,7 @@ function ListeningPanel() {
  * - 键盘输入：每行写一个答案，按播报顺序逐词匹配
  * - 上传图片：手写/拍照答案交多模态 AI 识别后批改
  */
-function DictationPanel() {
+function DictationPanel({ active }: { active?: boolean }) {
   const [form] = Form.useForm();
   const [loading, setLoading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
@@ -1887,7 +2017,7 @@ function DictationPanel() {
             </Button>
           </Form.Item>
           <Form.Item label="播放速度">
-            <SpeedSelect value={player.playbackRate} onChange={player.setPlaybackRate} />
+            <PlaybackRateControl value={player.playbackRate} onChange={player.setPlaybackRate} />
           </Form.Item>
         </Form>
       </Card>
@@ -2038,6 +2168,7 @@ function DictationPanel() {
         refreshKey={refreshKey}
         title="🎧 单词听写记录"
         showDictationFilters
+        active={active}
         onDelete={(id) => oralService.deleteRecord(id)}
       />
     </div>
@@ -2046,14 +2177,12 @@ function DictationPanel() {
 
 /** 普通话测评面板
  *
- * 两种模式：
- * - AI生成文本：AI 生成朗读文本 → 用户录音朗读 → AI 对比原文评测发音
- * - 自行发挥：用户自行朗读一段内容 → AI 评测口语表达
+ * 流程：AI 生成朗读文本 → 用户录音朗读 → 讯飞流式语音评测（read_chapter 篇章朗读）
+ * 打分（声韵/声调/流畅度/完整度，百分制）→ AI 基于评测数据生成评语与建议。
  *
- * 每条评测记录保存：测评等级、用户音频、转写文本、AI评语，支持删除。
+ * 每条评测记录保存：测评等级、参考文本、用户音频、维度得分、AI评语，支持删除。
  */
-function MandarinPanel() {
-  const [mode, setMode] = useState<MandarinMode>("ai_generated");
+function MandarinPanel({ active }: { active?: boolean }) {
   const [level, setLevel] = useState("二级甲等");
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -2091,70 +2220,64 @@ function MandarinPanel() {
     }
   }, [topic, difficulty, textLength, recorder]);
 
-  /** 提交评测 */
+  /** 提交评测（讯飞流式语音评测） */
   const submitEvaluation = useCallback(async () => {
+    if (!generatedText.trim()) {
+      message.warning("请先生成朗读文本");
+      return;
+    }
     if (!recorder.audioBlob) {
       message.warning("请先录制音频");
       return;
     }
     setLoading(true);
     try {
-      const formData = new FormData();
-      formData.append("audio", recorder.audioBlob, "recording.webm");
-      formData.append("evaluation_mode", mode);
-      formData.append("test_level", level);
-      formData.append("strict_level", "3");
-      // AI生成文本模式：附带参考文本
-      if (mode === "ai_generated" && generatedText) {
-        formData.append("text_content", generatedText);
+      // 讯飞语音评测要求 16k 采样率 / 16bit / 单声道，先在浏览器端转成 WAV
+      let wavBlob: Blob;
+      try {
+        wavBlob = await blobToWav16k(recorder.audioBlob);
+      } catch {
+        message.error("录音转码失败，请使用 Chrome / Edge 浏览器重新录制");
+        return;
       }
+      const formData = new FormData();
+      formData.append("audio", wavBlob, "recording.wav");
+      formData.append("test_level", level);
+      formData.append("text_content", generatedText);
       const data = await oralService.evaluateMandarinAudio(formData);
       setResult(data);
       setRefreshKey((k) => k + 1);
-      if (data.error) {
-        message.warning("评测部分完成：" + data.error);
-      } else {
-        message.success("评测完成");
-      }
-    } catch {
-      message.error("评测失败，请重试");
+      message.success("评测完成");
+    } catch (e) {
+      const detail = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      message.error(detail || "语音评测失败，请重试");
     } finally {
       setLoading(false);
     }
-  }, [recorder.audioBlob, mode, level, generatedText]);
-
-  /** 切换模式时重置 */
-  const handleModeChange = useCallback((newMode: MandarinMode) => {
-    setMode(newMode);
-    setResult(null);
-    recorder.reset();
-    if (newMode === "ai_generated") {
-      // 保留已生成的文本，不需要重置
-    }
-  }, [recorder]);
+  }, [recorder.audioBlob, level, generatedText]);
 
   /** 重新开始 */
   const handleReset = useCallback(() => {
     setResult(null);
     recorder.reset();
-    if (mode === "ai_generated") {
-      setGeneratedText("");
-    }
-  }, [mode, recorder]);
+    setGeneratedText("");
+  }, [recorder]);
 
   /** 删除记录回调 */
   const handleDelete = useCallback(async (id: number) => {
     await oralService.deleteRecord(id);
   }, []);
 
-  // 各维度中文名映射
+  // 各维度中文名映射（讯飞评测：声韵/声调/流畅度/完整度）
   const dimNameMap: Record<string, string> = {
-    pronunciation: "语音标准度",
-    grammar: "词汇语法规范度",
+    pronunciation: "声韵准确度",
+    tone: "声调准确度",
     fluency: "流畅度",
-    completeness: "内容完整度",
-    intonation: "语调自然度",
+    completeness: "完整度",
   };
+
+  // 讯飞评测各维度为百分制
+  const dimFull = result?.dimension_full_score ?? 100;
 
   /** 格式化录音时长 */
   const formatTime = (seconds: number) => {
@@ -2165,22 +2288,10 @@ function MandarinPanel() {
 
   return (
     <div>
-      {/* 模式选择 + 等级选择 + 筛选条件（同行） */}
+      {/* 等级选择 + 朗读文本生成条件（同行） */}
       <Card>
         <Space wrap style={{ width: "100%", justifyContent: "space-between" }}>
           <Space wrap size="middle">
-            <Space>
-              <Text strong>评测模式：</Text>
-              <Radio.Group
-                value={mode}
-                onChange={(e) => handleModeChange(e.target.value)}
-                optionType="button"
-                buttonStyle="solid"
-              >
-                <Radio.Button value="ai_generated">AI生成文本</Radio.Button>
-                <Radio.Button value="free_speech">自行发挥</Radio.Button>
-              </Radio.Group>
-            </Space>
             <Space>
               <Text strong>测评等级：</Text>
               <Select
@@ -2198,8 +2309,8 @@ function MandarinPanel() {
             </Space>
           </Space>
 
-          {/* AI生成文本模式：话题/难度/长度 + 生成按钮 */}
-          {mode === "ai_generated" && !generatedText && (
+          {/* 朗读文本生成：话题/难度/长度 + 生成按钮 */}
+          {!generatedText && (
             <Space wrap size="small">
               <Input
                 placeholder="话题（可选）"
@@ -2236,8 +2347,19 @@ function MandarinPanel() {
         </Space>
       </Card>
 
-      {/* AI生成文本模式：显示生成的文本 */}
-      {mode === "ai_generated" && generatedText && (
+      {/* 生成中提示：LLM 生成朗读文本通常需要 10~30 秒，期间无任何页面变化，
+          若不加提示用户会误以为按钮无反应，故生成时显示明确进度信息 */}
+      {generating && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginTop: 16 }}
+          message="AI 正在生成朗读文本，通常需要 10~30 秒，请耐心等待..."
+        />
+      )}
+
+      {/* 朗读文本展示 */}
+      {generatedText && (
         <Card style={{ marginTop: 16 }} title="📖 朗读文本">
           <Alert
             type="info"
@@ -2264,19 +2386,8 @@ function MandarinPanel() {
         </Card>
       )}
 
-      {/* 自行发挥模式：提示 */}
-      {mode === "free_speech" && !result && (
-        <Card style={{ marginTop: 16 }}>
-          <Alert
-            type="info"
-            showIcon
-            message="自行发挥模式：请录制一段普通话口语内容（如自我介绍、话题演讲、日常对话等），AI 将对您的发音和表达进行评测。"
-          />
-        </Card>
-      )}
-
-      {/* 录音区域（未提交结果时显示） */}
-      {!result && (
+      {/* 录音区域（已生成朗读文本且未提交结果时显示） */}
+      {generatedText && !result && (
         <Card style={{ marginTop: 16 }} title="🎙️ 录音">
           <div style={{ textAlign: "center", padding: "20px 0" }}>
             {!recorder.audioUrl ? (
@@ -2340,7 +2451,7 @@ function MandarinPanel() {
       {/* 加载中 */}
       {loading && (
         <div style={{ textAlign: "center", padding: 40 }}>
-          <Spin tip="AI 正在进行语音评测，请耐心等待..." />
+          <Spin tip="讯飞语音评测中，请稍候..." />
         </div>
       )}
 
@@ -2355,21 +2466,31 @@ function MandarinPanel() {
 
           {/* 维度得分 */}
           {result.dimension_scores && Object.keys(result.dimension_scores).length > 0 && (
+            <DimensionScoreBlock
+              scores={result.dimension_scores}
+              fullScore={dimFull}
+              nameMap={dimNameMap}
+              dividerText="各维度得分"
+            />
+          )}
+
+          {/* 乱读提示（讯飞评测） */}
+          {result.is_rejected && (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginTop: 12 }}
+              message="检测到朗读内容与参考文本严重不符，成绩可能不准确，请对照文本重新朗读。"
+            />
+          )}
+
+          {/* 朗读有误的字词（讯飞评测） */}
+          {result.error_chars && result.error_chars.length > 0 && (
             <>
-              <Divider>各维度得分</Divider>
-              {Object.entries(result.dimension_scores).map(([k, v]) => (
-                <div key={k} style={{ marginBottom: 12 }}>
-                  <Space>
-                    <Text>{dimNameMap[k] || k}</Text>
-                    <Text strong>{v}/25</Text>
-                  </Space>
-                  <Progress
-                    percent={Math.round((Number(v) / 25) * 100)}
-                    size="small"
-                    status={Number(v) >= 18 ? "success" : Number(v) >= 12 ? "normal" : "exception"}
-                  />
-                </div>
-              ))}
+              <Divider>❌ 朗读有误的字词</Divider>
+              <Space wrap>
+                {result.error_chars.map((c, i) => <Tag key={i} color="red">{c}</Tag>)}
+              </Space>
             </>
           )}
 
@@ -2427,39 +2548,54 @@ function MandarinPanel() {
         refreshKey={refreshKey}
         title="📄 普通话测评记录"
         showMandarinDetail
+        active={active}
         onDelete={handleDelete}
       />
     </div>
   );
 }
 
+/** 子板块切换键：listening=英语听力 / dictation=单词听写 / mandarin=普通话测评 */
+type OralTabKey = "listening" | "dictation" | "mandarin";
+
 /** 听力与口语主页 */
 export default function OralAssessmentPage() {
-  const tabItems = [
-    {
-      key: "listening",
-      label: <span><SoundOutlined /> 英语听力</span>,
-      children: <ListeningPanel />,
-    },
-    {
-      key: "dictation",
-      label: <span><EditOutlined /> 单词听写</span>,
-      children: <DictationPanel />,
-    },
-    {
-      key: "mandarin",
-      label: <span><CustomerServiceOutlined /> 普通话测评</span>,
-      children: <MandarinPanel />,
-    },
-  ];
+  /** 当前子板块（默认英语听力），用大号分段切换器控制（与作文批改一致） */
+  const [tab, setTab] = useState<OralTabKey>("listening");
 
   return (
-    <div style={{ padding: "24px 0" }}>
-      <Title level={3}>🎧 听力与口语</Title>
-      <Paragraph type="secondary">
-        AI 驱动的听说训练：听力理解、单词听写、普通话测评，实时批改反馈。
-      </Paragraph>
-      <Tabs defaultActiveKey="listening" items={tabItems} size="large" />
+    <div style={{ padding: "12px 0 24px", maxWidth: 1280, margin: "0 auto" }}>
+      {/* 页面头部：无 emoji，纯排版层次 */}
+      <div style={{ marginBottom: 24 }}>
+        <Title level={2} style={{ marginBottom: 0, letterSpacing: "-0.02em" }}>
+          听力与口语
+        </Title>
+      </div>
+
+      {/* 大号分段切换：激活项深蓝实底白字（样式见 soft-ui.css 8.1 节，与作文批改语文/英语切换一致） */}
+      <Segmented
+        block
+        className="soft-section-switcher"
+        value={tab}
+        onChange={(v) => setTab(v as OralTabKey)}
+        options={[
+          { value: "listening", label: "英语听力", icon: <SoundOutlined /> },
+          { value: "dictation", label: "单词听写", icon: <EditOutlined /> },
+          { value: "mandarin", label: "普通话测评", icon: <CustomerServiceOutlined /> },
+        ]}
+      />
+
+      {/* 三个子板块常驻挂载（隐藏而非卸载），切换时保留各自的状态；
+           active 传给面板控制 OralRecordsList 是否加载，未激活的 tab 不发查询请求 */}
+      <div hidden={tab !== "listening"} style={{ marginTop: 24 }}>
+        <ListeningPanel active={tab === "listening"} />
+      </div>
+      <div hidden={tab !== "dictation"} style={{ marginTop: 24 }}>
+        <DictationPanel active={tab === "dictation"} />
+      </div>
+      <div hidden={tab !== "mandarin"} style={{ marginTop: 24 }}>
+        <MandarinPanel active={tab === "mandarin"} />
+      </div>
     </div>
   );
 }

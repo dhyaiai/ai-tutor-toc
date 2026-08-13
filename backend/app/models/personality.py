@@ -40,8 +40,8 @@ class AgentPersonality(Base):
         comment="说话风格：口语化亲切/书面化正式/简洁高效"
     )
     voice_tone: Mapped[str] = mapped_column(
-        String(32), nullable=False, default="沉稳男声",
-        comment="语音音色：温柔女声/沉稳男声/活泼童声/磁性青年音"
+        String(32), nullable=False, default="female",
+        comment="语音音色：male/female（历史遗留中文值视为女声），对助教讲解/英语听力/单词听写的 TTS 播报生效"
     )
     strict_level: Mapped[int] = mapped_column(
         Integer, nullable=False, default=3,

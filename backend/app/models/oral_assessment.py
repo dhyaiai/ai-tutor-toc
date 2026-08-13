@@ -81,9 +81,17 @@ class OralRecord(Base):
         comment="英语听力/单词听写/普通话测评",
     )
     name: Mapped[str] = mapped_column(String(128), nullable=False, comment="作业名称")
-    score: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="成绩摘要")
+    # score 为展示摘要列，统一存储 "得分/满分" 格式（如 "4.5/6"，Alt8）：
+    # 前端 parseOralScore 按 split('/') 解析。数值详情一律存 detail JSON
+    # （total_score/full_score/dimension_full_score），本列不得存自由展示文案。
+    score: Mapped[str | None] = mapped_column(String(64), nullable=True, comment="成绩摘要（得分/满分）")
     grade_level: Mapped[str | None] = mapped_column(
         String(16), nullable=True, comment="学段：小学/初中/高中"
     )
+    # 高频筛选字段冗余列：从 detail JSON 提取，支持 SQL 层筛选（避免先 LIMIT 后过滤导致结果不确定）
+    detail_question_type: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True, comment="题型（冗余自detail）")
+    detail_word_scope: Mapped[str | None] = mapped_column(String(128), nullable=True, comment="词库范围（冗余自detail）")
+    detail_direction: Mapped[str | None] = mapped_column(String(32), nullable=True, comment="测试方向（冗余自detail）")
+    detail_difficulty: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True, comment="难度（冗余自detail）")
     detail: Mapped[str | None] = mapped_column(Text, nullable=True, comment="详情JSON")
     create_time: Mapped[datetime] = mapped_column(DateTime, default=datetime.now)

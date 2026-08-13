@@ -92,6 +92,14 @@ export interface MandarinResult {
   transcribed_text?: string;
   /** AI 综合评语 */
   ai_comment?: string;
+  /** 评测引擎：xfyun_ise（讯飞流式语音评测）/ llm */
+  engine?: string;
+  /** 各维度满分（讯飞评测为 100，LLM 评测为 25） */
+  dimension_full_score?: number;
+  /** 是否被判为乱读（讯飞评测） */
+  is_rejected?: boolean;
+  /** 朗读有误的字词（讯飞评测） */
+  error_chars?: string[];
   /** 错误信息 */
   error?: string;
   record?: OralRecord;
@@ -113,15 +121,13 @@ export interface MandarinGeneratedText {
   error?: string;
 }
 
-/** 普通话评测模式 */
-export type MandarinMode = "ai_generated" | "free_speech";
-
 /** 口语测评作业记录 */
 export interface OralRecord {
   id: number;
   category: string;
   name: string;
   score: string | null;
+  full_score?: number | null;   // 满分（从 detail JSON 提取）
   grade_level?: string | null;  // 学段：小学/初中/高中
   question_type?: string;       // 题型：短对话/长对话/短文理解
   word_scope?: string;          // 词库范围（单词听写）
@@ -248,24 +254,12 @@ export const oralService = {
     return data;
   },
 
-  /** 普通话水平测评（音频模式，上传录音文件） */
+  /** 普通话水平测评（讯飞流式语音评测，上传 16k/16bit/单声道 WAV 录音） */
   async evaluateMandarinAudio(formData: FormData): Promise<MandarinResult> {
     const { data } = await api.post(`${BASE}/mandarin/evaluate`, formData, {
       headers: { "Content-Type": "multipart/form-data" },
       timeout: 180000,  // 音频评测可能需要更长时间
     });
-    return data;
-  },
-
-  /** 普通话水平测评（纯文本模式，兼容旧版） */
-  async evaluateMandarinText(params: {
-    test_level?: string;
-    test_part?: string;
-    text_content: string;
-    strict_level?: number;
-    evaluation_mode?: string;
-  }): Promise<MandarinResult> {
-    const { data } = await api.post(`${BASE}/mandarin/evaluate-json`, params);
     return data;
   },
 
@@ -286,6 +280,11 @@ export const oralService = {
   async getRecordDetail(recordId: number): Promise<OralRecordDetail> {
     const { data } = await api.get(`${BASE}/records/${recordId}`);
     return data;
+  },
+
+  /** 修改作业记录名称 */
+  async renameRecord(recordId: number, name: string): Promise<void> {
+    await api.put(`${BASE}/records/${recordId}`, { name });
   },
 
   /** 删除一条作业记录 */

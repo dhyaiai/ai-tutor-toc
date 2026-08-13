@@ -2,28 +2,37 @@
 Celery 异步分析任务。
 
 编排作业分析的完整流程：
-OCR 切割 → 多模态评分 → 知识点提取 → 向量化入库
+OCR 切割 → 多模态评分 → 知识点提取
 """
 
 import asyncio
 import logging
 from app.models.assignment import AssignmentStatus
-from app.models.question import QuestionStatus, AnalysisTaskType, AnalysisTaskStatus
+from app.models.question import Question, QuestionStatus, AnalysisTaskType, AnalysisTaskStatus
 
 logger = logging.getLogger(__name__)
 
 
-def _stitch_question_answer(q_image_bytes: bytes, a_image_bytes: bytes | None) -> bytes:
+def _stitch_question_answer(
+    q_image_bytes: bytes,
+    a_image_bytes: bytes | None,
+    sheet_image_bytes: bytes | None = None,
+) -> bytes:
     """
-    将题目图片和学生答案图片垂直拼接，添加分隔线和标签。
+    将题目图片与客观题识别区图、标准答案图片（答案切割功能上传的答案解析页）垂直拼接，
+    添加分隔线和标签。拼接顺序：[Question] → [Answer Sheet] → [Reference Answer]。
 
-    拼接后 AI 能同时看到题目内容和学生作答，提高识别准确率。
-    如果答案图片为空，直接返回题目图片。
+    拼接后 AI 能同时看到题目内容（含学生手写作答）、学生在卷首识别区誊写的客观题答案、
+    以及标准答案，提高评分准确率。
+    注意：答案图片必须标注为 [Reference Answer]、识别区图必须标注为 [Answer Sheet]
+    （与 prompt 中的图片结构说明一致），绝不能标错，否则 AI 会把印刷版解析当成学生作答。
+    如果两类附加图都为空，直接返回压缩后的题目图片。
     输出为 JPEG 格式（体积远小于 PNG，大幅减少 API 传输时间）。
 
     Args:
         q_image_bytes: 题目图片字节
-        a_image_bytes: 答案图片字节（可为 None）
+        a_image_bytes: 标准答案图片字节（可为 None）
+        sheet_image_bytes: 客观题识别区（答题卡）切图字节（可为 None）
 
     Returns:
         拼接后的图片字节（JPEG格式）
@@ -31,42 +40,58 @@ def _stitch_question_answer(q_image_bytes: bytes, a_image_bytes: bytes | None) -
     import cv2
     import numpy as np
 
-    if a_image_bytes is None:
+    if a_image_bytes is None and sheet_image_bytes is None:
         return _compress_for_api(q_image_bytes)
 
     q_img = cv2.imdecode(np.frombuffer(q_image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-    a_img = cv2.imdecode(np.frombuffer(a_image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
-
     if q_img is None:
-        return _compress_for_api(a_image_bytes) if isinstance(a_image_bytes, bytes) else q_image_bytes
-    if a_img is None:
+        if a_image_bytes is not None:
+            return _compress_for_api(a_image_bytes)
+        return q_image_bytes
+
+    # 按拼接顺序收集 (图像, 标签)：题目 → 识别区 → 标准答案
+    parts: list[tuple[np.ndarray, str]] = [(q_img, "[Question]")]
+    if sheet_image_bytes is not None:
+        sheet_img = cv2.imdecode(np.frombuffer(sheet_image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if sheet_img is not None:
+            parts.append((sheet_img, "[Answer Sheet]"))
+    if a_image_bytes is not None:
+        a_img = cv2.imdecode(np.frombuffer(a_image_bytes, dtype=np.uint8), cv2.IMREAD_COLOR)
+        if a_img is not None:
+            parts.append((a_img, "[Reference Answer]"))
+
+    if len(parts) == 1:
         return _compress_for_api(q_image_bytes)
 
     # 缩放到相同宽度，限制最大宽度为 800px（减小图片体积，加快 API 传输）
-    max_w = max(q_img.shape[1], a_img.shape[1])
-    if max_w > 800:
-        scale = 800 / max_w
-        q_h = int(q_img.shape[0] * scale)
-        a_h = int(a_img.shape[0] * scale)
-        q_img = cv2.resize(q_img, (800, q_h))
-        a_img = cv2.resize(a_img, (800, a_h))
-        target_w = 800
-    else:
-        q_h = int(q_img.shape[0] * max_w / q_img.shape[1])
-        a_h = int(a_img.shape[0] * max_w / a_img.shape[1])
-        q_img = cv2.resize(q_img, (max_w, q_h))
-        a_img = cv2.resize(a_img, (max_w, a_h))
-        target_w = max_w
+    target_w = min(800, max(img.shape[1] for img, _ in parts))
 
-    # 添加标签
-    cv2.putText(q_img, "[Question]", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-    cv2.putText(a_img, "[Student Answer]", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+    # 添加标签：标签画在额外扩展的白色页眉条上，绝不能直接画在图片内容上——
+    # 题目切图可能很矮（如单选题仅 100+px），画在内容上会盖住学生手写作答；
+    # 且标签必须避开红色/蓝色（红色会被去红预处理当成红笔抹除并 inpaint，
+    # 连带破坏下方的印刷字与学生笔迹；蓝色在 Lab a* 通道上同样会被误判为红），
+    # 统一使用绿色
+    def _add_label_header(img: np.ndarray, label: str, width: int) -> np.ndarray:
+        header = np.full((40, width, 3), 255, dtype=np.uint8)
+        cv2.putText(header, label, (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 160, 0), 2)
+        return np.vstack([header, img])
+
+    labeled: list[np.ndarray] = []
+    for img, label in parts:
+        new_h = int(img.shape[0] * target_w / img.shape[1])
+        img = cv2.resize(img, (target_w, new_h))
+        labeled.append(_add_label_header(img, label, target_w))
 
     # 白色分隔线
     sep = np.full((8, target_w, 3), 200, dtype=np.uint8)
+    stacked: list[np.ndarray] = []
+    for i, img in enumerate(labeled):
+        if i > 0:
+            stacked.append(sep)
+        stacked.append(img)
 
     # 垂直拼接
-    stitched = np.vstack([q_img, sep, a_img])
+    stitched = np.vstack(stacked)
 
     # 使用 JPEG 压缩（quality=85 在识别质量和文件体积间取得平衡）
     encode_params = [cv2.IMWRITE_JPEG_QUALITY, 85]
@@ -124,7 +149,8 @@ def _infer_parent_question_type(
     规则：
     - 若 AI 已将父题标为"单选题"/"多选题"，但子题中存在多种不同题型，
       说明这是一个包含混合小题的大题，此时根据子题分析内容推断正确的大题题型。
-    - 若所有子题题型一致且与父题相同，不做修正。
+    - 若父题被标为选择题且子题全是选择题，说明这是"材料+多道选择小题"的题组，
+      修正为"选择题组"。
     """
     if not sub_list:
         return ai_parent_type
@@ -132,19 +158,21 @@ def _infer_parent_question_type(
     # 收集子题的题型集合
     child_types = {sq.question_type for sq in sub_list if sq.question_type}
 
-    # 如果子题题型全部一致且父题不是选择题，无需修正
-    # 如果父题不是单选题/多选题，信任 AI 的判断
-    if ai_parent_type not in ("单选题", "多选题"):
+    # 如果父题不是选择类题型（含已标为"选择题组"），信任 AI 的判断
+    if ai_parent_type not in ("单选题", "多选题", "选择题"):
         return ai_parent_type
 
-    # 父题被标为选择题，但子题有多种类型 → 明显是 AI 误判
-    # 或者子题中有非选择题类型（如简答题、填空题），说明这不是纯选择题大题
+    # 父题被标为选择题，且子题全是选择题 → 材料题组，修正为"选择题组"
+    # 子题中存在非选择题型（如简答题、填空题），说明这不是纯选择题大题，走关键词推断
     has_non_choice_child = any(
         t and "选" not in t for t in child_types
     )
-    if len(child_types) <= 1 and not has_non_choice_child:
-        # 子题全是选择题，父题标为单选题可能是正确的
-        return ai_parent_type
+    if not has_non_choice_child:
+        logger.info(
+            "Corrected parent question_type from '%s' to '选择题组' (all %d sub-questions are choice questions)",
+            ai_parent_type, len(sub_list)
+        )
+        return "选择题组"
 
     # 扫描子题的 analysis_detail 和 knowledge_points 寻找关键词
     all_text = ""
@@ -182,6 +210,191 @@ except Exception:
     celery_app = None
 
 
+# ── 正在运行的分析任务注册表 ──
+# 用于检测"僵尸"状态：dev 模式下分析任务与 API 同进程运行，
+# 服务重启会丢失后台任务，作业状态会永远停留在 grading。
+# API 层可通过 is_analysis_running() 判断该作业是否真的有任务在跑。
+# 生产模式使用 Redis 分布式锁（多 worker 进程隔离），dev 模式使用进程内集合。
+_RUNNING_ANALYSES: set[int] = set()
+_RUNNING_ANALYSES_LOCK_KEY_PREFIX = "analysis:running:"
+
+
+def _get_redis_client():
+    """获取 Redis 客户端（生产模式用于分布式锁）"""
+    try:
+        from app.core.config import get_settings
+        import redis
+        settings = get_settings()
+        if settings.DEV_MODE:
+            return None
+        return redis.Redis.from_url(settings.REDIS_URL, decode_responses=True)
+    except Exception:
+        return None
+
+
+def _set_analysis_running(assignment_id: int, running: bool) -> None:
+    """设置分析任务运行状态（进程内 + Redis 分布式）"""
+    # 进程内集合（dev 模式、单进程生产环境兜底）
+    if running:
+        _RUNNING_ANALYSES.add(assignment_id)
+    else:
+        _RUNNING_ANALYSES.discard(assignment_id)
+    
+    # Redis 分布式锁（生产模式多 worker）
+    redis_client = _get_redis_client()
+    if redis_client:
+        key = f"{_RUNNING_ANALYSES_LOCK_KEY_PREFIX}{assignment_id}"
+        if running:
+            # 使用 SET NX EX 3600（1小时过期，防止死锁）
+            redis_client.set(key, "1", nx=True, ex=3600)
+        else:
+            redis_client.delete(key)
+
+
+def is_analysis_running(assignment_id: int) -> bool:
+    """判断当前是否有该作业的分析任务正在运行（分布式感知）"""
+    # 先查进程内集合（快路径）
+    if assignment_id in _RUNNING_ANALYSES:
+        return True
+    
+    # 生产模式查 Redis
+    redis_client = _get_redis_client()
+    if redis_client:
+        key = f"{_RUNNING_ANALYSES_LOCK_KEY_PREFIX}{assignment_id}"
+        return redis_client.exists(key) > 0
+    
+    return False
+
+
+async def _is_analysis_cancelled(db, assignment_id: int) -> bool:
+    """检测作业分析是否已被用户终止（cancel_analysis 会把作业状态置为 FAILED）。
+
+    以 DB 状态为准而非内存标记：生产模式下分析任务在 Celery worker 进程运行，
+    与 API 进程不同，只能通过共享的数据库传递取消信号。
+    注意：必须用列查询而非 db.get——本 session 已加载过该作业对象（状态 GRADING），
+    db.get 会命中身份映射缓存读不到别的会话刚提交的 FAILED。
+    """
+    from sqlalchemy import select
+    from app.models.assignment import Assignment
+
+    result = await db.execute(
+        select(Assignment.status).where(Assignment.id == assignment_id)
+    )
+    status = result.scalar_one_or_none()
+    return status == AssignmentStatus.FAILED
+
+
+async def reconcile_stuck_assignment(db, assignment, all_questions) -> bool:
+    """僵尸状态自愈：将"分析中"但实际无任务在跑的作业收敛到终态。
+
+    供 GET 详情页与启动扫描（reconcile_all_stuck_assignments）共用。
+    调用前提：调用方已确认该作业确实没有分析任务在跑（dev 模式用
+    is_analysis_running 判断）。与旧实现相比修正两处问题：
+    1. 题目存在非终态（PENDING/PROCESSING，服务崩溃残留）时先统一标记 FAILED——
+       否则作业既无法自愈，也会被 analyze 接口的 ACTIVE_STATES 校验以
+       "分析正在进行中"拒绝重新触发；
+    2. 全部题目都失败时作业标记为 FAILED（含失败说明），不再伪造"分析已完成"；
+       只要还有题目 COMPLETED 才收敛为 COMPLETED（部分成功，摘要如实说明）。
+
+    返回 True 表示发生了收敛（已 commit；调用方如需重算总分请自行处理）。
+    """
+    if not all_questions:
+        return False
+    # 非终态题目（崩溃残留的 PENDING/PROCESSING）→ 标记失败，保证状态可收敛
+    stale = [q for q in all_questions if q.status not in (QuestionStatus.COMPLETED, QuestionStatus.FAILED)]
+    for q in stale:
+        q.status = QuestionStatus.FAILED
+        q.analysis_detail = "分析中断（服务重启/终止），请重新分析该题"
+    completed_count = sum(1 for q in all_questions if q.status == QuestionStatus.COMPLETED)
+    if completed_count == 0:
+        assignment.status = AssignmentStatus.FAILED
+        if not assignment.ai_summary:
+            assignment.ai_summary = "分析失败（服务重启后自动收敛）。请重新分析该作业。"
+    else:
+        assignment.status = AssignmentStatus.COMPLETED
+        if not assignment.ai_summary:
+            assignment.ai_summary = "分析已完成（服务重启后自动恢复，部分题目失败）。如需 AI 整体评语，请点击重新汇总。"
+    await db.commit()
+    logger.warning(
+        "[self-heal] Assignment %d 收敛为 %s（完成 %d / 失败 %d / 残留 %d）",
+        assignment.id, assignment.status.value, completed_count,
+        len(all_questions) - completed_count, len(stale),
+    )
+    return True
+
+
+async def reconcile_all_stuck_assignments():
+    """启动扫描：收敛所有"分析中"但无任务在跑的作业（dev 模式服务重启场景）。
+
+    仅 dev 模式由 main.py lifespan 调用。生产模式分析任务在 Celery worker 进程，
+    API 进程无法判断 worker 任务存活，状态收敛由 worker 自身保证。
+    """
+    from sqlalchemy import select
+    from app.db.session import async_session_factory
+    from app.models.assignment import Assignment
+
+    _ANALYZING_STATES = (
+        AssignmentStatus.SPLITTING,
+        AssignmentStatus.GRADING,
+        AssignmentStatus.PROCESSING,
+    )
+    async with async_session_factory() as db:
+        # 第一类：作业级状态仍卡在分析中（整卷分析被服务重启打断）
+        result = await db.execute(
+            select(Assignment).where(Assignment.status.in_(_ANALYZING_STATES))
+        )
+        stuck = result.scalars().all()
+        for assignment in stuck:
+            if is_analysis_running(assignment.id):
+                continue
+            q_result = await db.execute(
+                select(Question).where(Question.assignment_id == assignment.id)
+            )
+            questions = q_result.scalars().all()
+            if not questions:
+                # 无题目却卡在分析中（上传后未切割）→ 直接收敛为失败
+                assignment.status = AssignmentStatus.FAILED
+                assignment.ai_summary = "分析失败（服务重启后自动收敛，作业无题目）"
+                await db.commit()
+                continue
+            await reconcile_stuck_assignment(db, assignment, questions)
+
+        # 第二类（A3-5）：作业已到终态但存在崩溃残留的非终态题目——
+        # 单题重分析被服务重启打断时，作业状态是 COMPLETED/FAILED（不在
+        # _ANALYZING_STATES 内），第一类扫不到它，题目会永久卡在
+        # PROCESSING/PENDING（前端轮询到超时、再次重分析被 409 拒绝）。
+        # 启动时 _RUNNING_ANALYSES 为空（进程刚起，无在跑任务），
+        # 残留题目统一收敛为 FAILED。
+        residual_result = await db.execute(
+            select(Question.assignment_id)
+            .where(
+                Question.status.in_(
+                    (QuestionStatus.PENDING, QuestionStatus.PROCESSING)
+                )
+            )
+            .distinct()
+        )
+        for residual_assignment_id in residual_result.scalars().all():
+            if is_analysis_running(residual_assignment_id):
+                continue
+            assignment = await db.get(Assignment, residual_assignment_id)
+            if not assignment or assignment.status in _ANALYZING_STATES:
+                # 作业不存在，或作业级分析中（由第一类处理，避免重复收敛）
+                continue
+            # 仅收敛"确已进入过分析生命周期"的作业（COMPLETED/FAILED）：
+            # 状态仍停在 PENDING/SPLITTING/SPLITTED 的作业，题目合法地处于
+            # PENDING（用户还没点"开始分析"），不能当作崩溃残留误标失败
+            if assignment.status not in (AssignmentStatus.COMPLETED, AssignmentStatus.FAILED):
+                continue
+            q_result = await db.execute(
+                select(Question).where(Question.assignment_id == residual_assignment_id)
+            )
+            questions = q_result.scalars().all()
+            if not questions:
+                continue
+            await reconcile_stuck_assignment(db, assignment, questions)
+
+
 def _run_async(coro):
     """在 Celery 同步任务中运行异步协程"""
     try:
@@ -197,7 +410,11 @@ def _run_async(coro):
 
 
 if celery_app is not None:
-    @celery_app.task(bind=True, name="analyze_assignment", max_retries=3, default_retry_delay=60)
+    # 注意：任务级 soft/hard time_limit 必须覆盖内部批处理预算（单批最长 1320s，
+    # 详见下方 grade_batch 的 asyncio.wait_for 注释），否则生产模式下复杂大题
+    # （纯评分可达 644s）会被全局默认的 300s/360s 提前杀掉导致任务必然失败。
+    @celery_app.task(bind=True, name="analyze_assignment", max_retries=3, default_retry_delay=60,
+                     soft_time_limit=5400, time_limit=7200)
     def analyze_assignment(self, assignment_id: int):
         """作业整体分析任务（Celery）。"""
         logger.info("[analyze_assignment] Starting for assignment %d (attempt %d)",
@@ -222,6 +439,7 @@ async def _do_analyze(assignment_id: int):
     from app.models.assignment import Assignment
     from app.models.question import Question
 
+    _set_analysis_running(assignment_id, True)
     try:
         await _do_analyze_inner(assignment_id)
     except Exception as exc:
@@ -231,11 +449,13 @@ async def _do_analyze(assignment_id: int):
         except Exception as mark_exc:
             logger.error("[analyze] Failed to mark assignment %d as FAILED: %s", assignment_id, mark_exc)
         raise
+    finally:
+        _set_analysis_running(assignment_id, False)
 
 
 async def _do_analyze_inner(assignment_id: int):
     """分析主流程实现"""
-    from sqlalchemy import select, func
+    from sqlalchemy import select, func, delete
     from app.db.session import async_session_factory
     from app.models.assignment import Assignment
     from app.models.question import Question
@@ -260,18 +480,23 @@ async def _do_analyze_inner(assignment_id: int):
             raise ValueError("请先手动切割题目后再开始分析")
 
         # ── 清理旧的子题记录（重新分析时避免产生孤儿数据）──
-        old_children_result = await db.execute(
-            select(Question).where(
+        # 必须用 DELETE 语句（InnoDB 当前读）而非 select + db.delete（快照读）：
+        # REPEATABLE READ 下一致性快照在本事务第一个非锁定 SELECT 时建立，
+        # 若并发任务（单题重分析）在快照建立后提交了新子题，快照读"看不到"
+        # 它们 → 旧子题删不掉 → 重建时新旧叠加 → 子题重复、大题分值翻倍
+        # （曾出现：重分析后 4 小题变 8 小题）。DELETE 总是锁定并删除
+        # 最新已提交版本的行，无论快照多旧都能清空旧子题，重建后数据一致。
+        # 注意条件必须带 parent_id IS NOT NULL——只删子题，保留顶层题目。
+        delete_result = await db.execute(
+            delete(Question).where(
                 Question.assignment_id == assignment_id,
                 Question.parent_id.isnot(None),
             )
         )
-        old_children = old_children_result.scalars().all()
-        if old_children:
-            logger.info("[analyze] Deleting %d old sub-questions for assignment %d", len(old_children), assignment_id)
-            for child in old_children:
-                await db.delete(child)
-            await db.flush()
+        logger.info(
+            "[analyze] Deleted %d old sub-questions for assignment %d",
+            delete_result.rowcount or 0, assignment_id,
+        )
 
         # ── 题目已存在（手动切割），直接进入评分 ──
         # 只加载顶层题目（parent_id IS NULL），子题已清理
@@ -285,258 +510,416 @@ async def _do_analyze_inner(assignment_id: int):
             .order_by(Question.question_number)
         )
         existing_questions = question_result.scalars().all()
-        # 下载已有题目图片用于评分（如有答案图片则拼接后发给AI）
-        question_records = []
-        for q in existing_questions:
+        # 下载客观题识别区切图（如有），作为 [Answer Sheet] 拼入每道题
+        sheet_bytes: bytes | None = None
+        if assignment.answer_sheet_image_url:
+            try:
+                sheet_bytes = await storage.get_file_bytes(assignment.answer_sheet_image_url)
+                if sheet_bytes:
+                    logger.info("[analyze] 作业 %d 已加载客观题识别区切图", assignment_id)
+                else:
+                    logger.warning("[analyze] 作业 %d 识别区切图下载失败，回退无识别区模式", assignment_id)
+            except Exception as sheet_err:
+                logger.error("[analyze] 作业 %d 识别区切图加载异常: %s", assignment_id, sheet_err)
+                sheet_bytes = None
+        # 下载已有题目图片用于评分（如有答案图片/识别区图则拼接后发给AI）。
+        # 并发下载：题目图片可能几十张，串行逐个 await 在 MinIO/磁盘 IO 下耗时明显
+        async def _load_question_images(q) -> tuple | None:
+            """下载单题图片（题目图 + 答案图）并拼接附加图，失败返回 None 由调用方跳过"""
             q_bytes = await storage.get_file_bytes(q.image_url)
             if q_bytes is None:
                 logger.warning("Failed to download question image: %s", q.image_url)
-                continue
-            # 如果有答案图片，下载并拼接
+                return None
+            # 如果有答案图片，下载后与识别区图一起拼接
+            a_bytes = None
             if q.answer_image_url:
                 try:
                     a_bytes = await storage.get_file_bytes(q.answer_image_url)
-                    if a_bytes:
-                        q_bytes = _stitch_question_answer(q_bytes, a_bytes)
-                        logger.info("[analyze] 题目 #%d 已拼接答案图片", q.question_number)
-                    else:
+                    if not a_bytes:
                         logger.warning("[analyze] 题目 #%d 答案图片下载失败", q.question_number)
-                        q_bytes = _compress_for_api(q_bytes)  # 无答案图时也压缩
-                except Exception as stitch_err:
-                    logger.error("[analyze] 题目 #%d 答案拼接异常: %s，回退到仅使用题目图片",
-                                 q.question_number, stitch_err)
-                    q_bytes = _compress_for_api(q_bytes)
-            else:
-                # 无答案图片，直接压缩题目图片
+                except Exception as dl_err:
+                    logger.error("[analyze] 题目 #%d 答案图片下载异常: %s", q.question_number, dl_err)
+                    a_bytes = None
+            try:
+                q_bytes = _stitch_question_answer(q_bytes, a_bytes, sheet_bytes)
+                if a_bytes or sheet_bytes:
+                    logger.info("[analyze] 题目 #%d 已拼接附加图（答案图=%s, 识别区=%s）",
+                                q.question_number, bool(a_bytes), bool(sheet_bytes))
+            except Exception as stitch_err:
+                logger.error("[analyze] 题目 #%d 拼接异常: %s，回退到仅使用题目图片",
+                             q.question_number, stitch_err)
                 q_bytes = _compress_for_api(q_bytes)
-            question_records.append((q, q_bytes))
+            return q, q_bytes
+
+        # return_exceptions=True：单题图片下载异常（DEV 本地分支 read_bytes 的
+        # OSError 等）只跳过该题，不因一道题失败而 abort 整卷分析
+        # （否则 gather 会把异常传播给调用方，_do_analyze 的 except 将
+        # 整个作业标记 FAILED，其余题目已算好的结果全部丢失）
+        loaded = await asyncio.gather(
+            *[_load_question_images(q) for q in existing_questions],
+            return_exceptions=True,
+        )
+        failed_downloads = [
+            q.question_number
+            for q, r in zip(existing_questions, loaded)
+            if isinstance(r, BaseException)
+        ]
+        if failed_downloads:
+            logger.error("[analyze] 以下题目图片加载失败已跳过: %s", failed_downloads)
+        question_records = [
+            r for r in loaded
+            if r is not None and not isinstance(r, BaseException)
+        ]
         if not question_records:
             raise ValueError("无法加载任何题目图片进行评分")
-        assignment.status = AssignmentStatus.GRADING
-        await db.commit()
 
         # ── 阶段 2: AI 逐题评分（实时更新，每题完成后立即提交）──
+        # 重置顶层题目状态为 PENDING：重新分析时避免旧的 COMPLETED 状态残留，
+        # 也让 API 层的僵尸状态自愈逻辑不会在评分进行中误判为"全部完成"。
+        for q, _ in question_records:
+            q.status = QuestionStatus.PENDING
         assignment.status = AssignmentStatus.GRADING
         await db.commit()
         logger.info("[analyze] Stage: GRADING (assignment %d) — %d questions", assignment_id, len(question_records))
 
+        # 提取题目 ID 和图片数据（在 session 关闭前将数据提取到内存，
+        # 避免评分期间长时间占用数据库连接）
+        # 同时提取 assignment 的基本属性（close 后 ORM 对象会 detach，访问未加载字段会抛 DetachedInstanceError）
+        question_ids_and_images = [
+            (q.id, img_bytes) for q, img_bytes in question_records
+        ]
+        question_ids = [qid for qid, _ in question_ids_and_images]
+        # 个性化评分指令（用户设定的教学风格偏好，影响评分 prompt）——局部导入
+        from app.services.personality_service import load_grading_directive
+        personality_directive = await load_grading_directive(db, assignment.creator_id)
+        # 在 close 前提取需要的 assignment 属性（避免后续访问 detach 后的 ORM 对象）
+        assignment_subject = assignment.subject
+        assignment_creator_id = assignment.creator_id
+        # 关闭 session，释放连接回池（评分阶段可能耗时数分钟，不持有连接）
+        await db.close()
+
         from app.services.ai_grader import AIGrader
         from app.services.knowledge_extractor import KnowledgeExtractor
-        from app.services.personality_service import load_grading_directive
         grader = AIGrader()
         extractor = KnowledgeExtractor()
 
-        # 加载作业创建者的助教个性化配置（性格/说话风格/评分严格度），对所有批改生效
-        personality_directive = await load_grading_directive(db, assignment.creator_id)
-
         total_score = 0
         all_knowledge_points: set[str] = set()
-        q_count = len(question_records)
+        q_count = len(question_ids_and_images)
         # Batch grading: group images for concurrent API calls (≤3 per request)
         BATCH_SIZE = grader.MAX_IMAGES_PER_REQUEST
 
-        # Process in batches
+        # Process in batches（每批使用独立 session，避免长 LLM 调用期间占用连接池）
         batch_start = 0
         while batch_start < q_count:
-            batch = question_records[batch_start: batch_start + BATCH_SIZE]
-            batch_images = [qr.image_bytes if hasattr(qr, 'image_bytes') else qr for _, qr in batch]
+            batch_items = question_ids_and_images[batch_start: batch_start + BATCH_SIZE]
+            batch_qids = [qid for qid, _ in batch_items]
+            batch_images = [img for _, img in batch_items]
+
+            # 每批开启新 session
+            async with async_session_factory() as batch_db:
+                # 加载题目对象到新 session
+                batch_questions = []
+                for qid in batch_qids:
+                    q = await batch_db.get(Question, qid)
+                    if q is not None:
+                        batch_questions.append(q)
+
+                # 标记当前批次为"正在分析"，供前端区分排队中（PENDING）的题目
+                for question in batch_questions:
+                    question.status = QuestionStatus.PROCESSING
+                await batch_db.commit()
+            # session 已关闭，连接释放回池
+
             logger.info("[analyze] Grading batch %d/%d (%d questions)...",
-                        batch_start // BATCH_SIZE + 1, (q_count + BATCH_SIZE - 1) // BATCH_SIZE, len(batch))
+                        batch_start // BATCH_SIZE + 1, (q_count + BATCH_SIZE - 1) // BATCH_SIZE, len(batch_questions))
 
             try:
                 batch_results = await asyncio.wait_for(
-                    grader.grade_batch(batch_images, subject=assignment.subject, personality_directive=personality_directive),
-                    timeout=240,  # 每批 4 分钟超时（LLM API 自身超时 120s，需留余量）
+                    grader.grade_batch(batch_images, subject=assignment_subject, personality_directive=personality_directive),
+                    # 每批预算需容纳一次完整调用 + 一次重试：
+                    # _grade_chunk 最坏情况 = 600s(首试) + 1s(退避) + 600s(重试) = 1201s，
+                    # 因此设为 1320s 留余量（与单题重分析的预算一致），
+                    # 避免复杂大题（如英语语法填空/完形填空）首试较慢时重试被外层取消。
+                    timeout=1320,
                 )
             except asyncio.TimeoutError:
                 logger.warning("Batch grading timed out for questions starting at idx %d", batch_start)
-                for question, _ in batch:
-                    question.status = QuestionStatus.FAILED
-                    question.analysis_detail = "评分超时，请重新分析该题"
-                await db.commit()
+                # 超时：用新 session 写失败状态
+                async with async_session_factory() as batch_db:
+                    for qid in batch_qids:
+                        q = await batch_db.get(Question, qid)
+                        if q is not None:
+                            q.status = QuestionStatus.FAILED
+                            q.analysis_detail = "评分超时，请重新分析该题"
+                            # 清空残留分数/知识点，避免逐题分与作业总分、错题数统计不一致
+                            q.score = None
+                            q.full_score = None
+                            q.knowledge_points = None
+                    await batch_db.commit()
                 batch_start += BATCH_SIZE
                 continue
             except Exception as e:
                 logger.error("Batch grading failed for questions starting at idx %d: %s", batch_start, e)
-                for question, _ in batch:
-                    question.status = QuestionStatus.FAILED
-                    question.analysis_detail = f"评分异常: {str(e)}"
-                await db.commit()
+                async with async_session_factory() as batch_db:
+                    for qid in batch_qids:
+                        q = await batch_db.get(Question, qid)
+                        if q is not None:
+                            q.status = QuestionStatus.FAILED
+                            q.analysis_detail = f"评分异常: {str(e)}"
+                            # 清空残留分数/知识点，避免逐题分与作业总分、错题数统计不一致
+                            q.score = None
+                            q.full_score = None
+                            q.knowledge_points = None
+                    await batch_db.commit()
                 batch_start += BATCH_SIZE
                 continue
 
+            # ── 取消检测（写库前，针对在飞批次）──
+            # grade_batch 的 LLM 调用可能耗时数分钟，用户可能在此期间已取消作业。
+            # 若只在每批 commit 后检测，本批已完成的结果会以 COMPLETED 落库，
+            # 覆盖取消语义，出现"作业已取消但部分题目显示分析完成"的矛盾状态。
+            # 检测到取消 → 放弃本批结果，本批与未处理题目统一标记"分析已终止"。
+            async with async_session_factory() as batch_db:
+                if await _is_analysis_cancelled(batch_db, assignment_id):
+                    logger.info("[analyze] Assignment %d 批次执行期间被用户终止，放弃本批结果", assignment_id)
+                    for qid in batch_qids:
+                        q = await batch_db.get(Question, qid)
+                        if q is not None:
+                            q.status = QuestionStatus.FAILED
+                            q.analysis_detail = "分析已终止"
+                    for remaining_qid, _ in question_ids_and_images[batch_start + BATCH_SIZE:]:
+                        q = await batch_db.get(Question, remaining_qid)
+                        if q is not None:
+                            q.status = QuestionStatus.FAILED
+                            q.analysis_detail = "分析已终止"
+                    await batch_db.commit()
+                    return
+
             # Apply results — 支持大题套小题（父题有 sub_questions 时创建子题记录）
-            for (question, _), grade_result in zip(batch, batch_results):
-                if grade_result.sub_questions and len(grade_result.sub_questions) > 0:
-                    # ── 大题套小题：父题为容器，子题存评分 ──
-                    sub_list = grade_result.sub_questions
+            # 使用新 session 写入评分结果
+            async with async_session_factory() as batch_db:
+                batch_questions = []
+                for qid in batch_qids:
+                    q = await batch_db.get(Question, qid)
+                    if q is not None:
+                        batch_questions.append(q)
 
-                    # 父题设为容器（不存评分数据）
-                    question.score = None
-                    question.full_score = None
-                    question.student_answer = None
-                    question.correct_answer = None
-                    question.question_type = _infer_parent_question_type(
-                        grade_result.question_type, sub_list
-                    )
-                    question.analysis_detail = f"本大题共 {len(sub_list)} 小题"
-                    question.confidence_score = grade_result.confidence
-                    question.status = QuestionStatus.COMPLETED
+                # 按索引对齐题目与评分结果，而非 zip：评分期间若某题被并发删除，
+                # batch_questions 会变短导致 zip 结果整体错位写入错误题目
+                for _idx, grade_result in enumerate(batch_results):
+                    if _idx >= len(batch_questions):
+                        # 防御：评分期间题目被删除，batch_questions 已变短，剩余结果丢弃
+                        logger.warning("[analyze] Batch result idx %d exceeds loaded questions (%d), skip",
+                                       _idx, len(batch_questions))
+                        break
+                    question = batch_questions[_idx]
+                    if grade_result.sub_questions and len(grade_result.sub_questions) > 0:
+                        # ── 大题套小题：父题为容器，子题存评分 ──
+                        sub_list = grade_result.sub_questions
 
-                    # 收集所有子题的知识点（父题知识点为子题知识点的并集）
-                    parent_kps: set[str] = set()
-
-                    for idx, sq in enumerate(sub_list):
-                        child = Question(
-                            assignment_id=question.assignment_id,
-                            question_number=question.question_number,
-                            parent_id=question.id,
-                            sub_question_index=idx,
-                            image_url=question.image_url,  # 共享父题的拼接图
-                            student_answer=sq.student_answer,
-                            correct_answer=sq.correct_answer,
-                            score=sq.score,
-                            full_score=sq.full_score,
-                            analysis_detail=sq.analysis_detail,
-                            question_type=sq.question_type or grade_result.question_type,
-                            common_mistakes=sq.common_mistakes,
-                            confidence_score=sq.confidence,
-                            status=QuestionStatus.COMPLETED if sq.confidence >= 0.3 else QuestionStatus.FAILED,
-                            page_index=question.page_index,
-                            bbox_x=question.bbox_x,
-                            bbox_y=question.bbox_y,
-                            bbox_w=question.bbox_w,
-                            bbox_h=question.bbox_h,
+                        # 父题设为容器（不存评分数据）
+                        question.score = None
+                        question.full_score = None
+                        question.student_answer = None
+                        question.correct_answer = None
+                        # 父题保留完整题干（含 (1)(2) 所有小问原文），
+                        # 前端大题卡片顶部据此展示，子题只展示各自小问文本
+                        question.question_text = grade_result.question_text
+                        question.question_type = _infer_parent_question_type(
+                            grade_result.question_type, sub_list
                         )
-                        db.add(child)
+                        question.analysis_detail = f"本大题共 {len(sub_list)} 小题"
+                        question.confidence_score = grade_result.confidence
+                        question.status = QuestionStatus.COMPLETED
 
-                        # 提取子题知识点
-                        child_kps = sq.knowledge_points or []
-                        if sq.analysis_detail:
-                            try:
-                                kps = await extractor.extract(sq.analysis_detail)
-                                child.knowledge_points = extractor.merge(child_kps, kps)
-                            except Exception:
+                        # 重建子题前再清一次该父题现存子题（当前读 DELETE）。
+                        # 开头 SPLITTING 阶段的清理与本批写回之间隔了整批 LLM 评分
+                        # （可达数分钟），若期间有并发任务（单题重分析）提交了新子题，
+                        # 快照读的清理可能漏删 → 与本批新建子题叠加。DELETE 为当前读，
+                        # 与本批创建同事务原子生效，保证重建后该父题子题唯一。
+                        await batch_db.execute(
+                            delete(Question).where(Question.parent_id == question.id)
+                        )
+
+                        # 收集所有子题的知识点（父题知识点为子题知识点的并集）
+                        parent_kps: set[str] = set()
+
+                        for idx, sq in enumerate(sub_list):
+                            child = Question(
+                                assignment_id=question.assignment_id,
+                                question_number=question.question_number,
+                                parent_id=question.id,
+                                sub_question_index=idx,
+                                image_url=question.image_url,  # 共享父题的拼接图
+                                question_text=sq.question_text,  # 识别出的题干文本（含 LaTeX 公式）
+                                student_answer=sq.student_answer,
+                                correct_answer=sq.correct_answer,
+                                score=sq.score,
+                                full_score=sq.full_score,
+                                analysis_detail=sq.analysis_detail or (
+                                    None if sq.confidence >= 0.3
+                                    else "AI 未返回有效评分结果，请重新分析该题"
+                                ),
+                                question_type=sq.question_type or grade_result.question_type,
+                                common_mistakes=sq.common_mistakes,
+                                confidence_score=sq.confidence,
+                                status=QuestionStatus.COMPLETED if sq.confidence >= 0.3 else QuestionStatus.FAILED,
+                                page_index=question.page_index,
+                                bbox_x=question.bbox_x,
+                                bbox_y=question.bbox_y,
+                                bbox_w=question.bbox_w,
+                                bbox_h=question.bbox_h,
+                            )
+                            batch_db.add(child)
+
+                            # 提取子题知识点
+                            child_kps = sq.knowledge_points or []
+                            if sq.analysis_detail:
+                                try:
+                                    kps = await extractor.extract(sq.analysis_detail)
+                                    child.knowledge_points = extractor.merge(child_kps, kps)
+                                except Exception:
+                                    child.knowledge_points = child_kps
+                            else:
                                 child.knowledge_points = child_kps
-                        else:
-                            child.knowledge_points = child_kps
 
-                        if sq.score is not None:
-                            total_score += sq.score
-                        for kp in (child.knowledge_points or []):
-                            name = kp if isinstance(kp, str) else kp.get("name", str(kp))
-                            all_knowledge_points.add(name)
-                            parent_kps.add(name)
+                            if sq.score is not None:
+                                total_score += sq.score
+                            # 收集子题知识点到父题并集。
+                            # 注意：add 必须在 for 循环体内（曾因缩进回归写在循环外，
+                            # 子题知识点为空时 name 未绑定 → UnboundLocalError 让整卷崩溃）
+                            for kp in (child.knowledge_points or []):
+                                name = kp if isinstance(kp, str) else kp.get("name", str(kp))
+                                all_knowledge_points.add(name)
+                                parent_kps.add(name)
 
-                    # 父题知识点 = 所有子题知识点的并集，再精简到约5个
-                    raw_kps = list(parent_kps) if parent_kps else (grade_result.knowledge_points or [])
-                    question.knowledge_points = await extractor.trim(
-                        raw_kps,
-                        context=question.analysis_detail,
-                        max_count=5,
-                    )
-
-                else:
-                    # ── 普通单题（保持原有逻辑）──
-                    question.student_answer = grade_result.student_answer
-                    question.correct_answer = grade_result.correct_answer
-                    question.score = grade_result.score
-                    question.full_score = grade_result.full_score
-                    question.analysis_detail = grade_result.analysis_detail
-                    question.question_type = grade_result.question_type
-                    question.common_mistakes = grade_result.common_mistakes
-                    question.confidence_score = grade_result.confidence
-                    question.status = QuestionStatus.COMPLETED if grade_result.confidence >= 0.3 else QuestionStatus.FAILED
-
-                    # 提取知识点，并精简到约5个
-                    if grade_result.analysis_detail:
-                        try:
-                            kps = await extractor.extract(grade_result.analysis_detail)
-                            merged = extractor.merge(grade_result.knowledge_points, kps)
-                            question.knowledge_points = await extractor.trim(
-                                merged,
-                                context=grade_result.analysis_detail,
-                                max_count=5,
-                            )
-                        except Exception:
-                            question.knowledge_points = await extractor.trim(
-                                grade_result.knowledge_points or [],
-                                context=grade_result.analysis_detail,
-                                max_count=5,
-                            )
-                    else:
+                        # 父题知识点 = 所有子题知识点的并集，再精简到约5个
+                        # 注意：必须缩进在大题分支内——parent_kps 仅在该分支赋值，
+                        # 写在分支外时普通单题会 UnboundLocalError（曾因缩进回归让整卷崩溃）
+                        raw_kps = list(parent_kps) if parent_kps else (grade_result.knowledge_points or [])
                         question.knowledge_points = await extractor.trim(
-                            grade_result.knowledge_points or [],
-                            context=None,
+                            raw_kps,
+                            context=question.analysis_detail,
                             max_count=5,
                         )
 
-                    if question.score is not None:
-                        total_score += question.score
-                    for kp in (question.knowledge_points or []):
-                        name = kp if isinstance(kp, str) else kp.get("name", str(kp))
-                        all_knowledge_points.add(name)
+                    else:
+                        # ── 普通单题（保持原有逻辑）──
+                        # 注意：此分支必须缩进在循环体内（配对上方 if grade_result.sub_questions），
+                        # 曾因缩进错位写成 for-else，导致每批只对最后一个元素写回一次，
+                        # 其余题目永远停在 PROCESSING
+                        question.question_text = grade_result.question_text  # 识别出的题干文本（含 LaTeX 公式）
+                        question.student_answer = grade_result.student_answer
+                        question.correct_answer = grade_result.correct_answer
+                        question.score = grade_result.score
+                        question.full_score = grade_result.full_score
+                        question.analysis_detail = grade_result.analysis_detail
+                        question.question_type = grade_result.question_type
+                        question.common_mistakes = grade_result.common_mistakes
+                        question.confidence_score = grade_result.confidence
+                        question.status = QuestionStatus.COMPLETED if grade_result.confidence >= 0.3 else QuestionStatus.FAILED
+                        # 评分失败且无评语（如 LLM 返回空壳结果）时写明原因，
+                        # 避免前端只显示一个无信息的失败/低置信度卡片
+                        if question.status == QuestionStatus.FAILED and not question.analysis_detail:
+                            question.analysis_detail = "AI 未返回有效评分结果，请重新分析该题"
 
-            # Commit batch
-            await db.commit()
+                        # 提取知识点，并精简到约5个
+                        if grade_result.analysis_detail:
+                            try:
+                                kps = await extractor.extract(grade_result.analysis_detail)
+                                merged = extractor.merge(grade_result.knowledge_points, kps)
+                                question.knowledge_points = await extractor.trim(
+                                    merged,
+                                    context=grade_result.analysis_detail,
+                                    max_count=5,
+                                )
+                            except Exception:
+                                question.knowledge_points = await extractor.trim(
+                                    grade_result.knowledge_points or [],
+                                    context=grade_result.analysis_detail,
+                                    max_count=5,
+                                )
+                        else:
+                            question.knowledge_points = await extractor.trim(
+                                grade_result.knowledge_points or [],
+                                context=None,
+                                max_count=5,
+                            )
+
+                        if question.score is not None:
+                            total_score += question.score
+                        for kp in (question.knowledge_points or []):
+                            name = kp if isinstance(kp, str) else kp.get("name", str(kp))
+                            all_knowledge_points.add(name)
+
+                # Commit batch（提交本批写回结果）
+                # 注意：必须在 async with 块内 commit——曾因缩进错位写在块外，
+                # session 已关闭时 commit 静默失效（不抛异常），评分结果全部丢失，
+                # 表现为题目卡 PROCESSING 而作业却显示 COMPLETED
+                await batch_db.commit()
+            last_score = batch_questions[-1].score if batch_questions and batch_questions[-1].score else 0
             logger.info("[analyze] Batch done (%d questions), last score=%.1f",
-                        len(batch), batch[-1][0].score or 0)
+                        len(batch_questions), last_score or 0)
             batch_start += BATCH_SIZE
 
         # ── 完成 ──
-        assignment = await db.get(Assignment, assignment_id)
-        assignment.status = AssignmentStatus.COMPLETED
-        assignment.total_score = total_score
+        # 先提交 COMPLETED 状态与总分，再生成 AI 评语。
+        # 评语生成是一次耗时较长的 LLM 调用，若在此期间进程重启/崩溃，
+        # 状态已落库为 completed，不会永远卡在"正在分析"。
+        # 使用独立 session 进行完成阶段操作
+        async with async_session_factory() as db:
+            assignment = await db.get(Assignment, assignment_id)
+            if assignment is None:
+                return
+            # 取消检测：用户已终止（状态 FAILED）时不覆盖取消结果
+            if await _is_analysis_cancelled(db, assignment_id):
+                logger.info("[analyze] Assignment %d 已被用户终止，跳过完成态提交", assignment_id)
+                return
+            assignment.status = AssignmentStatus.COMPLETED
+            assignment.total_score = total_score
+            await db.commit()
 
-        # 获取叶子题目（子题 + 无子题的独立题）用于生成总结
-        leaf_records = []
-        all_qs_result = await db.execute(
-            select(Question)
-            .where(Question.assignment_id == assignment_id)
-            .order_by(Question.question_number, Question.sub_question_index)
-        )
-        all_qs = all_qs_result.scalars().all()
-        # 收集有子题的父题ID
-        parent_ids = {q.parent_id for q in all_qs if q.parent_id is not None}
-        for q in all_qs:
-            # 跳过父题容器（有子题且自身是父题）
-            if q.id in parent_ids:
-                continue
-            leaf_records.append((q, None))
-
-        # Generate AI summary via LLM for a teacher-like overall analysis
-        error_count = sum(1 for q, _ in leaf_records
-                         if q.score is not None and q.full_score is not None and q.score < q.full_score)
-        try:
-            ai_summary = await _generate_assignment_summary(
-                question_records=leaf_records,
-                total_score=total_score,
-                q_count=len(leaf_records),
-                error_count=error_count,
+            # 获取叶子题目（子题 + 无子题的独立题）用于生成总结
+            leaf_records = []
+            all_qs_result = await db.execute(
+                select(Question)
+                .where(Question.assignment_id == assignment_id)
+                .order_by(Question.question_number, Question.sub_question_index)
             )
-            assignment.ai_summary = ai_summary
-        except Exception as e:
-            logger.warning("Failed to generate LLM summary, using fallback: %s", e)
-            kp_list = ", ".join(all_knowledge_points) if all_knowledge_points else "暂无"
-            assignment.ai_summary = (
-                f"本作业共 {q_count} 题，总分 {total_score} 分。"
-                f"错题 {error_count} 题。"
-                f"涉及知识点：{kp_list}。"
-            )
+            all_qs = all_qs_result.scalars().all()
+            # 收集有子题的父题ID
+            parent_ids = {q.parent_id for q in all_qs if q.parent_id is not None}
+            for q in all_qs:
+                # 跳过父题容器（有子题且自身是父题）
+                if q.id in parent_ids:
+                    continue
+                leaf_records.append((q, None))
 
-        await db.commit()
+            # Generate AI summary via LLM for a teacher-like overall analysis
+            error_count = sum(1 for q, _ in leaf_records
+                             if q.score is not None and q.full_score is not None and q.score < q.full_score)
+            try:
+                ai_summary = await _generate_assignment_summary(
+                    question_records=leaf_records,
+                    total_score=total_score,
+                    q_count=len(leaf_records),
+                    error_count=error_count,
+                    personality_directive=personality_directive,
+                )
+                assignment.ai_summary = ai_summary
+            except Exception as e:
+                logger.warning("Failed to generate LLM summary, using fallback: %s", e)
+                kp_list = ", ".join(all_knowledge_points) if all_knowledge_points else "暂无"
+                assignment.ai_summary = (
+                    f"本作业共 {q_count} 题，总分 {total_score} 分。"
+                    f"错题 {error_count} 题。"
+                    f"涉及知识点：{kp_list}。"
+                )
 
-        # Trigger vectorization (skip in dev mode if no Celery/Redis)
-        try:
-            from app.tasks.vector_tasks import vectorize_assignment
-            if vectorize_assignment is not None:
-                vectorize_assignment.delay(assignment_id)
-            else:
-                logger.info("[dev] Skipping vectorization (Celery not available)")
-        except Exception:
-            logger.info("[dev] Skipping vectorization (Celery/Qdrant not available)")
+            await db.commit()
 
-        logger.info("[analyze] Stage: COMPLETED (assignment %d)", assignment_id)
+            logger.info("[analyze] Stage: COMPLETED (assignment %d)", assignment_id)
 
 
 async def recalc_assignment_total(assignment_id: int, db=None, *, user_id: int | None = None) -> None:
@@ -598,6 +981,82 @@ async def recalc_assignment_total(assignment_id: int, db=None, *, user_id: int |
             await _do(session)
 
 
+async def refresh_assignment_summary(assignment_id: int, db=None) -> None:
+    """
+    基于最新题目数据重新生成作业的 AI 整体评语（助教有话说）。
+
+    重分析/重新汇总后总分会变化，必须同步刷新评语，
+    否则评语中提到的分数会与页面显示的总分不一致。
+    LLM 调用失败时回退为基础统计评语，保证分数信息始终与最新数据一致。
+    """
+    from sqlalchemy import select
+    from app.db.session import async_session_factory
+    from app.models.assignment import Assignment
+    from app.models.question import Question
+    from app.services.personality_service import load_grading_directive
+
+    async def _do(session):
+        assignment = await session.get(Assignment, assignment_id)
+        if not assignment:
+            return
+
+        q_result = await session.execute(
+            select(Question)
+            .where(Question.assignment_id == assignment_id)
+            .order_by(Question.question_number, Question.sub_question_index)
+        )
+        all_qs = q_result.scalars().all()
+        parent_ids = {q.parent_id for q in all_qs if q.parent_id is not None}
+        leaf_records = [(q, None) for q in all_qs if q.id not in parent_ids]
+
+        error_count = sum(
+            1 for q, _ in leaf_records
+            if q.score is not None and q.full_score is not None and q.score < q.full_score
+        )
+
+        try:
+            personality_directive = await load_grading_directive(session, assignment.creator_id)
+        except Exception:
+            personality_directive = None
+
+        try:
+            ai_summary = await _generate_assignment_summary(
+                question_records=leaf_records,
+                # 总分未落库（如重分析中途失败）时为 None，评语生成端会条件化处理
+                total_score=assignment.total_score,
+                q_count=len(leaf_records),
+                error_count=error_count,
+                personality_directive=personality_directive,
+            )
+            assignment.ai_summary = ai_summary
+        except Exception as e:
+            logger.warning("[refresh_summary] LLM评语生成失败，使用基础评语: %s", e)
+            kp_set: set[str] = set()
+            for q, _ in leaf_records:
+                for kp in (q.knowledge_points or []):
+                    kp_set.add(kp if isinstance(kp, str) else kp.get("name", str(kp)))
+            kp_list = ", ".join(kp_set) if kp_set else "暂无"
+            # 总分未统计（None）时如实说明，不显示误导性的 0 分
+            score_text = (
+                f"{assignment.total_score} 分" if assignment.total_score is not None
+                else "尚未统计（部分题目未完成评分）"
+            )
+            assignment.ai_summary = (
+                f"本作业共 {len(leaf_records)} 题，得分 {score_text}。"
+                f"错题 {error_count} 题。"
+                f"涉及知识点：{kp_list}。"
+            )
+
+        await session.commit()
+        logger.info("[refresh_summary] Assignment %d ai_summary refreshed", assignment_id)
+
+    if db is not None:
+        await _do(db)
+    else:
+        async with async_session_factory() as session:
+            await _do(session)
+
+
 async def _mark_failed(assignment_id: int, error_msg: str):
     """标记作业分析失败"""
     from sqlalchemy import select
@@ -610,11 +1069,24 @@ async def _mark_failed(assignment_id: int, error_msg: str):
         if assignment:
             assignment.status = AssignmentStatus.FAILED
             assignment.ai_summary = f"Analysis failed: {error_msg}"
+            # 清理遭遗弃的"正在分析"题目，避免前端永远显示转圈
+            from app.models.question import Question
+            q_result = await db.execute(
+                select(Question).where(
+                    Question.assignment_id == assignment_id,
+                    Question.status == QuestionStatus.PROCESSING,
+                )
+            )
+            for q in q_result.scalars().all():
+                q.status = QuestionStatus.FAILED
+                q.analysis_detail = "分析中断，请重新分析该题"
             await db.commit()
 
 
 if celery_app is not None:
-    @celery_app.task(bind=True, name="reanalyze_question", max_retries=2, default_retry_delay=30)
+    # 单题重分析最坏情况 = 1320s(评分+重试) + 评语刷新(10-30s)，同样需覆盖全局默认限制
+    @celery_app.task(bind=True, name="reanalyze_question", max_retries=2, default_retry_delay=30,
+                     soft_time_limit=1500, time_limit=1800)
     def reanalyze_question(self, question_id: int, remark: str | None = None):
         """
         单题重分析任务。
@@ -639,7 +1111,21 @@ async def _do_reanalyze(question_id: int, remark: str | None = None):
     from app.models.question import Question
     from app.services.file_upload import StorageService
 
+    # ── 作业级运行标记登记（A3-5）──
+    # 单题重分析期间把所属作业登记进运行标记，表示"该作业有任务在跑"：
+    # 详情页/启动扫描的自愈逻辑据此跳过，不会把在飞的重分析误判为僵尸状态收敛。
+    # 服务重启后内存注册表清空（任务已丢失），同一自愈逻辑就会正确清理
+    # 卡在 PROCESSING/PENDING 的题目。finally 保证异常路径也注销。
+    assignment_id: int | None = None
     try:
+        async with async_session_factory() as db:
+            result = await db.execute(select(Question).where(Question.id == question_id))
+            question = result.scalar_one_or_none()
+            if question:
+                assignment_id = question.assignment_id
+        if assignment_id:
+            _set_analysis_running(assignment_id, True)
+
         await _do_reanalyze_inner(question_id, remark)
     except Exception as e:
         logger.error("[reanalyze_question] Fatal error for question %d: %s", question_id, e, exc_info=True)
@@ -655,26 +1141,52 @@ async def _do_reanalyze(question_id: int, remark: str | None = None):
                     await db.commit()
         except Exception as mark_err:
             logger.error("[reanalyze_question] Failed to mark question %d as FAILED: %s", question_id, mark_err)
+    finally:
+        if assignment_id:
+            _set_analysis_running(assignment_id, False)
 
 
 async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
     """单题重分析实现"""
-    from sqlalchemy import select
+    from sqlalchemy import select, update, delete
     from app.db.session import async_session_factory
     from app.models.question import Question
     from app.models.assignment import Assignment
     from app.services.file_upload import StorageService
 
     async with async_session_factory() as db:
+        # ── 并发守卫（第二道）：原子抢锁 ──
+        # 路由层只挡"已可见"的 PROCESSING；两个请求同时通过路由检查时，
+        # 只有第一个任务能在此把状态从非 PROCESSING 原子改为 PROCESSING，
+        # 第二个任务的 UPDATE 会因行锁等待第一个事务提交后命中
+        # `status != PROCESSING` 条件失败（rowcount=0）→ 直接退出。
+        # 防止重分析任务并发执行导致大题 BFS 删除/重建子题交错 → 重复子题。
+        locked = await db.execute(
+            update(Question)
+            .where(
+                Question.id == question_id,
+                Question.status != QuestionStatus.PROCESSING,
+            )
+            .values(status=QuestionStatus.PROCESSING)
+        )
+        if locked.rowcount == 0:
+            logger.info("[reanalyze_question] 题目 %d 已有在飞分析任务，跳过重复重分析", question_id)
+            return
+
         result = await db.execute(select(Question).where(Question.id == question_id))
         question = result.scalar_one_or_none()
         if not question:
+            # 抢锁成功但题被删除（极端竞态）→ 回滚锁状态后报错
+            await db.rollback()
             raise ValueError(f"题目 {question_id} 不存在")
 
         # 获取作业的学科信息
         assign_result = await db.execute(select(Assignment).where(Assignment.id == question.assignment_id))
         assignment = assign_result.scalar_one_or_none()
         subject = assignment.subject if assignment else None
+        # 记录重分析前的作业总分（E1：结束时据此判断是否真正需要刷新整卷评语，
+        # 分数无变化时跳过 refresh_assignment_summary，省掉整表重读 + LLM 重生成）
+        old_total_score = assignment.total_score if assignment else None
 
         # 加载作业创建者的助教个性化配置，重分析时同样生效
         from app.services.personality_service import load_grading_directive
@@ -682,11 +1194,12 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
             await load_grading_directive(db, assignment.creator_id) if assignment else None
         )
 
-        # 如果是父题，递归删除所有子题（包括孙子题等多级嵌套）
+        # 如果是父题，先【收集】所有后代ID（BFS遍历），但不在评分前删除——
+        # 若评分超时/异常/失败就物理删除子题，用户旧的大题子题数据（含人工核对
+        # 过的答案）会直接蒸发。改为：评分成功后在同一事务里删除旧子题并重建。
+        descendant_ids_to_delete: list[int] = []
         if question.parent_id is None:
-            # 收集所有后代ID（BFS遍历）
             to_delete_ids = [question_id]
-            all_descendants = []
             while to_delete_ids:
                 parent_ids_batch = to_delete_ids
                 to_delete_ids = []
@@ -695,40 +1208,47 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
                 )
                 children = children_result.scalars().all()
                 for child in children:
-                    all_descendants.append(child)
+                    descendant_ids_to_delete.append(child.id)
                     to_delete_ids.append(child.id)
-            # 从叶子节点向上删除
-            for desc in reversed(all_descendants):
-                await db.delete(desc)
-            if all_descendants:
-                logger.info("[reanalyze_question] Deleted %d descendants of question %d", len(all_descendants), question_id)
-                await db.flush()
 
-        question.status = QuestionStatus.PENDING
-        await db.commit()  # 立即提交，确保异常时外部 handler 能检测到 PENDING 状态
+        question.status = QuestionStatus.PROCESSING  # 重分析进行中，前端显示"正在分析"
+        await db.commit()  # 立即提交，确保异常时外部 handler 能检测到非终态并标记 FAILED
 
-        # Get image bytes from storage（如有答案图片则拼接后再发给AI）
+        # Get image bytes from storage（如有答案图片/识别区图则拼接后再发给AI）
         storage = StorageService()
         image_bytes = await storage.get_file_bytes(question.image_url)
         if image_bytes is None:
             raise ValueError(f"无法下载题目图片: {question.image_url}")
 
-        # 如果有答案图片，下载并拼接
+        # 下载客观题识别区切图（如有），重分析时同样作为 [Answer Sheet] 拼入
+        sheet_bytes: bytes | None = None
+        if assignment and assignment.answer_sheet_image_url:
+            try:
+                sheet_bytes = await storage.get_file_bytes(assignment.answer_sheet_image_url)
+                if not sheet_bytes:
+                    logger.warning("[reanalyze] 作业 %d 识别区切图下载失败，回退无识别区模式", assignment.id)
+            except Exception as sheet_err:
+                logger.error("[reanalyze] 识别区切图加载异常: %s", sheet_err)
+                sheet_bytes = None
+
+        # 如果有答案图片，下载后与识别区图一起拼接
+        a_bytes = None
         if question.answer_image_url:
             try:
                 a_bytes = await storage.get_file_bytes(question.answer_image_url)
-                if a_bytes:
-                    image_bytes = _stitch_question_answer(image_bytes, a_bytes)
-                    logger.info("[reanalyze] 题目 #%d 已拼接答案图片", question.question_number)
-                else:
+                if not a_bytes:
                     logger.warning("[reanalyze] 题目 #%d 答案图片下载失败", question.question_number)
-                    image_bytes = _compress_for_api(image_bytes)
-            except Exception as stitch_err:
-                logger.error("[reanalyze] 题目 #%d 答案拼接异常: %s，回退到仅使用题目图片",
-                             question.question_number, stitch_err)
-                image_bytes = _compress_for_api(image_bytes)
-        else:
-            # 无答案图片，直接压缩题目图片
+            except Exception as dl_err:
+                logger.error("[reanalyze] 题目 #%d 答案图片下载异常: %s", question.question_number, dl_err)
+                a_bytes = None
+        try:
+            image_bytes = _stitch_question_answer(image_bytes, a_bytes, sheet_bytes)
+            if a_bytes or sheet_bytes:
+                logger.info("[reanalyze] 题目 #%d 已拼接附加图（答案图=%s, 识别区=%s）",
+                            question.question_number, bool(a_bytes), bool(sheet_bytes))
+        except Exception as stitch_err:
+            logger.error("[reanalyze] 题目 #%d 拼接异常: %s，回退到仅使用题目图片",
+                         question.question_number, stitch_err)
             image_bytes = _compress_for_api(image_bytes)
 
         # Re-grade with remark (with timeout protection)
@@ -739,13 +1259,14 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
             results = await asyncio.wait_for(
                 grader.grade_batch([image_bytes], remark=remark, subject=subject, personality_directive=personality_directive),
                 # 单题重分析预算需容纳一次完整调用 + 一次重试：
-                # _grade_chunk 最坏情况 = 180s(首试) + 1s(退避) + 180s(重试) = 361s，
-                # 因此设为 6 分钟，避免复杂大题（如文言文/现代文阅读）在重试尚未完成时被外层取消。
-                timeout=360,
+                # _grade_chunk 最坏情况 = 600s(首试) + 1s(退避) + 600s(重试) = 1201s，
+                # 因此设为 1320s 留余量（旧值 390s 对英语大题实测不足，纯评分可达 644s），
+                # 避免复杂大题（如语法填空/完形填空/文言文阅读）在重试尚未完成时被外层取消。
+                timeout=1320,
             )
         except asyncio.TimeoutError:
             question.status = QuestionStatus.FAILED
-            question.analysis_detail = "重分析超时（6分钟），请重试"
+            question.analysis_detail = "重分析超时（22分钟），请重试"
             await db.commit()
             await recalc_assignment_total(question.assignment_id, db)
             logger.warning("[reanalyze_question] Timed out for question %d", question_id)
@@ -773,6 +1294,22 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
             question.manual_review_note = remark
 
         # ── 教师备注强制覆盖：解析备注中的明确纠正，覆盖AI识别结果 ──
+        # ── 检测 AI 评分是否返回了有效结果（必须在备注覆盖之前判断）──
+        # 当 _grade_chunk 的 API 调用全部重试失败时，会返回 _empty_grade_result()
+        # （confidence=0.0 且所有字段为 None）；模型输出被截断抢救出的对象也可能
+        # 缺失核心字段。此时不能当作正常结果写入数据库——否则空字段会把旧的
+        # analysis_detail / knowledge_points / common_mistakes 全部清空。
+        # 判断依据是原始 gr 是否含任何核心内容，不能依赖 confidence：
+        # apply_remark_overrides 会把 confidence 提升到 1.0 并填上教师给的答案，
+        # 若用覆盖后的值判断，空壳会被误判为"评分成功"，导致上述清空问题。
+        grading_failed = not (
+            gr.analysis_detail
+            or gr.student_answer
+            or gr.correct_answer
+            or gr.score is not None
+            or (gr.sub_questions and len(gr.sub_questions) > 0)
+        )
+
         # 注意：即使 AI 评分返回空壳结果（API 全部重试失败），备注覆盖仍然生效，
         # 因为教师已经人工确认过，备注中的内容就是权威依据。
         from app.services.remark_parser import parse_remark_overrides, apply_remark_overrides
@@ -784,34 +1321,29 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
                 for sq in gr.sub_questions:
                     apply_remark_overrides(sq, remark_overrides)
 
-        # ── 检测 AI 评分是否返回了有效结果 ──
-        # 当 _grade_chunk 的 API 调用全部重试失败时，会返回 _empty_grade_result()
-        # （confidence=0.0 且所有字段为 None），此时不能当作正常结果写入数据库。
-        grading_failed = (
-            gr.confidence is not None and gr.confidence <= 0.01
-            and gr.analysis_detail is None
-            and gr.student_answer is None
-            and not gr.sub_questions
-        )
-
         # ── 评分失败时的兜底策略 ──
         if grading_failed:
             if remark_overrides:
-                # 有教师备注覆盖：用覆盖值填充，标记为已完成
+                # 有教师备注覆盖：只写备注明确提供的字段，其余保留旧值，
+                # 避免空壳结果的 None 把已有的 analysis_detail / knowledge_points /
+                # common_mistakes / question_text 等旧数据清空（曾因先覆盖后判断
+                # 导致只有"学生答案"写入、其他字段全部丢失）。
                 logger.info(
                     "[reanalyze_question] AI 评分返回空结果，但备注覆盖提供 %d 个字段，"
                     "以备注为准完成 question %d",
                     len(remark_overrides), question_id,
                 )
-                # 用备注覆盖后的 gr 值写入（apply_remark_overrides 已设置 confidence=1.0）
-                question.student_answer = gr.student_answer
-                question.correct_answer = gr.correct_answer
-                question.score = gr.score
-                question.full_score = gr.full_score
-                question.analysis_detail = gr.analysis_detail or f"（人工备注修正：{remark}）"
-                question.question_type = gr.question_type
-                question.confidence_score = gr.confidence
-                question.common_mistakes = gr.common_mistakes
+                if "student_answer" in remark_overrides:
+                    question.student_answer = remark_overrides["student_answer"]
+                if "correct_answer" in remark_overrides:
+                    question.correct_answer = remark_overrides["correct_answer"]
+                if "score" in remark_overrides:
+                    question.score = remark_overrides["score"]
+                if "full_score" in remark_overrides:
+                    question.full_score = remark_overrides["full_score"]
+                if not question.analysis_detail:
+                    question.analysis_detail = f"（人工备注修正：{remark}）"
+                question.confidence_score = 1.0
                 question.status = QuestionStatus.COMPLETED
             else:
                 # 无有效备注覆盖：标记失败，保留旧数据不被空结果覆盖
@@ -833,12 +1365,33 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
         from app.services.knowledge_extractor import KnowledgeExtractor
         extractor = KnowledgeExtractor()
 
+        # ── 评分成功：先删除旧子题，再按新结果重建 ──
+        # 删除放在这里（而非评分前）：上面的超时/异常/空结果路径都已提前 return，
+        # 能走到这里说明评分成功，删除旧子题才不会造成"失败即丢数据"。
+        # 必须用 DELETE 语句（InnoDB 当前读）而非 select + db.delete（快照读）：
+        # BFS 收集用的是本事务早期建立的 REPEATABLE READ 快照，评分（LLM 调用
+        # 可达数分钟）期间若有并发任务提交了新子题，快照读"看不到"它们 →
+        # 旧子题删不掉 → 新子题叠加 → 子题重复、分值翻倍（曾出现：重分析后
+        # 4 小题变 8 小题）。DELETE 总是删除最新已提交版本的行，无论快照多旧
+        # 都会清空该父题下的所有现存子题，重建后数据一致。
+        if question.parent_id is None:
+            await db.execute(
+                delete(Question).where(Question.parent_id == question_id)
+            )
+        if descendant_ids_to_delete:
+            logger.info(
+                "[reanalyze_question] 评分成功，删除旧子题 %d 条后重建 question %d",
+                len(descendant_ids_to_delete), question_id,
+            )
+
         if gr.sub_questions and len(gr.sub_questions) > 0:
             # ── 大题套小题重分析：父题为容器，重建子题 ──
             question.score = None
             question.full_score = None
             question.student_answer = None
             question.correct_answer = None
+            # 父题保留完整题干（含 (1)(2) 所有小问原文），子题只展示各自小问文本
+            question.question_text = gr.question_text
             question.question_type = _infer_parent_question_type(
                 gr.question_type, gr.sub_questions
             )
@@ -857,6 +1410,7 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
                     parent_id=question.id,
                     sub_question_index=idx,
                     image_url=question.image_url,
+                    question_text=sq.question_text,  # 识别出的题干文本（含 LaTeX 公式）
                     student_answer=sq.student_answer,
                     correct_answer=sq.correct_answer,
                     score=sq.score,
@@ -897,6 +1451,7 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
             )
         else:
             # ── 普通单题重分析 ──
+            question.question_text = gr.question_text  # 识别出的题干文本（含 LaTeX 公式）
             question.student_answer = gr.student_answer
             question.correct_answer = gr.correct_answer
             question.score = gr.score
@@ -934,11 +1489,36 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
         # 同步更新作业总分
         await recalc_assignment_total(question.assignment_id, db)
 
+        # 总分真正变化时才刷新整卷评语（E1）：
+        # refresh_assignment_summary 会整表重读全部题目并让 LLM 重新生成评语
+        # （约 10-30s + 整卷 token），若本题重分析前后分数无变化
+        # （例如只调整了备注/知识点），跳过以避免无谓的 LLM 开销。
+        # 旧总分缺失（作业尚未完成过汇总）属于异常场景，保守刷新。
+        refreshed_assignment = await db.get(Assignment, question.assignment_id)
+        total_changed = (
+            old_total_score is None
+            or refreshed_assignment is None
+            or abs((refreshed_assignment.total_score or 0.0) - old_total_score) > 1e-6
+        )
+        if total_changed:
+            try:
+                # 总分已变化，同步刷新整体评语，避免"助教有话说"中提到的分数与最新总分不一致
+                await refresh_assignment_summary(question.assignment_id, db)
+            except Exception as summary_err:
+                logger.warning(
+                    "[reanalyze_question] 评语刷新失败（不影响重分析结果）: %s", summary_err
+                )
+        else:
+            logger.info(
+                "[reanalyze_question] question %d 总分无变化，跳过整卷评语刷新", question_id
+            )
+
         logger.info("[reanalyze_question] Completed for question %d", question_id)
 
 
 if celery_app is not None:
-    @celery_app.task(bind=True, name="generate_similar_questions")
+    @celery_app.task(bind=True, name="generate_similar_questions",
+                     soft_time_limit=900, time_limit=1200)
     def generate_similar_questions(self, question_id: int):
         """同类题生成任务"""
         logger.info("[generate_similar] Starting for question %d", question_id)
@@ -1008,6 +1588,7 @@ async def _do_generate_similar(question_id: int) -> dict:
                     "knowledge_point": sq.knowledge_point,
                     "difficulty": sq.difficulty,
                     "question_type": sq.question_type,
+                    "image_svg": sq.image_svg,
                 }
                 for i, sq in enumerate(similar)
             ]
@@ -1034,9 +1615,10 @@ async def _do_generate_similar(question_id: int) -> dict:
 
 async def _generate_assignment_summary(
     question_records: list,
-    total_score: float,
+    total_score: float | None,
     q_count: int,
     error_count: int,
+    personality_directive: str | None = None,
 ) -> str:
     """使用 LLM 生成教师式的整体作业分析评语"""
     from app.models.question import Question
@@ -1064,9 +1646,30 @@ async def _generate_assignment_summary(
 
     questions_text = "\n".join(question_summaries)
 
+    # 卷面总分（各叶子题满分之和），与学生实际得分区分开，避免 LLM 混淆或自行累加
+    total_full_score = sum(
+        float(q.full_score) for q, _ in question_records if q.full_score is not None
+    )
+
+    # 学生实际得分可能为 None（部分题目未完成评分，总分尚未落库）。
+    # 此时不能用 0 代替——"得分 0 分"会误导 LLM 生成负面评语，
+    # 条件化输出让 LLM 聚焦在已评题目上。
+    if total_score is None:
+        score_summary = "学生实际得分尚未统计（部分题目未完成评分）"
+        score_rule = (
+            f"7. 如需提及得分，只能说\"部分题目尚未评分、总分待统计\"，"
+            f"严禁虚构或估算学生得分；卷面满分{total_full_score}分仅作参考"
+        )
+    else:
+        score_summary = f"学生实际得分{total_score}分"
+        score_rule = (
+            f"7. 如需提及分数，必须使用上面给出的学生实际得分{total_score}分"
+            f"（满分{total_full_score}分），严禁自行累加各题分数或估算分数"
+        )
+
     prompt = f"""你是一位经验丰富的教师，请根据以下学生作业的各题详情，写一份整体分析评语（200-400字）。
 
-作业概况：共{q_count}题，总分{total_score}分，错题{error_count}题。
+作业概况：共{q_count}题，卷面总分{total_full_score}分，{score_summary}，错题{error_count}题。
 
 各题情况：
 {questions_text}
@@ -1077,7 +1680,12 @@ async def _generate_assignment_summary(
 3. 【存在不足】指出学生薄弱的知识点或常犯的错误类型（具体说明问题所在）
 4. 【改进建议】给出2-3条具体、可操作的改进建议，帮助学生在下次作业中提高
 5. 语气要鼓励性、建设性，像老师在和学生谈心，不要冷冰冰地罗列数据
-6. 不要使用 Markdown 格式，用纯文本段落表达"""
+6. 不要使用 Markdown 格式，用纯文本段落表达
+{score_rule}"""
+
+    # 注入助教个性化设定（性格类型/说话风格/评分严格度），让评语语气贴合用户配置
+    if personality_directive:
+        prompt += f"\n\n{personality_directive}"
 
     client = AsyncOpenAI(
         api_key=settings.LLM_API_KEY,

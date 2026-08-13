@@ -31,6 +31,9 @@ export interface CompositionResult {
   strict_level: number;
   essay_type?: string | null;
   pdf_url?: string | null;
+  /** 批改状态：pending(已提交) / correcting(批改中) / completed(完成) / failed(失败) */
+  status?: string;
+  error_message?: string | null;
   create_time?: string | null;
 }
 
@@ -45,6 +48,9 @@ export interface CompositionListItem {
   grade?: string | null;
   essay_type?: string | null;
   pdf_url?: string | null;
+  /** 批改状态：pending(已提交) / correcting(批改中) / completed(完成) / failed(失败) */
+  status?: string;
+  error_message?: string | null;
   create_time?: string | null;
 }
 
@@ -92,7 +98,8 @@ export const compositionService = {
       formData.append("essay_type", params.essay_type);
     }
     const { data } = await api.post(`${BASE}/correct`, formData, {
-      timeout: 300000,  // 5 分钟，多文件合并 + 批改时间较长
+      // 批改已异步化：接口只做"存文件+建记录"并立即返回，无需长超时
+      timeout: 120000,
       onUploadProgress: (e) => {
         if (e.total && onProgress) {
           onProgress(Math.round((e.loaded * 100) / e.total));
@@ -134,10 +141,10 @@ export const compositionService = {
     return data;
   },
 
-  /** 重新批改已存在的作文记录 */
+  /** 重新批改已存在的作文记录（异步：立即返回，批改在后台执行） */
   async reCorrect(id: number): Promise<CompositionResult> {
     const { data } = await api.post(`${BASE}/${id}/re-correct`, null, {
-      timeout: 300000,
+      timeout: 120000,
     });
     return data;
   },

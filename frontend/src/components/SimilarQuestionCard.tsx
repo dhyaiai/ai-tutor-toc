@@ -6,6 +6,8 @@ import {
 import { ReloadOutlined, UploadOutlined, CheckOutlined } from "@ant-design/icons";
 import type { SimilarQuestionItem } from "../services/questionService";
 import { aiQuestionService } from "../services/aiQuestionService";
+import MathText from "./MathText";
+import QuestionSvgImage from "./QuestionSvgImage";
 
 interface Props {
   index: number;
@@ -55,7 +57,11 @@ export default function SimilarQuestionCard({
   const handleRetry = async () => {
     setRetrying(true);
     try {
-      onReplace(index);
+      // 必须 await：onReplace 内部先创建换题任务再轮询结果（卡片会先变成加载态）。
+      // 原实现未 await，loading 瞬间被 finally 关闭，用户感觉"点了没反应"。
+      await onReplace(index);
+    } catch {
+      // onReplace 内部已提示错误，这里只需结束 loading 状态
     } finally {
       setRetrying(false);
     }
@@ -82,6 +88,7 @@ export default function SimilarQuestionCard({
         knowledge_point: question.knowledge_point,
         difficulty: question.difficulty,
         options: question.options || [],
+        image_svg: question.image_svg,
         selected_options: isChoice ? selectedOptions : undefined,
         answer_text: !isChoice ? textAnswer : undefined,
         answer_image: imageFile || undefined,
@@ -155,11 +162,13 @@ export default function SimilarQuestionCard({
         </div>
       ) : (
         <>
-          <Typography.Paragraph
-            style={{ marginBottom: 12, fontSize: 13, whiteSpace: "pre-wrap" }}
-          >
-            {question.question_text}
-          </Typography.Paragraph>
+          <MathText
+            content={question.question_text}
+            style={{ display: "block", marginBottom: 12, fontSize: 13 }}
+          />
+
+          {/* AI 生成的题目配图（SVG） */}
+          {question.image_svg && <QuestionSvgImage svg={question.image_svg} />}
 
           {/* 单选题/多选题选项 */}
           {isChoice && options.length > 0 && (
@@ -178,7 +187,8 @@ export default function SimilarQuestionCard({
               <Space direction="vertical" size={4}>
                 {options.map((opt) => (
                   <Checkbox key={opt.label} value={opt.label}>
-                    <Typography.Text strong>{opt.label}.</Typography.Text> {opt.text}
+                    <Typography.Text strong>{opt.label}.</Typography.Text>{" "}
+                    <MathText content={opt.text} />
                   </Checkbox>
                 ))}
               </Space>
@@ -192,7 +202,8 @@ export default function SimilarQuestionCard({
               <Space direction="vertical" size={4}>
                 {options.map((opt) => (
                   <Radio key={opt.label} value={opt.label}>
-                    <Typography.Text strong>{opt.label}.</Typography.Text> {opt.text}
+                    <Typography.Text strong>{opt.label}.</Typography.Text>{" "}
+                    <MathText content={opt.text} />
                   </Radio>
                 ))}
               </Space>
@@ -287,7 +298,7 @@ export default function SimilarQuestionCard({
           {showAnswer && question.answer && (
             <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #d9d9d9" }}>
               <Typography.Text strong style={{ fontSize: 13 }}>正确答案：</Typography.Text>
-              <Typography.Text style={{ fontSize: 13 }}>{question.answer}</Typography.Text>
+              <MathText content={question.answer} style={{ fontSize: 13 }} />
             </div>
           )}
 
@@ -295,9 +306,10 @@ export default function SimilarQuestionCard({
           {showAnswer && question.analysis && (
             <div style={{ marginTop: 8, paddingTop: 8, borderTop: "1px dashed #d9d9d9" }}>
               <Typography.Text strong style={{ fontSize: 13, color: "#722ed1" }}>解析：</Typography.Text>
-              <Typography.Paragraph style={{ fontSize: 13, marginBottom: 0, marginTop: 4, whiteSpace: "pre-wrap" }}>
-                {question.analysis}
-              </Typography.Paragraph>
+              <MathText
+                content={question.analysis}
+                style={{ display: "block", fontSize: 13, marginTop: 4 }}
+              />
             </div>
           )}
         </div>
