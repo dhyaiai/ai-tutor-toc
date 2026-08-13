@@ -15,6 +15,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.text_clean import sanitize_llm_controls
+
 logger = logging.getLogger(__name__)
 
 
@@ -78,9 +80,13 @@ async def request_llm_json(
                 data, _ = decoder.raw_decode(content, start_idx)
                 if not isinstance(data, dict):
                     raise json.JSONDecodeError("expected object", content, start_idx)
+                # 清洗模型误转义的控制字符（\b → 退格符 → 还原为 LaTeX 反斜杠）
+                data = sanitize_llm_controls(data)
                 return LLMJsonResult(data=data, raw_text=content, error="")
             else:
                 data = json.loads(content)
+                # 清洗模型误转义的控制字符（\b → 退格符 → 还原为 LaTeX 反斜杠）
+                data = sanitize_llm_controls(data)
                 return LLMJsonResult(data=data, raw_text=content, error="")
         except json.JSONDecodeError as e:
             # 输出被 max_tokens 截断时抛出，属可重试的临时失败

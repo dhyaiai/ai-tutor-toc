@@ -224,6 +224,7 @@ class SimilarGenerator:
         temperature: float = 0.6,
         timeout: int = 120,
         attempts: int = 2,
+        retry_delay: float = 2.0,
     ) -> dict | None:
         """
         请求 LLM 并解析 JSON 响应（带重试）。
@@ -249,6 +250,7 @@ class SimilarGenerator:
             temperature=temperature,
             timeout=timeout,
             attempts=attempts,
+            retry_delay=retry_delay,
             response_format={"type": "json_object"},
         )
         return result.data
@@ -324,7 +326,8 @@ class SimilarGenerator:
         )
 
         # 3 道题 JSON 较长，配合思考型模型需要充足 token 预算（原 1600 易被截断）
-        data = await self._request_json(prompt, max_tokens=6000, timeout=120, attempts=3)
+        # timeout=180：思考型模型先输出推理 token 再输出正文，120s 实测不够
+        data = await self._request_json(prompt, max_tokens=6000, timeout=180, attempts=3)
         if data is None:
             return []
 
@@ -377,7 +380,9 @@ class SimilarGenerator:
 
         # 原 max_tokens=900：思考型模型的推理 token 会抢占预算，复杂题 JSON 常被截断。
         # 实测拔高题推理 token 可达 2000+，预算不足时正文为空，需留足余量并多次重试
-        data = await self._request_json(prompt, max_tokens=4096, timeout=120, attempts=3)
+        # timeout=180：qwen3.7-plus 推理+长正文单次调用实测可超 120s，曾导致批量生成
+        # 中第 2、3 题稳定超时失败；重试间隔 2s 避开瞬时抖动
+        data = await self._request_json(prompt, max_tokens=4096, timeout=180, attempts=3)
         if data is None:
             return None
 
@@ -453,7 +458,8 @@ class SimilarGenerator:
         )
 
         # 大题 JSON（背景 + 全部子题）最长，原 3200 也易被推理 token 挤占导致截断
-        data = await self._request_json(prompt, max_tokens=8000, timeout=180, attempts=3)
+        # timeout=240：与 questions.py 大题的 wait_for=780 对齐（3 次 × 240 = 720 < 780）
+        data = await self._request_json(prompt, max_tokens=8000, timeout=240, attempts=3)
         if data is None:
             return None
 

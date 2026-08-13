@@ -19,6 +19,7 @@ from openai import AsyncOpenAI
 from app.core.config import get_settings
 from app.services.image_preprocess import build_red_split_views
 from app.services.prompt_rules import FORMULA_RULE
+from app.services.text_clean import sanitize_llm_controls
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +82,8 @@ def _loads_questions_tolerant(raw: str) -> list[dict]:
     try:
         data = json.loads(raw)
         if isinstance(data, dict):
-            return data.get("questions", []) or []
+            # 清洗模型误转义的控制字符（\b → 退格符 → 还原为 LaTeX 反斜杠）
+            return sanitize_llm_controls(data.get("questions", []) or [])
     except Exception:
         pass
 
@@ -128,7 +130,8 @@ def _loads_questions_tolerant(raw: str) -> list[dict]:
                     depth -= 1
                     if depth == 0:
                         try:
-                            objs.append(json.loads(raw[start:i + 1]))
+                            # 清洗模型误转义的控制字符（\b → 退格符 → 还原为 LaTeX 反斜杠）
+                            objs.append(sanitize_llm_controls(json.loads(raw[start:i + 1])))
                         except Exception:
                             pass
                         i += 1

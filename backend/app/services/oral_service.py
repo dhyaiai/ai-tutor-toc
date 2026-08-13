@@ -17,6 +17,7 @@ import logging
 import re
 from openai import AsyncOpenAI
 from app.core.config import get_settings
+from app.services.text_clean import sanitize_llm_controls
 
 logger = logging.getLogger(__name__)
 
@@ -491,7 +492,7 @@ class OralService:
                 response_format={"type": "json_object"},
                 timeout=180,
             )
-            data = json.loads(response.choices[0].message.content or "{}")
+            data = sanitize_llm_controls(json.loads(response.choices[0].message.content or "{}"))
         except Exception as e:
             logger.error("听写图片批改LLM调用失败: %s", e)
             return {
@@ -688,7 +689,7 @@ class OralService:
                     # 空正文（思考型模型 token 预算耗尽）：按失败处理走重试，
                     # 不能静默返回空 dict 让调用方产出"空题/空文本"假成功结果
                     raise ValueError("LLM 返回空正文，按失败处理")
-                data = json.loads(content)
+                data = sanitize_llm_controls(json.loads(content))
                 if isinstance(data, dict):
                     return data
                 last_error = ValueError("LLM 返回内容不是 JSON 对象")

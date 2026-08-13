@@ -1,3 +1,4 @@
+import logging
 import time
 from collections import defaultdict
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -22,6 +23,8 @@ _SIMILAR_SINGLE_RATE_WINDOW = 3600
 # 取任务软超时上限即可（锁 TTL 内任务未启动说明队列积压，应当拦截新任务）。
 _SIMILAR_LOCK_TTL = 900   # 批量生成任务软超时 900s
 _REPLACE_LOCK_TTL = 300   # 单题替换任务软超时 300s
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/questions", tags=["questions"])
 
@@ -225,7 +228,8 @@ async def _run_similar_generation(question_id: int):
                 try:
                     big_q = await _asyncio.wait_for(
                         generator.generate_similar_big_question(parent_info, children_info, difficulty="medium"),
-                        timeout=300,
+                        # 兜底必须 ≥ 内层最坏耗时（单次 240s × 3 次重试 = 720s），否则误杀重试中的调用
+                        timeout=780,
                     )
                 except _asyncio.TimeoutError:
                     logger.error("Similar big question generation timeout for question %d", question_id)
@@ -272,8 +276,10 @@ async def _run_similar_generation(question_id: int):
             difficulties = ["easy", "medium", "hard"]
             all_results = []
 
-            # 逐题生成，每完成1题就更新缓存；单题超时 240s
-            SINGLE_TIMEOUT = 240
+            # 逐题生成，每完成1题就更新缓存
+            # 单题超时兜底必须 ≥ 内层最坏耗时（generate_one 单次 180s × 最多 3 次重试 = 540s），
+            # 否则外层 wait_for 会误杀尚未跑完重试的调用
+            SINGLE_TIMEOUT = 570
             await _set_similar_cache(question_id, {"status": "processing", "result": all_results, "is_big_question": False})
             for diff in difficulties:
                 try:

@@ -258,8 +258,62 @@ class ExplainService:
             f"请按 JSON 格式输出完整讲解和思考题。"
         )
 
+        # 统一走 request_llm_json（含多模态路径：content 为图片+文本列表，OpenAI 兼容）
+        from app.services.llm_json import request_llm_json
+
+        async def _try_llm(
+            llm_client: AsyncOpenAI,
+            llm_model: str,
+            llm_content,
+            *,
+            timeout: int,
+            attempts: int,
+            max_tokens: int,
+        ) -> dict | None:
+            """调用一次 LLM,返回「讲解+思考题均非空」的 data,否则 None。
+
+            request_llm_json 只兜 JSON 解析层,「模型返回合法 JSON 但字段为空/
+            被截断成残缺 JSON」仍需在此兜底——不满足要求时记日志并返回 None,
+            由调用方切换下一条路径(多模态 → 纯文本 → 纯文本重试)。
+            """
+            result = await request_llm_json(
+                llm_client,
+                model=llm_model,
+                messages=[
+                    {"role": "system", "content": FULL_EXPLAIN_SYSTEM_PROMPT},
+                    {"role": "user", "content": llm_content},
+                ],
+                max_tokens=max_tokens,
+                temperature=0.3,
+                timeout=timeout,
+                attempts=attempts,
+                response_format={"type": "json_object"},
+            )
+            data = result.data
+            if (
+                data is not None
+                and (data.get("explanation") or "").strip()
+                and (data.get("thinking_question") or "").strip()
+            ):
+                return data
+            logger.warning(
+                "讲解生成不完整（模型=%s，错误=%s），切换下一条路径",
+                llm_model,
+                result.error or "讲解/思考题字段为空",
+            )
+            return None
+
+        # 候选路径按优先级依次尝试，全部失败才报错（避免单一模型故障导致讲解整体 500）：
+        # 1. 多模态视觉模型（仅带图时；timeout 短、不重试，失败快速降级）
+        # 2. 纯文本模型（deepseek；思考型模型易截断，max_tokens 放宽、允许重试）
+        # 3. 纯文本再试一次（模型偶发输出残缺 JSON 时的兜底）
+        data = None
         if images:
-            # 多模态路径：图片 + 文本提示一起喂给视觉模型
+            vision_settings = get_settings()
+            vision_client = AsyncOpenAI(
+                api_key=vision_settings.VISION_API_KEY,
+                base_url=vision_settings.VISION_API_BASE,
+            )
             content_parts: list[dict] = []
             for img in images:
                 content_parts.append({
@@ -267,44 +321,32 @@ class ExplainService:
                     "image_url": {"url": img, "detail": "high"},
                 })
             content_parts.append({"type": "text", "text": user_prompt})
-
-            vision_settings = get_settings()
-            client = AsyncOpenAI(
-                api_key=vision_settings.VISION_API_KEY,
-                base_url=vision_settings.VISION_API_BASE,
+            data = await _try_llm(
+                vision_client,
+                vision_settings.VISION_MODEL,
+                content_parts,
+                timeout=120,
+                attempts=1,
+                max_tokens=4000,
             )
-            model = vision_settings.VISION_MODEL
-        else:
-            content_parts = user_prompt
-            client = self.client
-            model = self.model
+        if data is None:
+            data = await _try_llm(
+                self.client, self.model, user_prompt,
+                timeout=180, attempts=2, max_tokens=6000,
+            )
+        if data is None:
+            data = await _try_llm(
+                self.client, self.model, user_prompt,
+                timeout=180, attempts=1, max_tokens=6000,
+            )
 
-        # 统一走 request_llm_json（含多模态路径：content 为图片+文本列表，OpenAI 兼容）
-        from app.services.llm_json import request_llm_json
-        result = await request_llm_json(
-            client,
-            model=model,
-            messages=[
-                {"role": "system", "content": FULL_EXPLAIN_SYSTEM_PROMPT},
-                {"role": "user", "content": content_parts},
-            ],
-            max_tokens=4000,
-            temperature=0.3,
-            timeout=180,
-            response_format={"type": "json_object"},
-        )
-        if result.data is None:
-            raise ValueError(f"讲解生成失败: {result.error or '模型未返回有效结果'}")
-        data = result.data
-        explanation = (data.get("explanation") or "").strip()
-        thinking_question = (data.get("thinking_question") or "").strip()
-        if not explanation or not thinking_question:
-            raise ValueError("讲解生成失败：讲解或思考题为空")
+        if data is None:
+            raise ValueError("讲解生成失败：模型连续多次未返回完整内容，请稍后重试")
 
         return {
             "knowledge_points": data.get("knowledge_points", []),
-            "explanation": explanation,
-            "thinking_question": thinking_question,
+            "explanation": (data.get("explanation") or "").strip(),
+            "thinking_question": (data.get("thinking_question") or "").strip(),
         }
 
     async def check_thinking_answer(

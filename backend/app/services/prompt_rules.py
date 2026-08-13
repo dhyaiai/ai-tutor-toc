@@ -20,5 +20,8 @@ FORMULA_RULE = (
     "- 仅使用 KaTeX 支持的标准 LaTeX 命令(\\frac \\sqrt \\sum \\int \\begin{aligned} \\begin{cases} \\text{...} 等),不得使用 \\ce、\\cancel 等 KaTeX 不支持的命令;简单化学式(如 H₂O、CO₂、2H₂O)和化学方程式直接用普通文本加 Unicode 下标数字。\n"
     "- 题干、选项、答案、解析等展示给学生的文本字段中出现的所有公式一律按此规则。\n"
     "- 例外(重要):common_mistakes(常见错误)与 knowledge_points(知识点)两个列表字段一律用纯文本书写,严禁出现 $...$、$$...$$ 或任何 LaTeX 命令(\\frac、\\sqrt、\\times 等)。如需提及公式,用中文与 Unicode 字符描述,例如不得写\"误用 $a^2+b^2=c^2$\",应写\"误用勾股定理的平方关系\"。\n"
-    "- 输出前自查:$ 必须成对出现;\\frac、\\sqrt 等命令必须带完整花括号参数。"
+    "- 输出前自查:$ 必须成对出现;\\frac、\\sqrt 等命令必须带完整花括号参数。\n"
+    "- 【JSON 转义警告(重要)】你返回的是 JSON,JSON 字符串里反斜杠必须写双反斜杠 \\\\ 转义,"
+    "例如写 \\\\theta、\\\\eta、\\\\frac(不要写 \\theta、\\eta 这类单反斜杠——\\t、\\b 会被 JSON 解析成制表符/退格符,"
+    "前端渲染会变成 heta、eta 之类乱码)。"
 )

@@ -8,6 +8,8 @@ import json
 import logging
 from dataclasses import dataclass
 
+from app.services.text_clean import sanitize_llm_controls
+
 logger = logging.getLogger(__name__)
 
 
@@ -214,7 +216,7 @@ class KnowledgeExtractor:
                 response_format={"type": "json_object"},
                 timeout=30,
             )
-            data = json.loads(response.choices[0].message.content or "{}")
+            data = sanitize_llm_controls(json.loads(response.choices[0].message.content or "{}"))
             trimmed = data.get("knowledge_points", [])
             if isinstance(trimmed, list) and trimmed:
                 result = []
