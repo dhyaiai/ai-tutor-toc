@@ -7,6 +7,7 @@ OCR 切割 → 多模态评分 → 知识点提取
 
 import asyncio
 import logging
+import re
 from app.models.assignment import AssignmentStatus
 from app.models.question import Question, QuestionStatus, AnalysisTaskType, AnalysisTaskStatus
 
@@ -201,6 +202,78 @@ def _infer_parent_question_type(
         ai_parent_type, child_types
     )
     return ai_parent_type  # 无法确定时保持原样
+
+
+def _is_choice_parent_illusion(grade_result) -> bool:
+    """
+    判断"选择类题目被 LLM 幻觉拆成小题"（实例：单选题被判成"本大题共 2 小题"）。
+
+    依据：评分 prompt 明确规定只有"选择题组"及阅读类大题才能拆子题，
+    且选择题组必须标为"选择题组"。因此当父题题型为选择类（或类型缺失）、
+    而所有有类型的子题也都是选择类时，拆分几乎必然是模型幻觉
+    （把选择题的 A/B/C/D 选项误当成小问），真实选择题组不会漏标类型。
+    """
+    parent_type = grade_result.question_type
+    # 只有父题类型缺失/选择类才可能触发；计算题、文言文阅读等直接放行
+    if parent_type not in (None, "", "单选题", "多选题", "选择题"):
+        return False
+    child_types = {sq.question_type for sq in grade_result.sub_questions if sq.question_type}
+    # 所有有类型的子题都是选择类 → 幻觉；子题类型全缺失时信息不足，保守拒拆（宁合并不幻觉拆）
+    return all("选" in t for t in child_types) if child_types else True
+
+
+def _merge_choice_illusion(grade_result) -> None:
+    """
+    处理幻觉拆分：拒绝拆子题，取第一个有效子题（confidence≥0.3）提升为整题结果。
+
+    幻觉拆分的子题中常有一个空壳（LLM 对不存在的"小题 0"返回空内容 FAILED），
+    取第一个有效子题即得到真实整题评分；无有效子题时整题置为失败。
+    """
+    valid_subs = [sq for sq in grade_result.sub_questions if sq.confidence >= 0.3]
+    if valid_subs:
+        sq = valid_subs[0]
+        grade_result.question_text = grade_result.question_text or sq.question_text
+        grade_result.student_answer = sq.student_answer
+        grade_result.correct_answer = sq.correct_answer
+        grade_result.score = sq.score
+        grade_result.full_score = sq.full_score
+        grade_result.analysis_detail = sq.analysis_detail
+        grade_result.question_type = sq.question_type or grade_result.question_type
+        grade_result.knowledge_points = sq.knowledge_points
+        grade_result.common_mistakes = sq.common_mistakes
+        grade_result.confidence = sq.confidence
+    else:
+        # 所有子题都是空壳（LLM 整题空返回）→ 整题按失败处理
+        grade_result.analysis_detail = None
+        grade_result.confidence = 0.0
+    logger.warning(
+        "检测到选择题被幻觉拆成 %d 个小题，已合并为整题（父题题型=%s）",
+        len(grade_result.sub_questions), grade_result.question_type,
+    )
+    grade_result.sub_questions = None
+
+
+def _fallback_common_mistakes(analysis_detail: str | None) -> list[str] | None:
+    """
+    LLM 未返回 common_mistakes 时的兜底：从评语【存在问题】段提取第一条。
+
+    双保险（评分 prompt 已强制该字段必填）：模型偶发省略时，学生的实际错误
+    也是"常见错误"的合法内容（prompt 要求把本题实际错误纳入其中），
+    提取不到（评语缺失/全对无错误段）返回 None，由调用方存 []。
+    """
+    if not analysis_detail:
+        return None
+    m = re.search(r"【存在问题】(.+?)(?=【改进建议】|$)", analysis_detail, re.S)
+    if not m:
+        return None
+    text = m.group(1).strip().strip("\n")
+    # 跳过"无/暂无"等空话（客观题全对时 prompt 要求【存在问题】写"无"）
+    if text in ("无", "无。", "暂无", ""):
+        return None
+    first = re.split(r"[。；;]", text)[0].strip()
+    if not first:
+        return None
+    return [first[:60]]
 
 
 # Celery is optional (not available in dev mode)
@@ -714,6 +787,18 @@ async def _do_analyze_inner(assignment_id: int):
                                        _idx, len(batch_questions))
                         break
                     question = batch_questions[_idx]
+                    # ── 幻觉拆分防线（在拆子题分支之前独立判断）──
+                    # 选择类题目（单选/多选/类型缺失+子题全选择）被 LLM 幻觉拆成
+                    # "小题"时拒绝拆分（实例：单选题被判成"本大题共 2 小题"，
+                    # 产生空壳 FAILED 子题），取第一个有效子题提升为整题，
+                    # 合并后 sub_questions 置 None，自然落入下方普通单题分支。
+                    if (
+                        grade_result.sub_questions
+                        and len(grade_result.sub_questions) > 0
+                        and _is_choice_parent_illusion(grade_result)
+                    ):
+                        _merge_choice_illusion(grade_result)
+
                     if grade_result.sub_questions and len(grade_result.sub_questions) > 0:
                         # ── 大题套小题：父题为容器，子题存评分 ──
                         sub_list = grade_result.sub_questions
@@ -762,7 +847,10 @@ async def _do_analyze_inner(assignment_id: int):
                                     else "AI 未返回有效评分结果，请重新分析该题"
                                 ),
                                 question_type=sq.question_type or grade_result.question_type,
-                                common_mistakes=sq.common_mistakes,
+                                # 常见错误兜底：LLM 偶发省略字段时从评语【存在问题】段提取，仍无则存 []
+                                common_mistakes=sq.common_mistakes
+                                or _fallback_common_mistakes(sq.analysis_detail)
+                                or [],
                                 confidence_score=sq.confidence,
                                 status=QuestionStatus.COMPLETED if sq.confidence >= 0.3 else QuestionStatus.FAILED,
                                 page_index=question.page_index,
@@ -816,7 +904,10 @@ async def _do_analyze_inner(assignment_id: int):
                         question.full_score = grade_result.full_score
                         question.analysis_detail = grade_result.analysis_detail
                         question.question_type = grade_result.question_type
-                        question.common_mistakes = grade_result.common_mistakes
+                        # 常见错误兜底：LLM 偶发省略字段时从评语【存在问题】段提取，仍无则存 []
+                        question.common_mistakes = grade_result.common_mistakes \
+                            or _fallback_common_mistakes(grade_result.analysis_detail) \
+                            or []
                         question.confidence_score = grade_result.confidence
                         question.status = QuestionStatus.COMPLETED if grade_result.confidence >= 0.3 else QuestionStatus.FAILED
                         # 评分失败且无评语（如 LLM 返回空壳结果）时写明原因，
@@ -1384,6 +1475,15 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
                 len(descendant_ids_to_delete), question_id,
             )
 
+        # ── 幻觉拆分防线（与批量分析一致）：选择类题目被 LLM 幻觉拆成"小题"时
+        # 拒绝拆分，取第一个有效子题提升为整题，合并后落入下方普通单题分支 ──
+        if (
+            gr.sub_questions
+            and len(gr.sub_questions) > 0
+            and _is_choice_parent_illusion(gr)
+        ):
+            _merge_choice_illusion(gr)
+
         if gr.sub_questions and len(gr.sub_questions) > 0:
             # ── 大题套小题重分析：父题为容器，重建子题 ──
             question.score = None
@@ -1417,7 +1517,10 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
                     full_score=sq.full_score,
                     analysis_detail=sq.analysis_detail,
                     question_type=sq.question_type or gr.question_type,
-                    common_mistakes=sq.common_mistakes,
+                    # 常见错误兜底：LLM 偶发省略字段时从评语【存在问题】段提取，仍无则存 []
+                    common_mistakes=sq.common_mistakes
+                    or _fallback_common_mistakes(sq.analysis_detail)
+                    or [],
                     confidence_score=sq.confidence,
                     status=QuestionStatus.COMPLETED if sq.confidence >= 0.3 else QuestionStatus.FAILED,
                     page_index=question.page_index,
@@ -1459,7 +1562,10 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
             question.analysis_detail = gr.analysis_detail
             question.question_type = gr.question_type
             question.confidence_score = gr.confidence
-            question.common_mistakes = gr.common_mistakes
+            # 常见错误兜底：LLM 偶发省略字段时从评语【存在问题】段提取，仍无则存 []
+            question.common_mistakes = gr.common_mistakes \
+                or _fallback_common_mistakes(gr.analysis_detail) \
+                or []
             # 备注覆盖后置信度已被设为 1.0，正常评分结果置信度也已被 remark boost
             # 提升到 ≥0.85，此处统一按阈值判断，只有真正低置信度（<0.3）才标失败
             question.status = (

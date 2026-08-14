@@ -98,8 +98,9 @@ class AnalyticsAggregator:
         # 题目得分条件不能在 WHERE 中过滤（会把无题目的作业行滤掉），
         # 得分率在 Python 端按 total_full 是否为 0 兜底。
         #
-        # 题目数口径（A2-8）：必须是"叶子题目"——父题容器（存在子题指向它的行）
-        # 只是组织节点，不计入题目数。与作业明细/报告/看板各处口径一致，
+        # 题目数口径（A2-8）：按题号去重（题号数）——大题父容器与子题共享同一
+        # question_number，去重后"第 8 题（1 父 + 3 子）"只计 1 题。
+        # 与作业记录列表/作业详情页顶层题目数口径一致，
         # 否则同一份作业的题目数在不同板块显示不同。
         parent_container_ids = (
             select(Question.parent_id)
@@ -114,7 +115,7 @@ class AnalyticsAggregator:
             select(
                 Assignment.subject,
                 func.count(func.distinct(Assignment.id)),
-                func.count(Question.id),
+                func.count(func.distinct(Question.question_number)),
                 func.coalesce(func.sum(Question.score), 0.0),
                 func.coalesce(func.sum(Question.full_score), 0.0),
             )
@@ -381,10 +382,10 @@ class AnalyticsAggregator:
         stmt = select(func.count(Assignment.id)).where(*base_conditions)
         total_assignments = (await self.db.execute(stmt)).scalar() or 0
 
-        # 题目总数、总得分、总满分（只统计有效打分的题目）
+        # 题目总数、总得分、总满分（只统计有效打分的题目；题数按题号去重，见上方口径注释）
         stmt = (
             select(
-                func.count(Question.id),
+                func.count(func.distinct(Question.question_number)),
                 func.coalesce(func.sum(Question.score), 0.0),
                 func.coalesce(func.sum(Question.full_score), 0.0),
             )
@@ -423,7 +424,7 @@ class AnalyticsAggregator:
                 Assignment.id,
                 Assignment.name,
                 Assignment.ai_summary,
-                func.count(Question.id).label("question_count"),
+                func.count(func.distinct(Question.question_number)).label("question_count"),
                 func.coalesce(func.sum(Question.score), 0.0).label("total_score"),
                 func.coalesce(func.sum(Question.full_score), 0.0).label("total_full"),
             )

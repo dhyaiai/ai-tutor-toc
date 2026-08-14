@@ -425,10 +425,13 @@ async def list_assignments(
     total = (await db.execute(count_query)).scalar() or 0
 
     # Paginated results with aggregated counts (single query to avoid N+1)
+    # 题数口径：按题号去重（题号数）——大题父容器与其子题共享同一 question_number，
+    # count(Question.id) 会把"第 8 题（1 父 + 3 子 = 4 行）"统计成 4 题，需去重为 1 题。
+    # 与详情页顶层题目数（questions.length）、学情聚合口径保持一致。
     q_stats = (
         select(
             Question.assignment_id,
-            func.count(Question.id).label("question_count"),
+            func.count(func.distinct(Question.question_number)).label("question_count"),
             func.sum(case((Question.score < Question.full_score, 1), else_=0)).label("error_count"),
             func.coalesce(func.sum(Question.score), 0).label("total_score"),
             func.coalesce(func.sum(Question.full_score), 0).label("full_total"),
