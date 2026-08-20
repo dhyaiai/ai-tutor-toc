@@ -490,6 +490,9 @@ class OralService:
                 max_tokens=2000,
                 temperature=0.1,
                 response_format={"type": "json_object"},
+                # qwen3.7 系列默认开启思考模式，推理 token 抢占输出预算导致正文
+                # 空/截断；听写批改是结构化 JSON 输出，显式关闭思考。
+                extra_body={"enable_thinking": vision_settings.VISION_ENABLE_THINKING},
                 timeout=180,
             )
             data = sanitize_llm_controls(json.loads(response.choices[0].message.content or "{}"))

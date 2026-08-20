@@ -628,6 +628,9 @@ class CompositionService:
                 max_tokens=MULTIMODAL_MAX_TOKENS,
                 temperature=0.3,
                 response_format={"type": "json_object"},
+                # qwen3.7 系列默认开启思考模式，推理 token 抢占输出预算导致正文
+                # 空/截断；批改是结构化 JSON 输出，显式关闭思考（透传非标准参数）。
+                extra_body={"enable_thinking": vision_settings.VISION_ENABLE_THINKING},
                 timeout=180,
             )
 
@@ -701,6 +704,8 @@ class CompositionService:
                 max_tokens=retry_max_tokens,
                 temperature=0.3,
                 response_format={"type": "json_object"},
+                # 与首次调用一致：关闭 qwen3.7 思考模式，避免推理 token 抢占输出预算
+                extra_body={"enable_thinking": get_settings().VISION_ENABLE_THINKING},
                 timeout=240,
             )
             raw = response.choices[0].message.content

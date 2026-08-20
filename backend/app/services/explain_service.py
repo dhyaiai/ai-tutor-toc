@@ -269,13 +269,18 @@ class ExplainService:
             timeout: int,
             attempts: int,
             max_tokens: int,
+            enable_thinking: bool | None = None,
         ) -> dict | None:
             """调用一次 LLM,返回「讲解+思考题均非空」的 data,否则 None。
 
             request_llm_json 只兜 JSON 解析层,「模型返回合法 JSON 但字段为空/
             被截断成残缺 JSON」仍需在此兜底——不满足要求时记日志并返回 None,
             由调用方切换下一条路径(多模态 → 纯文本 → 纯文本重试)。
+
+            enable_thinking：非 None 时透传为 extra_body，用于关闭 qwen3 视觉模型的
+            思考模式（推理 token 抢占输出预算导致正文截断/空壳）。
             """
+            extra_body = {"enable_thinking": enable_thinking} if enable_thinking is not None else None
             result = await request_llm_json(
                 llm_client,
                 model=llm_model,
@@ -288,6 +293,7 @@ class ExplainService:
                 timeout=timeout,
                 attempts=attempts,
                 response_format={"type": "json_object"},
+                extra_body=extra_body,
             )
             data = result.data
             if (
@@ -328,6 +334,7 @@ class ExplainService:
                 timeout=120,
                 attempts=1,
                 max_tokens=4000,
+                enable_thinking=vision_settings.VISION_ENABLE_THINKING,
             )
         if data is None:
             data = await _try_llm(

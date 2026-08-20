@@ -267,6 +267,9 @@ async def transcribe(doc: dict, meta: dict) -> list[dict]:
         retry_delay=1.0,
         response_format={"type": "json_object"},
         extract_braces=True,      # 容错：模型附带多余文本时提取 JSON
+        # qwen3.7 系列默认开启思考模式，推理 token 抢占输出预算导致多题 JSON 截断/空壳；
+        # 转录是结构化 JSON 输出，关闭思考更稳定（与评分器 ai_grader 一致）。
+        extra_body={"enable_thinking": settings.VISION_ENABLE_THINKING},
     )
     if result.data is None:
         raise ValueError(f"转录失败：{result.error or '模型未返回有效内容'}")

@@ -163,8 +163,8 @@ async def list_ai_questions(
     current_user: User = Depends(get_current_user),
 ):
     """列出AI生成题目（繁星驱动板块）——支持大题分组聚合。
-    score_rate 是聚合值（大题按最近一次作答累计计算），无法用 SQL 条件过滤，
-    必须在 Python 侧分组构建 items 之后再过滤。"""
+    score_rate 是聚合值（大题按各子题最近一次作答累计、独立题取最近一次作答），
+    无法用 SQL 条件过滤，必须在 Python 侧分组构建 items 之后再过滤。"""
     conditions = [AIGeneratedQuestion.user_id == current_user.id]
     # 繁星驱动只展示 AI 生成的题（source 为 NULL 或 'ai'）。
     # 上传转录的题（source='upload'）与 AI 题共用本表并自动收藏，
@@ -313,6 +313,16 @@ async def list_ai_questions(
     # ── 独立题 ──
     for q in standalone_rows:
         ans = answers_by_qid.get(q.id, [])
+        # 得分率：取最近一次作答的得分/满分（与卡片上"得分 x/y"展示一致）。
+        # 未作答或分数缺失时为 None——不满足任何得分率筛选范围，会被下方筛选排除；
+        # 修复：此前独立题不计算 score_rate，一开得分率筛选（哪怕 0~1 全范围）
+        # 所有独立题都被过滤掉，页面恒显示"暂无AI生成题目记录"
+        latest = ans[-1] if ans else None
+        score_rate = (
+            round(float(latest.score) / float(latest.full_score), 4)
+            if latest and latest.score is not None and latest.full_score
+            else None
+        )
         items.append({
             "id": q.id,
             "source_question_id": q.source_question_id,
@@ -329,6 +339,7 @@ async def list_ai_questions(
             "user_answers": _build_answer_items(ans),
             "created_at": q.created_at,
             "is_big_question": False,
+            "score_rate": score_rate,
             "is_favorited": q.id in fav_set,
         })
 
@@ -433,6 +444,7 @@ async def list_ai_questions(
                 user_answers=it["user_answers"],
                 created_at=it["created_at"],
                 is_big_question=False,
+                score_rate=it["score_rate"],
                 is_favorited=it["is_favorited"],
             ))
 

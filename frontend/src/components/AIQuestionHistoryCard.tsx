@@ -736,10 +736,15 @@ function StandaloneCard({
       ) : (
         <>
           {latestAnswer && (
-            /* 作答结果：得分 / 评语 / 我的作答（有作答记录时显示） */
+            /* 作答结果：得分 / 得分率 / 评语 / 我的作答（有作答记录时显示） */
             <div style={{ marginTop: 8, padding: 8, background: "#fafafa", borderRadius: 4 }}>
               <Typography.Text style={{ fontSize: 12 }}>
                 得分：{latestAnswer.score}/{latestAnswer.full_score}
+                {latestAnswer.score != null && latestAnswer.full_score != null && (
+                  <span style={{ marginLeft: 8, color: "#666" }}>
+                    得分率：{getScoreRate(latestAnswer.score, latestAnswer.full_score)}
+                  </span>
+                )}
               </Typography.Text>
               {latestAnswer.ai_feedback && (
                 <Typography.Paragraph style={{ fontSize: 12, marginBottom: 0, marginTop: 4 }} type="secondary">

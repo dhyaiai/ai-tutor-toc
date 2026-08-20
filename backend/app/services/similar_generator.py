@@ -209,6 +209,9 @@ class SimilarGenerator:
         self.llm_key = settings.VISION_API_KEY
         self.llm_base = settings.VISION_API_BASE
         self.model = settings.VISION_MODEL
+        # qwen3.7 系列默认开启思考模式，推理 token 抢占输出预算导致长 JSON 截断/空壳；
+        # 同类题是结构化 JSON 生成，关闭思考更稳定（与评分器 ai_grader 一致）。
+        self.enable_thinking = settings.VISION_ENABLE_THINKING
 
     def _get_client(self):
         if not self.llm_key:
@@ -252,6 +255,7 @@ class SimilarGenerator:
             attempts=attempts,
             retry_delay=retry_delay,
             response_format={"type": "json_object"},
+            extra_body={"enable_thinking": self.enable_thinking},
         )
         return result.data
 

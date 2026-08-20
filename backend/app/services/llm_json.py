@@ -41,6 +41,7 @@ async def request_llm_json(
     retry_delay: float = 0.0,
     response_format: dict | None = None,
     extract_braces: bool = False,
+    extra_body: dict | None = None,
 ) -> LLMJsonResult:
     """
     请求 LLM 并解析 JSON 响应（带重试）。
@@ -50,6 +51,8 @@ async def request_llm_json(
     :param extract_braces: 模型可能附带多余文本时，提取首个 { 到末尾 } 再解析（容错更强）
     :param attempts: 总尝试次数（含首次调用；如 2 = 首次 + 1 次重试）
     :param retry_delay: 每次失败后的等待秒数（用于避开瞬时限流）
+    :param extra_body: 透传给网关的非 OpenAI 标准参数（如 {"enable_thinking": False}
+        关闭 qwen3 系列思考模式，避免推理 token 抢占 max_tokens 导致正文截断/空壳）
     """
     last_err: Exception | None = None
     raw_text = ""
@@ -64,6 +67,8 @@ async def request_llm_json(
             }
             if response_format:
                 kwargs["response_format"] = response_format
+            if extra_body:
+                kwargs["extra_body"] = extra_body
             resp = await client.chat.completions.create(**kwargs)
             content = (resp.choices[0].message.content or "").strip()
             raw_text = content

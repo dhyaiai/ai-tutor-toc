@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     # 请配置在 .env 的 VISION_API_BASE，不要把账号专属 URL 写进代码
     VISION_API_BASE: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     VISION_MODEL: str = "qwen3.7-plus"
+    # qwen3.7 系列模型默认开启思考模式（enable_thinking=true），推理 token 会抢占
+    # max_tokens 输出预算，导致评分/转录等长 JSON 正文被截断或整体为空（空壳结果）。
+    # 评分等结构化输出场景的解题推理已由 prompt 的 solution_process 字段承载，
+    # 无需隐藏思维链，关闭思考模式可大幅降低"评语截断/空壳"失败率。
+    # 仅当换用需要深度推理的模型或确有需求时，才应置为 True。
+    VISION_ENABLE_THINKING: bool = False
 
     # 首启引导：users 表为空时自动创建初始管理员（注册功能已移除，防止空库部署无法开户）。
     # 密码留空时 dev 模式随机生成并打印到控制台；生产模式必须显式配置，否则启动失败。
@@ -87,6 +93,11 @@ class Settings(BaseSettings):
     GRADER_MAX_OUTPUT_TOKENS: int = 8000
     GRADER_MAX_IMAGES_PER_REQUEST: int = 2
     GRADER_MAX_RETRIES: int = 2
+    # 作业分析批次的并发数（同时在飞的视觉 LLM 请求数）。
+    # 原实现逐批串行调用视觉模型，整卷耗时 = 各批耗时之和；并发 3 路可将
+    # 总耗时压缩至约 1/3。设为 1 即回到串行行为。过高可能触发视觉 API
+    # 并发限流（触发后走既有退避重试，但会拖慢整体）。
+    GRADER_CONCURRENCY: int = 3
     
     # Agent 执行器配置
     AGENT_MAX_OUTPUT_TOKENS: int = 4096

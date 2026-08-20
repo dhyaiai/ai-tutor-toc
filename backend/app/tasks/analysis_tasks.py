@@ -682,12 +682,60 @@ async def _do_analyze_inner(assignment_id: int):
         # Batch grading: group images for concurrent API calls (≤3 per request)
         BATCH_SIZE = grader.MAX_IMAGES_PER_REQUEST
 
-        # Process in batches（每批使用独立 session，避免长 LLM 调用期间占用连接池）
-        batch_start = 0
-        while batch_start < q_count:
+        # ── 批次并发执行 ──
+        # 原实现为 while 循环串行逐批调用视觉 LLM：一份 20 题的卷子 = 10 次串行
+        # 调用（复杂大题单次可达数分钟），整卷耗时 = 各批之和，是分析慢的主因。
+        # 现改为信号量控制的并发批次：同时在飞的批次数由 GRADER_CONCURRENCY
+        # 配置（默认 3，设为 1 即回到串行行为），总耗时约压缩至 1/并发数。
+        # 注意：total_score / all_knowledge_points 不能在并发批次内直接累加
+        # （多个批次交错执行），改为每批返回自己的贡献，全部完成后统一汇总。
+        from app.core.config import get_settings
+        grader_concurrency = max(1, get_settings().GRADER_CONCURRENCY)
+        grade_semaphore = asyncio.Semaphore(grader_concurrency)
+        total_batches = (q_count + BATCH_SIZE - 1) // BATCH_SIZE
+        logger.info(
+            "[analyze] Grading %d questions in %d batch(es), concurrency=%d",
+            q_count, total_batches, grader_concurrency,
+        )
+
+        async def _mark_batch_failed(batch_qids: list[int], detail: str, clear_scores: bool = True) -> None:
+            """把一批题目标记为 FAILED（独立 session，不占用调用方连接）。
+
+            clear_scores=True 时同时清空残留分数/知识点，避免逐题分与作业总分、
+            错题数统计不一致（评分失败/超时场景）；用户取消场景传 False 只改状态
+            （与原串行实现的取消语义一致：已算出的分数不清空）。
+            """
+            async with async_session_factory() as fail_db:
+                for qid in batch_qids:
+                    q = await fail_db.get(Question, qid)
+                    if q is not None:
+                        q.status = QuestionStatus.FAILED
+                        q.analysis_detail = detail
+                        if clear_scores:
+                            q.score = None
+                            q.full_score = None
+                            q.knowledge_points = None
+                await fail_db.commit()
+
+        async def _process_batch(batch_start: int) -> tuple[float, set[str]]:
+            """处理一个批次（信号量限流）：排队 → 执行 → 返回 (本批得分, 本批知识点集合)"""
+            async with grade_semaphore:
+                return await _run_batch(batch_start)
+
+        async def _run_batch(batch_start: int) -> tuple[float, set[str]]:
+            """批次执行体：标记 PROCESSING → 评分 → 取消检测 → 结果写回（每批独立 session）"""
             batch_items = question_ids_and_images[batch_start: batch_start + BATCH_SIZE]
             batch_qids = [qid for qid, _ in batch_items]
             batch_images = [img for _, img in batch_items]
+            batch_no = batch_start // BATCH_SIZE + 1
+
+            # 排队等信号量期间用户可能已终止作业：
+            # 发起昂贵的视觉 LLM 调用前先检测，避免白跑一次
+            async with async_session_factory() as cancel_db:
+                if await _is_analysis_cancelled(cancel_db, assignment_id):
+                    logger.info("[analyze] Assignment %d batch %d queued when cancelled", assignment_id, batch_no)
+                    await _mark_batch_failed(batch_qids, "分析已终止", clear_scores=False)
+                    return 0.0, set()
 
             # 每批开启新 session
             async with async_session_factory() as batch_db:
@@ -705,7 +753,7 @@ async def _do_analyze_inner(assignment_id: int):
             # session 已关闭，连接释放回池
 
             logger.info("[analyze] Grading batch %d/%d (%d questions)...",
-                        batch_start // BATCH_SIZE + 1, (q_count + BATCH_SIZE - 1) // BATCH_SIZE, len(batch_questions))
+                        batch_no, total_batches, len(batch_questions))
 
             try:
                 batch_results = await asyncio.wait_for(
@@ -717,57 +765,28 @@ async def _do_analyze_inner(assignment_id: int):
                     timeout=1320,
                 )
             except asyncio.TimeoutError:
-                logger.warning("Batch grading timed out for questions starting at idx %d", batch_start)
-                # 超时：用新 session 写失败状态
-                async with async_session_factory() as batch_db:
-                    for qid in batch_qids:
-                        q = await batch_db.get(Question, qid)
-                        if q is not None:
-                            q.status = QuestionStatus.FAILED
-                            q.analysis_detail = "评分超时，请重新分析该题"
-                            # 清空残留分数/知识点，避免逐题分与作业总分、错题数统计不一致
-                            q.score = None
-                            q.full_score = None
-                            q.knowledge_points = None
-                    await batch_db.commit()
-                batch_start += BATCH_SIZE
-                continue
+                logger.warning("Batch %d grading timed out for questions starting at idx %d", batch_no, batch_start)
+                # 超时：标记失败并清空残留分数（原内联逻辑抽取为 _mark_batch_failed）
+                await _mark_batch_failed(batch_qids, "评分超时，请重新分析该题")
+                return 0.0, set()
             except Exception as e:
-                logger.error("Batch grading failed for questions starting at idx %d: %s", batch_start, e)
-                async with async_session_factory() as batch_db:
-                    for qid in batch_qids:
-                        q = await batch_db.get(Question, qid)
-                        if q is not None:
-                            q.status = QuestionStatus.FAILED
-                            q.analysis_detail = f"评分异常: {str(e)}"
-                            # 清空残留分数/知识点，避免逐题分与作业总分、错题数统计不一致
-                            q.score = None
-                            q.full_score = None
-                            q.knowledge_points = None
-                    await batch_db.commit()
-                batch_start += BATCH_SIZE
-                continue
+                logger.error("Batch %d grading failed for questions starting at idx %d: %s", batch_no, batch_start, e)
+                await _mark_batch_failed(batch_qids, f"评分异常: {str(e)}")
+                return 0.0, set()
 
             # ── 取消检测（写库前，针对在飞批次）──
             # grade_batch 的 LLM 调用可能耗时数分钟，用户可能在此期间已取消作业。
             # 若只在每批 commit 后检测，本批已完成的结果会以 COMPLETED 落库，
             # 覆盖取消语义，出现"作业已取消但部分题目显示分析完成"的矛盾状态。
-            # 检测到取消 → 放弃本批结果，本批与未处理题目统一标记"分析已终止"。
-            async with async_session_factory() as batch_db:
-                if await _is_analysis_cancelled(batch_db, assignment_id):
-                    logger.info("[analyze] Assignment %d 批次执行期间被用户终止，放弃本批结果", assignment_id)
-                    for qid in batch_qids:
-                        q = await batch_db.get(Question, qid)
-                        if q is not None:
-                            q.status = QuestionStatus.FAILED
-                            q.analysis_detail = "分析已终止"
-                    for remaining_qid, _ in question_ids_and_images[batch_start + BATCH_SIZE:]:
-                        q = await batch_db.get(Question, remaining_qid)
-                        if q is not None:
-                            q.status = QuestionStatus.FAILED
-                            q.analysis_detail = "分析已终止"
-                    await batch_db.commit()
-                    return
+            # 检测到取消 → 放弃本批结果，本批题目标记"分析已终止"。
+            # 并发模式下每个批次各自检测并放弃自己的结果；其余在飞/排队批次
+            # 会在各自的检测点（写库前/获取信号量后）收敛到同样的 FAILED 终态，
+            # 语义与原串行实现一致（已完成的批次保持 COMPLETED）。
+            async with async_session_factory() as cancel_db:
+                if await _is_analysis_cancelled(cancel_db, assignment_id):
+                    logger.info("[analyze] Assignment %d 批次 %d 执行期间被用户终止，放弃本批结果", assignment_id, batch_no)
+                    await _mark_batch_failed(batch_qids, "分析已终止", clear_scores=False)
+                    return 0.0, set()
 
             # Apply results — 支持大题套小题（父题有 sub_questions 时创建子题记录）
             # 使用新 session 写入评分结果
@@ -778,6 +797,66 @@ async def _do_analyze_inner(assignment_id: int):
                     if q is not None:
                         batch_questions.append(q)
 
+                # ── 预取知识点（批内并发）──
+                # 原实现在写回循环内逐题串行 await 知识点 LLM 调用（提取+精简
+                # 最多两次/题），批内多题时累积等待明显；现先对批内全部题目
+                # 并发发起，写回时直接查表（kp_map）使用。
+                # 先统一应用"幻觉拆分防线"（纯 CPU 判定），保证预取阶段的
+                # 子题列表与写回循环看到的一致。
+                for _gr in batch_results:
+                    if (
+                        _gr.sub_questions
+                        and len(_gr.sub_questions) > 0
+                        and _is_choice_parent_illusion(_gr)
+                    ):
+                        _merge_choice_illusion(_gr)
+
+                async def _kp_job_normal(gr):
+                    """普通单题：一次调用完成提取+合并+精简；异常回退仅精简已有列表"""
+                    try:
+                        return await extractor.extract_and_trim(
+                            gr.analysis_detail, gr.knowledge_points, max_count=5,
+                        )
+                    except Exception:
+                        return await extractor.trim(
+                            gr.knowledge_points or [], context=None, max_count=5,
+                        )
+
+                async def _kp_job_sub(sq):
+                    """大题子题：知识点提取；异常返回空（回退用评分自带知识点）"""
+                    try:
+                        return await extractor.extract(sq.analysis_detail)
+                    except Exception:
+                        return []
+
+                # (题目序, 子题序或 None) → 知识点列表
+                kp_keys: list[tuple[int, int | None]] = []
+                kp_jobs: list = []
+                for _idx, _gr in enumerate(batch_results):
+                    _subs = _gr.sub_questions
+                    if _subs and len(_subs) > 0:
+                        for _s_idx, _sq in enumerate(_subs):
+                            if _sq.analysis_detail:
+                                kp_keys.append((_idx, _s_idx))
+                                kp_jobs.append(_kp_job_sub(_sq))
+                    elif _gr.analysis_detail or _gr.knowledge_points:
+                        # 普通单题：有评语走"提取+精简"合并调用；
+                        # 无评语仅精简自带列表（≤上限个时 trim 内部不发 LLM）
+                        kp_keys.append((_idx, None))
+                        kp_jobs.append(_kp_job_normal(_gr))
+                kp_results = await asyncio.gather(*kp_jobs, return_exceptions=True)
+                kp_map: dict[tuple[int, int | None], list] = {}
+                for _key, _res in zip(kp_keys, kp_results):
+                    kp_map[_key] = [] if isinstance(_res, BaseException) else (_res or [])
+
+                # 本批得分与知识点（并发下不能直接累加共享变量，批次结束后由
+                # 调用方汇总到 total_score / all_knowledge_points）
+                batch_score = 0.0
+                batch_kps: set[str] = set()
+                # 父题精简任务：(父题对象, 候选知识点列表, trim 上下文)，
+                # 依赖子题结果，写回循环中收集、循环后并发执行
+                parent_trim_jobs: list = []
+
                 # 按索引对齐题目与评分结果，而非 zip：评分期间若某题被并发删除，
                 # batch_questions 会变短导致 zip 结果整体错位写入错误题目
                 for _idx, grade_result in enumerate(batch_results):
@@ -787,18 +866,8 @@ async def _do_analyze_inner(assignment_id: int):
                                        _idx, len(batch_questions))
                         break
                     question = batch_questions[_idx]
-                    # ── 幻觉拆分防线（在拆子题分支之前独立判断）──
-                    # 选择类题目（单选/多选/类型缺失+子题全选择）被 LLM 幻觉拆成
-                    # "小题"时拒绝拆分（实例：单选题被判成"本大题共 2 小题"，
-                    # 产生空壳 FAILED 子题），取第一个有效子题提升为整题，
-                    # 合并后 sub_questions 置 None，自然落入下方普通单题分支。
-                    if (
-                        grade_result.sub_questions
-                        and len(grade_result.sub_questions) > 0
-                        and _is_choice_parent_illusion(grade_result)
-                    ):
-                        _merge_choice_illusion(grade_result)
-
+                    # 幻觉拆分防线已在上方知识点预取前统一应用（纯 CPU 判定，
+                    # 提前是为了保证预取的子题列表与写回循环看到的一致）
                     if grade_result.sub_questions and len(grade_result.sub_questions) > 0:
                         # ── 大题套小题：父题为容器，子题存评分 ──
                         sub_list = grade_result.sub_questions
@@ -861,36 +930,32 @@ async def _do_analyze_inner(assignment_id: int):
                             )
                             batch_db.add(child)
 
-                            # 提取子题知识点
+                            # 子题知识点：评分自带 + 预取的提取结果合并
+                            # （原为循环内逐题串行 await LLM，现查预取表，无 IO）
                             child_kps = sq.knowledge_points or []
-                            if sq.analysis_detail:
-                                try:
-                                    kps = await extractor.extract(sq.analysis_detail)
-                                    child.knowledge_points = extractor.merge(child_kps, kps)
-                                except Exception:
-                                    child.knowledge_points = child_kps
+                            sub_extracted = kp_map.get((_idx, idx))
+                            if sub_extracted is not None:
+                                child.knowledge_points = extractor.merge(child_kps, sub_extracted)
                             else:
                                 child.knowledge_points = child_kps
 
                             if sq.score is not None:
-                                total_score += sq.score
+                                batch_score += sq.score
                             # 收集子题知识点到父题并集。
                             # 注意：add 必须在 for 循环体内（曾因缩进回归写在循环外，
                             # 子题知识点为空时 name 未绑定 → UnboundLocalError 让整卷崩溃）
                             for kp in (child.knowledge_points or []):
                                 name = kp if isinstance(kp, str) else kp.get("name", str(kp))
-                                all_knowledge_points.add(name)
+                                batch_kps.add(name)
                                 parent_kps.add(name)
 
                         # 父题知识点 = 所有子题知识点的并集，再精简到约5个
                         # 注意：必须缩进在大题分支内——parent_kps 仅在该分支赋值，
                         # 写在分支外时普通单题会 UnboundLocalError（曾因缩进回归让整卷崩溃）
                         raw_kps = list(parent_kps) if parent_kps else (grade_result.knowledge_points or [])
-                        question.knowledge_points = await extractor.trim(
-                            raw_kps,
-                            context=question.analysis_detail,
-                            max_count=5,
-                        )
+                        # 父题精简依赖子题结果（kp_map），收集到 parent_trim_jobs，
+                        # 写回循环结束后批内并发执行（原为循环内串行 await）
+                        parent_trim_jobs.append((question, raw_kps, question.analysis_detail))
 
                     else:
                         # ── 普通单题（保持原有逻辑）──
@@ -915,34 +980,41 @@ async def _do_analyze_inner(assignment_id: int):
                         if question.status == QuestionStatus.FAILED and not question.analysis_detail:
                             question.analysis_detail = "AI 未返回有效评分结果，请重新分析该题"
 
-                        # 提取知识点，并精简到约5个
-                        if grade_result.analysis_detail:
-                            try:
-                                kps = await extractor.extract(grade_result.analysis_detail)
-                                merged = extractor.merge(grade_result.knowledge_points, kps)
-                                question.knowledge_points = await extractor.trim(
-                                    merged,
-                                    context=grade_result.analysis_detail,
-                                    max_count=5,
-                                )
-                            except Exception:
-                                question.knowledge_points = await extractor.trim(
-                                    grade_result.knowledge_points or [],
-                                    context=grade_result.analysis_detail,
-                                    max_count=5,
-                                )
-                        else:
-                            question.knowledge_points = await extractor.trim(
-                                grade_result.knowledge_points or [],
-                                context=None,
-                                max_count=5,
-                            )
+                        # 知识点：预取阶段已并发完成（提取+合并+精简一次调用），
+                        # 无评语且无自带知识点时 kp_map 无键，落空列表
+                        question.knowledge_points = kp_map.get((_idx, None)) or []
 
                         if question.score is not None:
-                            total_score += question.score
+                            batch_score += question.score
                         for kp in (question.knowledge_points or []):
                             name = kp if isinstance(kp, str) else kp.get("name", str(kp))
-                            all_knowledge_points.add(name)
+                            batch_kps.add(name)
+
+                # ── 父题知识点精简（批内并发）──
+                # 依赖子题知识点（kp_map）计算并集后才能发起，故放在写回循环之后；
+                # 上下文为父题的题数说明（与原逻辑一致）。
+                if parent_trim_jobs:
+                    trim_results = await asyncio.gather(
+                        *[
+                            extractor.trim(raw, context=ctx, max_count=5)
+                            for _pq, raw, ctx in parent_trim_jobs
+                        ],
+                        return_exceptions=True,
+                    )
+                    for (parent_q, raw, ctx), trim_res in zip(parent_trim_jobs, trim_results):
+                        if isinstance(trim_res, BaseException):
+                            # 异常回退：截断到上限（与 trim 无 LLM 时的降级行为一致）
+                            names: list[str] = []
+                            for p in (raw or []):
+                                nm = p.get("name", "") if isinstance(p, dict) else str(p)
+                                if nm and nm not in names:
+                                    names.append(nm)
+                            parent_q.knowledge_points = [{"name": n} for n in names[:5]]
+                        else:
+                            parent_q.knowledge_points = trim_res
+                        for kp in (parent_q.knowledge_points or []):
+                            name = kp if isinstance(kp, str) else kp.get("name", str(kp))
+                            batch_kps.add(name)
 
                 # Commit batch（提交本批写回结果）
                 # 注意：必须在 async with 块内 commit——曾因缩进错位写在块外，
@@ -950,9 +1022,26 @@ async def _do_analyze_inner(assignment_id: int):
                 # 表现为题目卡 PROCESSING 而作业却显示 COMPLETED
                 await batch_db.commit()
             last_score = batch_questions[-1].score if batch_questions and batch_questions[-1].score else 0
-            logger.info("[analyze] Batch done (%d questions), last score=%.1f",
-                        len(batch_questions), last_score or 0)
-            batch_start += BATCH_SIZE
+            logger.info("[analyze] Batch %d/%d done (%d questions), last score=%.1f",
+                        batch_no, total_batches, len(batch_questions), last_score or 0)
+            return batch_score, batch_kps
+
+        # ── 并发驱动所有批次（信号量限流）──
+        # return_exceptions：单批未预期异常不拖垮其余批次——批内各失败路径
+        # （超时/评分异常/用户取消）已在 _run_batch 中兜底标记 FAILED 并返回
+        # 空贡献，此处仅防御性记录，保证其余批次结果不丢失。
+        batch_outcomes = await asyncio.gather(
+            *[_process_batch(start) for start in range(0, q_count, BATCH_SIZE)],
+            return_exceptions=True,
+        )
+        for start, outcome in zip(range(0, q_count, BATCH_SIZE), batch_outcomes):
+            if isinstance(outcome, BaseException):
+                logger.error("[analyze] Batch %d unexpected error: %s",
+                             start // BATCH_SIZE + 1, outcome)
+                continue
+            b_score, b_kps = outcome
+            total_score += b_score
+            all_knowledge_points.update(b_kps)
 
         # ── 完成 ──
         # 先提交 COMPLETED 状态与总分，再生成 AI 评语。
@@ -1501,6 +1590,22 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
             question.common_mistakes = gr.common_mistakes
 
             parent_kps: set[str] = set()
+
+            # 先并发提取所有子题知识点（原为循环内逐题串行 await，
+            # 语法填空/完形填空等十几个小问的大题重分析时可省大量串行等待）
+            async def _extract_sub_kp(sq_):
+                """提取单个子题知识点；无评语或异常返回空（回退用评分自带知识点）"""
+                if not sq_.analysis_detail:
+                    return []
+                try:
+                    return await extractor.extract(sq_.analysis_detail)
+                except Exception:
+                    return []
+
+            sub_kp_results = await asyncio.gather(
+                *[_extract_sub_kp(sq) for sq in gr.sub_questions]
+            )
+
             for idx, sq in enumerate(gr.sub_questions):
                 # 有教师备注覆盖时，子题也不再因低置信度标为 FAILED
                 # （备注覆盖已把 confidence 设为 1.0，阈值判断自然通过）
@@ -1531,15 +1636,9 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
                 )
                 db.add(child)
 
+                # 子题知识点：评分自带 + 并发预取的提取结果合并
                 child_kps = sq.knowledge_points or []
-                if sq.analysis_detail:
-                    try:
-                        kps = await extractor.extract(sq.analysis_detail)
-                        child.knowledge_points = extractor.merge(child_kps, kps)
-                    except Exception:
-                        child.knowledge_points = child_kps
-                else:
-                    child.knowledge_points = child_kps
+                child.knowledge_points = extractor.merge(child_kps, sub_kp_results[idx])
 
                 for kp in (child.knowledge_points or []):
                     name = kp if isinstance(kp, str) else kp.get("name", str(kp))
@@ -1575,20 +1674,12 @@ async def _do_reanalyze_inner(question_id: int, remark: str | None = None):
             )
 
             # Re-extract knowledge points 并精简到约5个
-            if gr.analysis_detail:
-                kps = await extractor.extract(gr.analysis_detail)
-                merged = extractor.merge(gr.knowledge_points, kps)
-                question.knowledge_points = await extractor.trim(
-                    merged,
-                    context=gr.analysis_detail,
-                    max_count=5,
-                )
-            else:
-                question.knowledge_points = await extractor.trim(
-                    gr.knowledge_points or [],
-                    context=None,
-                    max_count=5,
-                )
+            # （extract_and_trim 一次调用完成提取+合并+精简，原为最多两次 LLM 调用）
+            question.knowledge_points = await extractor.extract_and_trim(
+                gr.analysis_detail,
+                gr.knowledge_points,
+                max_count=5,
+            )
 
         await db.commit()
 

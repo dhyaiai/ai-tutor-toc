@@ -184,6 +184,66 @@ def _to_number(value, default=None):
     return default
 
 
+def _normalize_choice_letters(value: str | None) -> set[str] | None:
+    """提取多选题答案的选项字母集合；无法可靠判定为纯字母答案时返回 None。
+
+    多选题答案按 prompt 要求是"只写选项字母"（如 "AC"、"ABD"），但可能带
+    分隔符（"A,C,D"）或被误带 LaTeX/文字。只接受由大写字母 + 常见分隔符
+    组成的答案；混入数字/LaTeX/汉字时返回 None，调用方跳过校验避免误伤。
+    空串/None 视为"未作答"，返回空集合。
+    """
+    if value is None:
+        return set()
+    stripped = re.sub(r"[\s,，;；、]+", "", value)
+    if not stripped:
+        return set()
+    if not all("A" <= ch <= "Z" for ch in stripped.upper()):
+        return None
+    return {ch for ch in stripped.upper()}
+
+
+def _enforce_multi_choice_score(result) -> bool:
+    """多选题评分兜底校正：错选=0、少选=一半、全对=满分、未作答=0。
+
+    prompt 已要求模型遵守上述规则，但模型偶发把"多选了一个错误选项"误按
+    "少选"给一半分（实例：正确 AC、学生 ACD，评语已指出 D 错却给 3/6 分）。
+    这里在落库前用确定性规则强制校正，返回是否做了校正（供上层记录）。
+    """
+    changed = False
+    targets = [result]
+    sub = getattr(result, "sub_questions", None)
+    if sub:
+        targets = targets + list(sub)
+    for r in targets:
+        if r is None or not r.question_type or "多选" not in r.question_type:
+            continue
+        if r.full_score is None:
+            continue
+        correct = _normalize_choice_letters(r.correct_answer)
+        student = _normalize_choice_letters(r.student_answer)
+        if correct is None or student is None or not correct:
+            # 正确答案缺失或含非字母内容，无法可靠判定，跳过
+            continue
+        full = float(r.full_score)
+        old = r.score
+        if not student:
+            new_score = 0.0  # 未作答
+        elif student - correct:
+            new_score = 0.0  # 错选（选了正确答案之外的选项）
+        elif correct - student:
+            new_score = full / 2.0  # 少选（全部正确但漏选）
+        else:
+            new_score = full  # 全对
+        if old != new_score:
+            r.score = new_score
+            changed = True
+            logger.warning(
+                "多选题评分兜底校正：正确=%s 学生=%s 得分 %s → %s（满分 %s，题型=%s）",
+                r.correct_answer, r.student_answer, old, new_score, r.full_score, r.question_type,
+            )
+    return changed
+
+
 @dataclass
 class SubGradeResult:
     """大题下的子题评分结果（如阅读理解的第1小题、第2小题等）"""
@@ -483,6 +543,9 @@ class AIGrader:
             base_url=settings.VISION_API_BASE,
         )
         self.model = settings.VISION_MODEL
+        # 思考模式开关：qwen3.7 系列默认开启思考（enable_thinking=true），推理 token
+        # 抢占输出预算导致评语截断/空壳；评分走结构化 JSON 输出，关闭思考更稳定。
+        self.enable_thinking = settings.VISION_ENABLE_THINKING
         self.max_retries = settings.GRADER_MAX_RETRIES
         # 输出 token 上限：大题（如文言文/现代文阅读）含多个小题，
         # 每题都要输出三段式详细评语 + 知识点 + 常见错误，3000 tokens 易被截断。
@@ -775,6 +838,10 @@ class AIGrader:
         # 每次失败后翻倍输出预算重试（上限 16384，百炼 qwen3 系列输出上限），
         # 大幅提高"失败一次后重试成功"率
         max_tokens = self.max_output_tokens
+        # 历次尝试中"空壳题最少"的部分成功结果：最后一次重试若整体异常
+        # （超时/限流等），用它兜底返回，避免丢掉前面已算好的题
+        best_partial: list[GradeResult] | None = None
+        best_empty_count: int | None = None
 
         for attempt in range(self.max_retries):
             try:
@@ -784,6 +851,10 @@ class AIGrader:
                     max_tokens=max_tokens,
                     temperature=0.1,
                     response_format={"type": "json_object"},
+                    # qwen3.7 系列默认开启思考模式，推理 token 抢占输出预算导致正文
+                    # 空/截断；评分是结构化 JSON 输出，显式关闭思考（非 OpenAI 标准
+                    # 参数，经 extra_body 透传给百炼/MaaS 网关）。
+                    extra_body={"enable_thinking": self.enable_thinking},
                     # 大题（如语法填空10小题、完形填空15小题）需输出上万字符的
                     # 详细评语，qwen 实测单次生成可能超过 10 分钟，180s 会确定性超时，
                     # 故设为 600s；短题响应快，不受此上限影响。
@@ -895,6 +966,35 @@ class AIGrader:
                         for sq in r.sub_questions:
                             flag_self_correction(sq)
 
+                # ── 空壳结果检测与重试 ──
+                # 思考型模型推理预算耗尽时，偶发输出"语法完整但内容为空"的
+                # question 对象（仅 image_index/question_text 等元数据，无评语/
+                # 得分/答案，实例见 _parse_single_result 的空壳日志）。JSON 语法层
+                # （finish_reason / 解析）检测不到这种失败，必须在此显式检测：
+                # 出现空壳 → 记录部分成功结果并整体重试（翻倍输出预算正是对
+                # "推理耗尽预算"的对症解法）；最后一次尝试仍空壳则接受部分结果。
+                empty_count = sum(1 for r in results if self._is_empty_payload(r))
+                if empty_count:
+                    if best_empty_count is None or empty_count < best_empty_count:
+                        best_partial = results
+                        best_empty_count = empty_count
+                    if attempt < self.max_retries - 1:
+                        raise ValueError(
+                            f"{empty_count}/{len(results)} 题返回空壳结果（无评语/得分/答案），"
+                            f"疑似推理预算耗尽，翻倍输出预算重试"
+                        )
+                    logger.warning(
+                        "Chunk %d 最后一次尝试仍有 %d/%d 题空壳，按部分成功结果返回",
+                        chunk_idx, empty_count, len(results),
+                    )
+
+                # ── 多选题评分兜底校验 ──
+                # 模型偶发不遵守多选题"错选=0/少选=一半"规则（如正确 AC、学生
+                # ACD 给了 3/6 分），在结果确定（含最后一次空壳接受）后统一校正，
+                # 覆盖本批所有顶层题及其子题。
+                for r in results:
+                    _enforce_multi_choice_score(r)
+
                 return results
 
             except Exception as e:
@@ -902,6 +1002,14 @@ class AIGrader:
                     "Chunk %d attempt %d failed: %s", chunk_idx, attempt + 1, e
                 )
                 if attempt == self.max_retries - 1:
+                    # 最后一次尝试失败：若前面有"空壳最少"的部分成功结果，
+                    # 用它兜底（比整批清空多救回几道已算好的题）
+                    if best_partial is not None:
+                        logger.warning(
+                            "Chunk %d 全部尝试失败，返回空壳最少的部分成功结果（%d/%d 空壳）",
+                            chunk_idx, best_empty_count, len(images),
+                        )
+                        return best_partial
                     return [
                         self._empty_grade_result()
                         for _ in images
